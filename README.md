@@ -1,9 +1,10 @@
 ---
-title: Doc Translator
-emoji: 😻
-colorFrom: red
-colorTo: green
+title: BabelDOC Translator
+emoji: 📄
+colorFrom: blue
+colorTo: purple
 sdk: docker
+app_port: 7860
 pinned: false
 ---
 
