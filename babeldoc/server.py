@@ -332,7 +332,7 @@ async def translate_document(
 if __name__ == "__main__":
     import uvicorn
     
-    port = int(os.getenv("PORT", 8000))
+    port = int(os.getenv("PORT", 7860))
     
     logger.info(f"Starting BabelDOC API server on port {port}")
     
