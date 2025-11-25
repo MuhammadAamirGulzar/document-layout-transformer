@@ -9,7 +9,6 @@ gunicorn==21.2.0
 # Core dependencies
 magic-pdf
 PyMuPDF
-pymupdf
 anthropic
 openai
 reportlab
@@ -20,7 +19,7 @@ numpy
 torch
 torchvision
 
-# Missing dependencies
+# BabelDOC dependencies
 tenacity
 tqdm
 rich
@@ -35,9 +34,7 @@ ultralytics
 onnxruntime
 paddleocr
 rapidfuzz
-<<<<<<< HEAD
 loguru
-
 bitstring>=4.3.0
 configargparse>=1.7
 httpx[socks]>=0.27.0
@@ -54,13 +51,10 @@ pydantic>=2.10.6
 scikit-image>=0.25.2
 tiktoken>=0.9.0
 python-levenshtein>=0.27.1
-rapidocr-onnxruntime>=1.4.4
+rapidocr-onnxruntime==1.2.3
 pyzstd>=0.17.0
 hyperscan>=0.7.13
 rtree>=1.4.0
 chardet>=5.2.0
 scipy>=1.15.3
 uharfbuzz>=0.50.2
-=======
-loguru
->>>>>>> 42218f8 (update)
