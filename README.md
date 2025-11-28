@@ -1,5 +1,5 @@
 ---
-title: BabelDOC Translator
+title: TransDOC Translator
 emoji: 📄
 colorFrom: blue
 colorTo: purple
