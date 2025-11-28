@@ -89,6 +89,8 @@ LINE_BREAK_REGEX = regex.compile(
     r"]+ $"
 )
 
+ARABIC_WORD_SPACING_RATIO = 1.65
+
 
 class TypesettingUnit:
     def __str__(self):
@@ -199,11 +201,11 @@ class TypesettingUnit:
         unicode = self.try_get_unicode()
         if unicode:
             return unicode in [
-                "£",
-                "，",
-                "！",
-                "：",
-                "）",
+                "Â£",
+                "ØŒ",
+                "ï¼",
+                "ï¼š",
+                "ï¼‰",
             ]
         return False
 
@@ -241,20 +243,20 @@ class TypesettingUnit:
             return False
         assert len(unicode) == 1, "Unicode must be a single character"
         if unicode in [
-            "（",
-            "）",
-            "，",
-            "。",
-            "、",
-            "；",
-            "：",
-            "？",
-            "！",
-            "）",
-            "，",
-            "！",
-            "：",
-            "）",
+            "ï¼ˆ",
+            "ï¼‰",
+            "ØŒ",
+            "ã€‚",
+            "ã€",
+            "ï¼›",
+            "ï¼š",
+            "ï¼Ÿ",
+            "ï¼",
+            "ï¼‰",
+            "ØŒ",
+            "ï¼",
+            "ï¼š",
+            "ï¼‰",
         ]:
             return True
         if unicode:
@@ -327,33 +329,33 @@ class TypesettingUnit:
                 "?",
                 "!",
                 # Chinese punctuation
-                "，",  # Comma
-                "。",  # Period
-                "：",  # Colon
-                "；",  # Semicolon
-                "？",  # Question mark
-                "！",  # Exclamation mark
-                "、",  # Enumeration comma
+                "ØŒ",  # Comma
+                "ã€‚",  # Period
+                "ï¼š",  # Colon
+                "ï¼›",  # Semicolon
+                "ï¼Ÿ",  # Question mark
+                "ï¼",  # Exclamation mark
+                "ã€",  # Enumeration comma
                 # Closing brackets
                 ")",  # Right parenthesis
                 "]",  # Right square bracket
                 "}",  # Right curly bracket
-                "）",  # Right parenthesis
-                "】",  # Right square bracket
-                "》",  # Right double angle bracket
-                "』",  # Right single quotation mark
-                "」",  # Right corner bracket
+                "ï¼‰",  # Right parenthesis
+                "ã€‘",  # Right square bracket
+                "ã€‹",  # Right double angle bracket
+                "ã€",  # Right single quotation mark
+                "ã€",  # Right corner bracket
                 # Connected line symbols
-                "–",  # EN DASH
-                "—",  # EM DASH
+                "â€“",  # EN DASH
+                "â€”",  # EM DASH
                 # Special punctuation
-                "·",  # Middle dot
-                "…",  # Ellipsis
-                "°",  # Degree symbol
+                "Â·",  # Middle dot
+                "â€¦",  # Ellipsis
+                "Â°",  # Degree symbol
                 # Slash
                 "/",  # Slash
-                "／",  # Fullwidth solidus
-                "‰",  # Per mille sign
+                "ï¼",  # Fullwidth solidus
+                "â€°",  # Per mille sign
             ]
         return False
 
@@ -376,21 +378,21 @@ class TypesettingUnit:
             # Opening brackets
             """,  # Left double quotation mark
             "'",  # Left single quotation mark
-            "《",  # Left double angle bracket
-            "『",  # Left single quotation mark
+            "ã€Š",  # Left double angle bracket
+            "ã€Ž",  # Left single quotation mark
             # Opening brackets
             "(",  # Left parenthesis
             "[",  # Left square bracket
             "{",  # Left curly bracket
-            "（",  # Left parenthesis
-            "【",  # Left square bracket
-            "《",  # Left double angle bracket
-            "『",  # Left single quotation mark
+            "ï¼ˆ",  # Left parenthesis
+            "ã€",  # Left square bracket
+            "ã€Š",  # Left double angle bracket
+            "ã€Ž",  # Left single quotation mark
             # Cannot appear at end of line - combined with closing brackets
             """,  # Right double quotation mark
             "'",  # Right single quotation mark
-            "》",  # Right double angle bracket
-            "』",  # Right single quotation mark
+            "ã€‹",  # Right double angle bracket
+            "ã€",  # Right single quotation mark
         ]
 
     def passthrough(
@@ -1293,6 +1295,92 @@ class Typesetting:
             ),
         )
 
+    def _is_arabic_output(self) -> bool:
+        """Check if the output language is Arabic for RTL margin mirroring."""
+        lang_out = (self.translation_config.lang_out or "").lower()
+        if lang_out in ("en-ar", "ar", "ara", "arabic"):
+            return True
+        if "-ar" in lang_out or "->ar" in lang_out or "/ar" in lang_out:
+            return True
+        return False
+
+    def _calculate_rtl_margin_shift(self, paragraph: il_version_1.PdfParagraph, page: il_version_1.Page) -> float:
+        """Calculate the X shift needed for RTL margin mirroring.
+        
+        For RTL languages, the left margin should become the right margin and vice versa.
+        This function calculates the shift needed to achieve this.
+        
+        Args:
+            paragraph: The paragraph to mirror
+            page: The page containing the paragraph
+            
+        Returns:
+            The X shift to apply for margin mirroring
+        """
+        if not paragraph.box or not page.cropbox or not page.cropbox.box:
+            return 0.0
+        
+        box = paragraph.box
+        page_box = page.cropbox.box
+        
+        # Original margins
+        original_left_margin = box.x - page_box.x
+        original_right_margin = page_box.x2 - box.x2
+        
+        # For RTL: new_left_margin = original_right_margin
+        # new_box.x = page_box.x + original_right_margin
+        # shift_x = new_box.x - box.x = page_box.x + original_right_margin - box.x
+        # = page_box.x + (page_box.x2 - box.x2) - box.x
+        # = page_box.x + page_box.x2 - box.x2 - box.x
+        
+        shift_x = page_box.x + page_box.x2 - box.x2 - box.x
+        
+        return shift_x
+
+    def _apply_rtl_margin_shift_to_composition(
+        self, 
+        composition: list[PdfParagraphComposition], 
+        shift_x: float
+    ) -> None:
+        """Apply RTL margin shift to all characters in a composition list.
+        
+        Args:
+            composition: List of paragraph compositions to shift
+            shift_x: The X shift to apply
+        """
+        if shift_x == 0:
+            return
+            
+        for comp in composition:
+            if comp.pdf_character:
+                char = comp.pdf_character
+                if char.box:
+                    char.box.x += shift_x
+                    char.box.x2 += shift_x
+                if char.visual_bbox and char.visual_bbox.box:
+                    char.visual_bbox.box.x += shift_x
+                    char.visual_bbox.box.x2 += shift_x
+            elif comp.pdf_formula:
+                formula = comp.pdf_formula
+                if formula.box:
+                    formula.box.x += shift_x
+                    formula.box.x2 += shift_x
+                for char in formula.pdf_character:
+                    if char.box:
+                        char.box.x += shift_x
+                        char.box.x2 += shift_x
+                    if char.visual_bbox and char.visual_bbox.box:
+                        char.visual_bbox.box.x += shift_x
+                        char.visual_bbox.box.x2 += shift_x
+                for curve in formula.pdf_curve:
+                    if curve.box:
+                        curve.box.x += shift_x
+                        curve.box.x2 += shift_x
+                for form in formula.pdf_form:
+                    if form.box:
+                        form.box.x += shift_x
+                        form.box.x2 += shift_x
+
     def render_paragraph(
         self,
         paragraph: il_version_1.PdfParagraph,
@@ -1303,12 +1391,40 @@ class Typesetting:
         ],
     ):
         typesetting_units = self.create_typesetting_units(paragraph, fonts)
+        
+        # Check if Arabic output for RTL margin mirroring
+        is_arabic_output = self._is_arabic_output()
+        
+        # Check if this paragraph is table content that should NOT have margin mirroring
+        # Table cells should maintain their original positions
+        is_table_content = False
+        if paragraph.layout_label:
+            layout_label_lower = paragraph.layout_label.lower()
+            if any(table_marker in layout_label_lower for table_marker in [
+                'table_cell', 'table_text', 'wired_table_cell', 'wireless_table_cell'
+            ]):
+                is_table_content = True
+        
         # If all typesetting units can be passed through directly, no need to layout
         if all(unit.can_passthrough for unit in typesetting_units):
             paragraph.scale = 1.0
             paragraph.pdf_paragraph_composition = self.create_passthrough_composition(
                 typesetting_units,
             )
+            
+            # Apply RTL margin mirroring for Arabic output on passthrough paragraphs
+            # Skip table content to maintain table structure
+            if is_arabic_output and not is_table_content:
+                shift_x = self._calculate_rtl_margin_shift(paragraph, page)
+                if shift_x != 0:
+                    self._apply_rtl_margin_shift_to_composition(
+                        paragraph.pdf_paragraph_composition, 
+                        shift_x
+                    )
+                    # Also update the paragraph box to reflect the new position
+                    if paragraph.box:
+                        paragraph.box.x += shift_x
+                        paragraph.box.x2 += shift_x
         else:
             # Use precomputed scale factor to layout typesetting units
             precomputed_scale = (
@@ -1323,6 +1439,22 @@ class Typesetting:
 
             # Update paragraph render order for child characters
             self._update_paragraph_render_order(paragraph)
+            
+            # Apply RTL margin mirroring for Arabic output on layout paragraphs
+            # The _layout_typesetting_units function already right-aligns within the original box,
+            # but we need to shift to the mirrored margin position as well
+            # Skip table content to maintain table structure
+            if is_arabic_output and not is_table_content:
+                shift_x = self._calculate_rtl_margin_shift(paragraph, page)
+                if shift_x != 0:
+                    self._apply_rtl_margin_shift_to_composition(
+                        paragraph.pdf_paragraph_composition, 
+                        shift_x
+                    )
+                    # Also update the paragraph box to reflect the new position
+                    if paragraph.box:
+                        paragraph.box.x += shift_x
+                        paragraph.box.x2 += shift_x
 
     def _is_arabic_char(self, char: str) -> bool:
         """Check if character is Arabic - OPTIMIZED"""
@@ -1387,19 +1519,15 @@ class Typesetting:
         all_units_fit = True
         last_unit: TypesettingUnit | None = None
         line_ys = [current_y]
+        current_line_index = 0
         
         if paragraph.first_line_indent:
             current_x += space_width * 4
         
         # OPTIMIZED ARABIC WORD-LEVEL PROCESSING
         if is_arabic:
-            # CRITICAL: Capture original English left margin BEFORE typesetting
-            # This preserves the margin hierarchy for titles vs paragraphs
-            original_left_margin = 0
-            if typesetting_units and hasattr(typesetting_units[0], 'x') and typesetting_units[0].x is not None:
-                # Find the minimum X position from the original English layout
-                original_min_x = min(u.x for u in typesetting_units if hasattr(u, 'x') and u.x is not None)
-                original_left_margin = original_min_x - box.x
+            arabic_word_spacing = space_width * ARABIC_WORD_SPACING_RATIO
+            line_units_map: dict[int, list[TypesettingUnit]] = {}
             
             i = 0
             safety_counter = 0
@@ -1443,8 +1571,11 @@ class Typesetting:
                     
                     if current_y < box.y:
                         all_units_fit = False
+                    
+                    current_line_index += 1
                 
                 # Place word units
+                relocated_word_units = []
                 for unit in word_units:
                     if unit.is_space and current_x == box.x:
                         continue
@@ -1458,6 +1589,8 @@ class Typesetting:
                         current_x += space_width * 0.5
                     
                     relocated_unit = unit.relocate(current_x, current_y, scale)
+                    relocated_unit.line_id = current_line_index
+                    relocated_word_units.append(relocated_unit)
                     typeset_units.append(relocated_unit)
                     
                     if not unit.is_space:
@@ -1465,6 +1598,15 @@ class Typesetting:
                     
                     current_x = relocated_unit.box.x2
                     last_unit = relocated_unit
+                
+                if relocated_word_units:
+                    relocated_word_units[-1].ends_word = True
+                    line_units_map.setdefault(current_line_index, []).extend(relocated_word_units)
+                
+            
+            # Apply post-layout spacing so wrapping stays unchanged
+            if typeset_units and line_units_map:
+                self._apply_arabic_word_spacing(line_units_map, arabic_word_spacing)
             
             # Right-align Arabic lines (but NOT table content)
             # Check if this paragraph is inside a table by examining layout_label
@@ -1489,33 +1631,38 @@ class Typesetting:
                             lines_dict[line_y] = []
                         lines_dict[line_y].append(unit)
                 
-                # CRITICAL FIX: Use the original English left margin as the right margin
-                # This directly mirrors the English layout hierarchy in Arabic RTL
-                # Titles with small English left margin -> small Arabic right margin (flush right)
-                # Paragraphs with large English left margin -> large Arabic right margin (indented from right)
+                # Sort lines by Y coordinate (top to bottom for RTL - highest Y first)
+                sorted_line_ys = sorted(lines_dict.keys(), reverse=True)
                 
-                # The original_left_margin was captured BEFORE typesetting from the English positions
-                right_margin = original_left_margin
+                # Check if paragraph is justified and has multiple lines
+                is_justified = getattr(paragraph, 'is_justified', False)
+                num_lines = len(sorted_line_ys)
                 
-                for line_y, line_units in lines_dict.items():
-                    if line_units:
-                        # Calculate shift to position line from the right with the mirrored margin
-                        line_max_x = max(u.box.x2 for u in line_units if u.box and u.box.x2 is not None)
-                        target_right_position = box.x2 - right_margin
+                for line_idx, line_y in enumerate(sorted_line_ys):
+                    line_units = lines_dict[line_y]
+                    if not line_units:
+                        continue
+                    
+                    is_last_line = (line_idx == num_lines - 1)
+                    
+                    # Get line boundaries
+                    line_min_x = min(u.box.x for u in line_units if u.box and u.box.x is not None)
+                    line_max_x = max(u.box.x2 for u in line_units if u.box and u.box.x2 is not None)
+                    line_width = line_max_x - line_min_x
+                    target_width = box.x2 - box.x
+                    
+                    if is_justified and not is_last_line and num_lines > 1:
+                        # For justified paragraphs (not last line):
+                        # Distribute space between words to fill the full width
+                        self._justify_arabic_line(line_units, box.x, box.x2, line_min_x, line_max_x)
+                    else:
+                        # For last line or non-justified paragraphs:
+                        # Just right-align the line
+                        target_right_position = box.x2
                         shift_x = target_right_position - line_max_x
                         
                         for unit in line_units:
-                            if unit.box:
-                                unit.box.x += shift_x
-                                unit.box.x2 += shift_x
-                            if unit.x is not None:
-                                unit.x += shift_x
-                            if unit.char and unit.char.box:
-                                unit.char.box.x += shift_x
-                                unit.char.box.x2 += shift_x
-                            if unit.char and unit.char.visual_bbox and unit.char.visual_bbox.box:
-                                unit.char.visual_bbox.box.x += shift_x
-                                unit.char.visual_bbox.box.x2 += shift_x
+                            self._shift_unit_x(unit, shift_x)
         else:
             # ORIGINAL NON-ARABIC LOGIC (UNCHANGED)
             for i, unit in enumerate(typesetting_units):
@@ -1531,7 +1678,7 @@ class Typesetting:
                     and not last_unit.mixed_character_blacklist and not unit.mixed_character_blacklist
                     and current_x > box.x and unit.try_get_unicode() != " "
                     and last_unit.try_get_unicode() != " "
-                    and last_unit.try_get_unicode() not in ["、", "，", "。", "：", "！", "？"]):
+                    and last_unit.try_get_unicode() not in ["ã€", "ØŒ", "ã€‚", "ï¼š", "ï¼", "ï¼Ÿ"]):
                     current_x += space_width * 0.5
                 
                 if use_english_line_break:
@@ -1626,6 +1773,137 @@ class Typesetting:
             typeset_units = reversed_typeset_units
         
         return typeset_units, all_units_fit
+
+    def _apply_arabic_word_spacing(
+        self,
+        line_units_map: dict[int, list[TypesettingUnit]],
+        spacing: float,
+    ):
+        """Apply additional spacing between Arabic words post layout."""
+        if spacing <= 0:
+            return
+
+        for units in line_units_map.values():
+            cumulative_shift = 0.0
+            for unit in units:
+                if cumulative_shift:
+                    self._shift_unit_x(unit, cumulative_shift)
+                if getattr(unit, "ends_word", False):
+                    cumulative_shift += spacing
+
+    def _shift_unit_x(self, unit: TypesettingUnit, shift_x: float):
+        """Shift a typesetting unit horizontally."""
+        if shift_x == 0 or unit is None:
+            return
+        if unit.box:
+            unit.box.x += shift_x
+            unit.box.x2 += shift_x
+        if unit.x is not None:
+            unit.x += shift_x
+        if unit.char and unit.char.box:
+            unit.char.box.x += shift_x
+            unit.char.box.x2 += shift_x
+        if (
+            unit.char
+            and unit.char.visual_bbox
+            and unit.char.visual_bbox.box
+        ):
+            unit.char.visual_bbox.box.x += shift_x
+            unit.char.visual_bbox.box.x2 += shift_x
+
+    def _justify_arabic_line(
+        self, 
+        line_units: list[TypesettingUnit], 
+        target_left: float, 
+        target_right: float,
+        current_left: float,
+        current_right: float,
+    ):
+        """Justify an Arabic line by distributing space between words.
+        
+        For RTL text, we want the line to:
+        - Start from the right margin (target_right)
+        - Extend to the left margin (target_left)
+        - Space between words is distributed evenly to fill the gap
+        
+        Args:
+            line_units: List of typesetting units in the line
+            target_left: Target left edge (box.x)
+            target_right: Target right edge (box.x2)
+            current_left: Current line left edge (min x)
+            current_right: Current line right edge (max x)
+        """
+        if not line_units:
+            return
+        
+        target_width = target_right - target_left
+        current_width = current_right - current_left
+        
+        if current_width <= 0 or target_width <= current_width:
+            # Line already fills the space or is wider, just right-align
+            shift_x = target_right - current_right
+            for unit in line_units:
+                self._shift_unit_x(unit, shift_x)
+            return
+        
+        # Calculate the extra space to distribute
+        extra_space = target_width - current_width
+        
+        # Find word boundaries by looking for units marked as ending a word
+        # or by detecting spaces between character groups
+        word_gaps = []
+        sorted_units = sorted(line_units, key=lambda u: u.box.x if u.box else 0)
+        
+        # Count word boundaries (gaps between words)
+        for i, unit in enumerate(sorted_units):
+            if getattr(unit, 'ends_word', False) and i < len(sorted_units) - 1:
+                word_gaps.append(i)
+        
+        # Alternative: detect gaps by looking at spaces between consecutive units
+        if not word_gaps:
+            for i in range(len(sorted_units) - 1):
+                unit = sorted_units[i]
+                next_unit = sorted_units[i + 1]
+                if unit.box and next_unit.box:
+                    gap = next_unit.box.x - unit.box.x2
+                    # If gap is significant (larger than typical character spacing), it's a word gap
+                    if gap > 1:  # Threshold for word gap detection
+                        word_gaps.append(i)
+        
+        num_gaps = len(word_gaps)
+        
+        if num_gaps == 0:
+            # No word gaps found, just right-align
+            shift_x = target_right - current_right
+            for unit in line_units:
+                self._shift_unit_x(unit, shift_x)
+            return
+        
+        # Distribute extra space evenly between word gaps
+        space_per_gap = extra_space / num_gaps
+        
+        # First, right-align the line to target_right
+        initial_shift = target_right - current_right
+        for unit in line_units:
+            self._shift_unit_x(unit, initial_shift)
+        
+        # Now expand gaps by shifting units to the left based on which gap they're after
+        # Units after gap i get shifted left by (num_gaps - gap_index) * space_per_gap
+        # This creates justified spacing from right to left
+        gap_index = 0
+        cumulative_shift = 0.0
+        
+        # Re-sort after initial shift
+        sorted_units = sorted(line_units, key=lambda u: u.box.x if u.box else 0)
+        
+        for i, unit in enumerate(sorted_units):
+            # Apply cumulative shift (negative, to move left)
+            if cumulative_shift != 0:
+                self._shift_unit_x(unit, -cumulative_shift)
+            
+            # Check if this unit ends a word (next position should expand)
+            if i in word_gaps:
+                cumulative_shift += space_per_gap
 
     def _get_width_before_next_break_point(
         self, units: list[TypesettingUnit], scale: float
@@ -1830,7 +2108,7 @@ class Typesetting:
         # Check figures
         for figure in page.pdf_figure:
             if figure.box.y2 < current_box.y and not (
-                figure.box.x >= current_box.x2 or figure.box.x2 <= current_box.x
+                char.box.x >= current_box.x2 or char.box.x2 <= current_box.x
             ):
                 min_y = max(min_y, figure.box.y2)
 
