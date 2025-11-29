@@ -1,3 +1,5 @@
+
+
 from __future__ import annotations
 
 import copy
@@ -1269,9 +1271,9 @@ class Typesetting:
             font_size=6,
             graphic_state=il_version_1.GraphicState(),
         )
-        text = f""
+        text = f"This document was translated by funstory.ai using open-source PDF translation software BabelDOC {WATERMARK_VERSION} (http://yadt.io). For commercial use, please contact us for a custom version. We welcome feedback and contributions to the open-source project. Please star on GitHub."
         if self.translation_config.debug:
-            text += ""
+            text += "\n This is DEBUG mode. Do not share or use this document for production. Please contact us if you have questions."
         page.pdf_paragraph.append(
             il_version_1.PdfParagraph(
                 first_line_indent=False,
@@ -1310,6 +1312,9 @@ class Typesetting:
         For RTL languages, the left margin should become the right margin and vice versa.
         This function calculates the shift needed to achieve this.
         
+        IMPORTANT: When there are sidebars or page decorations, we mirror within the
+        CONTENT AREA (excluding decorations), not the full page width.
+        
         Args:
             paragraph: The paragraph to mirror
             page: The page containing the paragraph
@@ -1323,19 +1328,133 @@ class Typesetting:
         box = paragraph.box
         page_box = page.cropbox.box
         
-        # Original margins
-        original_left_margin = box.x - page_box.x
-        original_right_margin = page_box.x2 - box.x2
+        # Detect content area boundaries (accounting for sidebars/decorations)
+        content_left, content_right = self._get_content_area_bounds(page)
+        
+        # Original margins relative to content area
+        original_left_margin = box.x - content_left
+        original_right_margin = content_right - box.x2
         
         # For RTL: new_left_margin = original_right_margin
-        # new_box.x = page_box.x + original_right_margin
-        # shift_x = new_box.x - box.x = page_box.x + original_right_margin - box.x
-        # = page_box.x + (page_box.x2 - box.x2) - box.x
-        # = page_box.x + page_box.x2 - box.x2 - box.x
+        # new_box.x = content_left + original_right_margin
+        # shift_x = new_box.x - box.x
         
-        shift_x = page_box.x + page_box.x2 - box.x2 - box.x
+        new_x = content_left + original_right_margin
+        shift_x = new_x - box.x
         
         return shift_x
+
+    def _get_content_area_bounds(self, page: il_version_1.Page) -> tuple[float, float]:
+        """Get the left and right boundaries of the content area, excluding sidebars.
+        
+        Detects large rectangles or figures near page edges that are likely sidebars
+        or decorative elements, and returns the content area bounds.
+        
+        Args:
+            page: The page to analyze
+            
+        Returns:
+            Tuple of (content_left, content_right) x-coordinates
+        """
+        if not page.cropbox or not page.cropbox.box:
+            return (0.0, 612.0)  # Default US Letter width
+        
+        page_box = page.cropbox.box
+        page_left = page_box.x
+        page_right = page_box.x2
+        page_width = page_right - page_left
+        page_height = page_box.y2 - page_box.y
+        
+        # Start with full page as content area
+        content_left = page_left
+        content_right = page_right
+        
+        # Check for sidebar rectangles
+        if hasattr(page, 'pdf_rectangle') and page.pdf_rectangle:
+            for rect in page.pdf_rectangle:
+                if not rect.box:
+                    continue
+                
+                rect_box = rect.box
+                rect_height = rect_box.y2 - rect_box.y
+                rect_width = rect_box.x2 - rect_box.x
+                
+                # Is it a tall rectangle (sidebar-like)? Must be at least 30% of page height
+                is_tall = rect_height > page_height * 0.3
+                
+                # Is it narrow enough to be a sidebar? (less than 25% of page width)
+                is_narrow = rect_width < page_width * 0.25
+                
+                if is_tall and is_narrow:
+                    # Check if it's on the left side
+                    if rect_box.x < page_left + page_width * 0.2:
+                        # Left sidebar - content starts after it
+                        content_left = max(content_left, rect_box.x2)
+                    
+                    # Check if it's on the right side
+                    if rect_box.x2 > page_right - page_width * 0.2:
+                        # Right sidebar - content ends before it
+                        content_right = min(content_right, rect_box.x)
+        
+        # Also check for figures that might be sidebars/decorations
+        if hasattr(page, 'pdf_figure') and page.pdf_figure:
+            for figure in page.pdf_figure:
+                if not figure.box:
+                    continue
+                
+                fig_box = figure.box
+                fig_height = fig_box.y2 - fig_box.y
+                fig_width = fig_box.x2 - fig_box.x
+                
+                # Is it a tall figure (sidebar-like)?
+                is_tall = fig_height > page_height * 0.3
+                
+                # Is it narrow?
+                is_narrow = fig_width < page_width * 0.25
+                
+                if is_tall and is_narrow:
+                    # Check if it's on the left side
+                    if fig_box.x < page_left + page_width * 0.2:
+                        content_left = max(content_left, fig_box.x2)
+                    
+                    # Check if it's on the right side
+                    if fig_box.x2 > page_right - page_width * 0.2:
+                        content_right = min(content_right, fig_box.x)
+        
+        # Also check page layouts for sidebar-type elements
+        if hasattr(page, 'page_layout') and page.page_layout:
+            for layout in page.page_layout:
+                if not layout.box:
+                    continue
+                
+                layout_box = layout.box
+                layout_height = layout_box.y2 - layout_box.y
+                layout_width = layout_box.x2 - layout_box.x
+                
+                # Check if it's a header/footer or sidebar type layout
+                layout_name = (layout.class_name or "").lower()
+                
+                # Skip actual content layouts
+                if layout_name in ['text', 'paragraph', 'title', 'plain text', 'content']:
+                    continue
+                
+                # Is it tall and narrow (sidebar-like)?
+                is_tall = layout_height > page_height * 0.3
+                is_narrow = layout_width < page_width * 0.25
+                
+                if is_tall and is_narrow:
+                    if layout_box.x < page_left + page_width * 0.2:
+                        content_left = max(content_left, layout_box.x2)
+                    if layout_box.x2 > page_right - page_width * 0.2:
+                        content_right = min(content_right, layout_box.x)
+        
+        # Ensure we have valid bounds
+        if content_left >= content_right:
+            # Reset to page bounds if something went wrong
+            content_left = page_left
+            content_right = page_right
+        
+        return (content_left, content_right)
 
     def _apply_rtl_margin_shift_to_composition(
         self, 
@@ -1382,60 +1501,93 @@ class Typesetting:
                         form.box.x2 += shift_x
 
     def _is_paragraph_inside_table(self, paragraph: il_version_1.PdfParagraph, page: il_version_1.Page) -> bool:
-        """Check if a paragraph is inside a table (cell content) that should not be margin-mirrored.
+        """Check if a paragraph should NOT have margin mirroring applied.
         
-        Uses two detection methods:
-        1. Check layout_label for table cell markers
-        2. Check if paragraph is geometrically contained within a table layout region
+        This includes:
+        1. Table cell content (should stay in place within table structure)
+        2. Figure content (captions, axis labels, legends, text inside figures)
+        3. Table footnotes
+        4. Content that would overlap with page borders/sidebars after mirroring
         
-        Note: table_caption, table_title, table_footnote are NOT considered "inside table"
-        because they appear outside/around the table and should be mirrored.
+        Uses multiple detection methods:
+        1. Check layout_label for table/figure cell markers
+        2. Check if paragraph is geometrically contained within a table/figure layout region
+        3. Check if mirroring would cause overlap with page decorations
         
         Args:
             paragraph: The paragraph to check
             page: The page containing the paragraph
             
         Returns:
-            True if paragraph is table cell content that should not be mirrored
+            True if paragraph should NOT be margin-mirrored
         """
-        # Method 1: Check layout_label for table cell markers
+        # Method 1: Check layout_label for content that should not be mirrored
         if paragraph.layout_label:
             layout_label_lower = paragraph.layout_label.lower()
-            # Only exclude actual table cell content, NOT captions/titles/footnotes
+            
+            # Table cell content markers
             table_cell_markers = [
                 'table_cell', 'table_cell_hybrid', 'table_text', 
-                'wired_table_cell', 'wireless_table_cell'
+                'wired_table_cell', 'wireless_table_cell',
+                'table_footnote'  # Table footnotes should stay with the table
             ]
-            if any(marker in layout_label_lower for marker in table_cell_markers):
+            
+            # Figure content markers
+            figure_content_markers = [
+                'figure_text', 'figure_text_hybrid',
+                'figure_caption', 'figure_title',
+                'chart_title', 'chart_legend',
+                'axis_label', 'axis_text'
+            ]
+            
+            all_markers = table_cell_markers + figure_content_markers
+            
+            if any(marker in layout_label_lower for marker in all_markers):
                 return True
         
-        # Method 2: Check if paragraph is geometrically inside a table layout region
-        if not paragraph.box:
-            return False
+        # Method 2: Check if paragraph is geometrically inside a table or figure layout region
+        if paragraph.box:
+            if self._is_inside_table_or_figure_region(paragraph.box, page):
+                return True
+        
+        # Method 3: Check if mirroring would cause overlap with page decorations (sidebars, borders)
+        if paragraph.box and page.cropbox and page.cropbox.box:
+            if self._would_overlap_page_decoration(paragraph, page):
+                return True
+        
+        return False
+
+    def _is_inside_table_or_figure_region(self, para_box: Box, page: il_version_1.Page) -> bool:
+        """Check if a paragraph box is geometrically inside a table or figure region.
+        
+        Args:
+            para_box: The paragraph's bounding box
+            page: The page containing the paragraph
             
-        # Get table layouts from page
+        Returns:
+            True if paragraph is inside a table or figure
+        """
+        # Get layouts from page
         if not hasattr(page, 'page_layout') or not page.page_layout:
             return False
-        
-        para_box = paragraph.box
         
         for layout in page.page_layout:
             if not layout.box:
                 continue
                 
-            # Check if this is a table layout (not caption/title/footnote)
+            # Check if this is a table or figure layout
             layout_name = (layout.class_name or "").lower()
             
-            # These are the actual table structure layouts (not captions around them)
-            is_table_layout = layout_name in [
-                'table', 'wired_table', 'wireless_table'
+            # Table and figure structure layouts
+            is_container_layout = layout_name in [
+                'table', 'wired_table', 'wireless_table',
+                'figure', 'chart', 'graph', 'diagram', 'image'
             ]
             
-            if not is_table_layout:
+            if not is_container_layout:
                 continue
             
-            # Check if paragraph is contained within this table layout
-            # Using a containment check: paragraph should be mostly inside the table
+            # Check if paragraph is contained within this layout
             layout_box = layout.box
             
             # Calculate overlap
@@ -1445,15 +1597,94 @@ class Typesetting:
             overlap_y2 = min(para_box.y2, layout_box.y2)
             
             if overlap_x1 < overlap_x2 and overlap_y1 < overlap_y2:
-                # There is overlap - calculate how much of paragraph is inside table
+                # There is overlap - calculate how much of paragraph is inside
                 overlap_area = (overlap_x2 - overlap_x1) * (overlap_y2 - overlap_y1)
                 para_area = (para_box.x2 - para_box.x) * (para_box.y2 - para_box.y)
                 
                 if para_area > 0:
                     containment_ratio = overlap_area / para_area
-                    # If more than 50% of paragraph is inside a table, consider it table content
+                    # If more than 50% of paragraph is inside, consider it contained
                     if containment_ratio > 0.5:
                         return True
+        
+        return False
+
+    def _would_overlap_page_decoration(self, paragraph: il_version_1.PdfParagraph, page: il_version_1.Page) -> bool:
+        """Check if margin mirroring would cause the paragraph to overlap with page decorations.
+        
+        Page decorations include sidebars, borders, colored regions, etc.
+        We detect these by checking if there are rectangles/figures near the page edges
+        that the mirrored paragraph would overlap with.
+        
+        Args:
+            paragraph: The paragraph to check
+            page: The page containing the paragraph
+            
+        Returns:
+            True if mirroring would cause overlap with decorations
+        """
+        if not paragraph.box or not page.cropbox or not page.cropbox.box:
+            return False
+        
+        para_box = paragraph.box
+        page_box = page.cropbox.box
+        
+        # Calculate where the paragraph would be after mirroring
+        shift_x = page_box.x + page_box.x2 - para_box.x2 - para_box.x
+        
+        new_x = para_box.x + shift_x
+        new_x2 = para_box.x2 + shift_x
+        
+        # Check if the new position is outside the safe content area
+        # Allow some margin (5% of page width) for borders/sidebars
+        page_width = page_box.x2 - page_box.x
+        safe_margin = page_width * 0.05
+        
+        # If the mirrored position would be too close to or beyond page edges, skip mirroring
+        if new_x < page_box.x + safe_margin or new_x2 > page_box.x2 - safe_margin:
+            # Additional check: see if there are rectangles (potential decorations) in the target area
+            if hasattr(page, 'pdf_rectangle') and page.pdf_rectangle:
+                for rect in page.pdf_rectangle:
+                    if not rect.box:
+                        continue
+                    
+                    rect_box = rect.box
+                    
+                    # Check if this rectangle is a page decoration (tall, near edge)
+                    rect_height = rect_box.y2 - rect_box.y
+                    page_height = page_box.y2 - page_box.y
+                    
+                    # Is it a tall rectangle (sidebar-like)?
+                    is_tall = rect_height > page_height * 0.3
+                    
+                    # Is it near the left or right edge?
+                    is_near_left = rect_box.x < page_box.x + page_width * 0.15
+                    is_near_right = rect_box.x2 > page_box.x2 - page_width * 0.15
+                    
+                    if is_tall and (is_near_left or is_near_right):
+                        # Check if mirrored paragraph would overlap with this decoration
+                        if (new_x < rect_box.x2 and new_x2 > rect_box.x and
+                            para_box.y < rect_box.y2 and para_box.y2 > rect_box.y):
+                            return True
+            
+            # Also check for figures that might be decorative elements
+            if hasattr(page, 'pdf_figure') and page.pdf_figure:
+                for figure in page.pdf_figure:
+                    if not figure.box:
+                        continue
+                    
+                    fig_box = figure.box
+                    
+                    # Check if this figure is near the edge (potential decoration)
+                    fig_width = fig_box.x2 - fig_box.x
+                    is_near_left = fig_box.x < page_box.x + page_width * 0.15
+                    is_near_right = fig_box.x2 > page_box.x2 - page_width * 0.15
+                    
+                    if is_near_left or is_near_right:
+                        # Check if mirrored paragraph would overlap
+                        if (new_x < fig_box.x2 and new_x2 > fig_box.x and
+                            para_box.y < fig_box.y2 and para_box.y2 > fig_box.y):
+                            return True
         
         return False
 
