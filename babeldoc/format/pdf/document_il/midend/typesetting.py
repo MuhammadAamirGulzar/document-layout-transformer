@@ -1,5 +1,3 @@
-
-
 from __future__ import annotations
 
 import copy
@@ -12,8 +10,6 @@ from functools import cache
 import pymupdf
 import regex
 from rtree import index
-
-from babeldoc.const import WATERMARK_VERSION
 from babeldoc.format.pdf.document_il import Box
 from babeldoc.format.pdf.document_il import PdfCharacter
 from babeldoc.format.pdf.document_il import PdfCurve
@@ -1271,9 +1267,9 @@ class Typesetting:
             font_size=6,
             graphic_state=il_version_1.GraphicState(),
         )
-        text = f"This document was translated by funstory.ai using open-source PDF translation software BabelDOC {WATERMARK_VERSION} (http://yadt.io). For commercial use, please contact us for a custom version. We welcome feedback and contributions to the open-source project. Please star on GitHub."
+        text = f""
         if self.translation_config.debug:
-            text += "\n This is DEBUG mode. Do not share or use this document for production. Please contact us if you have questions."
+            text += ""
         page.pdf_paragraph.append(
             il_version_1.PdfParagraph(
                 first_line_indent=False,
