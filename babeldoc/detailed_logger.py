@@ -145,7 +145,7 @@ class DetailedLogger:
             return
             
         self.log_file.write(f"\n  Paragraph:\n")
-        self.log_file.write(f"    Text: {paragraph_data.get('text', '')[:200]}\n")
+        # self.log_file.write(f"    Text: {paragraph_data.get('text', '')[:200]}\n")
         self.log_file.write(f"    Layout: {paragraph_data.get('layout_label', 'N/A')}\n")
         self.log_file.write(f"    Bounding box: {paragraph_data.get('box', 'N/A')}\n")
         self.log_file.write(f"    Character count: {paragraph_data.get('char_count', 0)}\n")
