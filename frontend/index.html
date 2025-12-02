@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>BabelDOC - Intelligent PDF Translation</title>
+    <title>TransDOC - Intelligent PDF Translation</title>
     <style>
         * {
             margin: 0;
@@ -25,7 +25,7 @@
             background: white;
             border-radius: 20px;
             box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
-            max-width: 600px;
+            max-width: 650px;
             width: 100%;
             padding: 40px;
         }
@@ -166,24 +166,54 @@
             background: #ccc;
             cursor: not-allowed;
             transform: none;
+            box-shadow: none;
         }
 
+        /* Progress Container Styles */
         .progress-container {
             display: none;
-            margin-top: 20px;
+            margin-top: 25px;
+            padding: 25px;
+            background: linear-gradient(135deg, #f8f9ff 0%, #f0f4ff 100%);
+            border-radius: 15px;
+            border: 1px solid #e0e7ff;
         }
 
         .progress-container.active {
             display: block;
         }
 
+        .progress-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 15px;
+        }
+
+        .progress-title {
+            font-weight: 600;
+            color: #333;
+            font-size: 1.1em;
+        }
+
+        .progress-percentage {
+            font-weight: 700;
+            color: #667eea;
+            font-size: 1.3em;
+        }
+
+        /* Main Progress Bar */
+        .progress-bar-container {
+            margin-bottom: 20px;
+        }
+
         .progress-bar {
             width: 100%;
-            height: 8px;
-            background: #e0e0e0;
+            height: 12px;
+            background: #e0e7ff;
             border-radius: 10px;
             overflow: hidden;
-            margin-bottom: 10px;
+            position: relative;
         }
 
         .progress-fill {
@@ -191,27 +221,199 @@
             background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
             width: 0%;
             transition: width 0.3s ease;
-            animation: pulse 1.5s ease-in-out infinite;
+            border-radius: 10px;
+            position: relative;
         }
 
-        @keyframes pulse {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0.7; }
+        .progress-fill::after {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: linear-gradient(
+                90deg,
+                rgba(255, 255, 255, 0) 0%,
+                rgba(255, 255, 255, 0.3) 50%,
+                rgba(255, 255, 255, 0) 100%
+            );
+            animation: shimmer 1.5s infinite;
         }
 
-        .progress-text {
-            text-align: center;
+        @keyframes shimmer {
+            0% { transform: translateX(-100%); }
+            100% { transform: translateX(100%); }
+        }
+
+        /* Current Stage Display */
+        .current-stage {
+            background: white;
+            border-radius: 10px;
+            padding: 15px;
+            margin-bottom: 15px;
+            border: 1px solid #e0e7ff;
+        }
+
+        .current-stage-label {
+            font-size: 0.85em;
             color: #666;
+            margin-bottom: 5px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .current-stage-name {
+            font-size: 1.15em;
+            font-weight: 600;
+            color: #333;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .stage-spinner {
+            width: 18px;
+            height: 18px;
+            border: 2px solid #e0e7ff;
+            border-top-color: #667eea;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        /* Stage Progress */
+        .stage-progress {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-top: 10px;
+        }
+
+        .stage-progress-bar {
+            flex: 1;
+            height: 6px;
+            background: #e0e7ff;
+            border-radius: 3px;
+            overflow: hidden;
+        }
+
+        .stage-progress-fill {
+            height: 100%;
+            background: #667eea;
+            width: 0%;
+            transition: width 0.2s ease;
+        }
+
+        .stage-progress-text {
+            font-size: 0.85em;
+            color: #666;
+            min-width: 80px;
+            text-align: right;
+        }
+
+        /* Stages List */
+        .stages-list {
+            margin-top: 15px;
+        }
+
+        .stages-list-title {
+            font-size: 0.85em;
+            color: #666;
+            margin-bottom: 10px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .stage-item {
+            display: flex;
+            align-items: center;
+            padding: 8px 12px;
+            background: white;
+            border-radius: 8px;
+            margin-bottom: 6px;
+            border: 1px solid #e0e7ff;
+            transition: all 0.3s ease;
+        }
+
+        .stage-item.completed {
+            background: #f0fdf4;
+            border-color: #86efac;
+        }
+
+        .stage-item.active {
+            background: #fef3c7;
+            border-color: #fcd34d;
+            box-shadow: 0 2px 8px rgba(252, 211, 77, 0.3);
+        }
+
+        .stage-item.pending {
+            opacity: 0.6;
+        }
+
+        .stage-icon {
+            width: 24px;
+            height: 24px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin-right: 10px;
             font-size: 0.9em;
         }
 
+        .stage-item.completed .stage-icon {
+            color: #10b981;
+        }
+
+        .stage-item.active .stage-icon {
+            color: #f59e0b;
+        }
+
+        .stage-item.pending .stage-icon {
+            color: #9ca3af;
+        }
+
+        .stage-name {
+            flex: 1;
+            font-size: 0.9em;
+            color: #333;
+        }
+
+        .stage-status {
+            font-size: 0.8em;
+            color: #666;
+        }
+
+        .stage-item.completed .stage-status {
+            color: #10b981;
+        }
+
+        .stage-item.active .stage-status {
+            color: #f59e0b;
+        }
+
+        /* Part Info */
+        .part-info {
+            text-align: center;
+            font-size: 0.85em;
+            color: #666;
+            margin-top: 10px;
+            padding-top: 10px;
+            border-top: 1px solid #e0e7ff;
+        }
+
+        /* Result Container */
         .result-container {
             display: none;
             margin-top: 20px;
-            padding: 20px;
-            background: #f0fdf4;
-            border-radius: 10px;
+            padding: 25px;
+            background: linear-gradient(135deg, #f0fdf4 0%, #dcfce7 100%);
+            border-radius: 15px;
             border: 2px solid #86efac;
+            text-align: center;
         }
 
         .result-container.active {
@@ -219,41 +421,42 @@
         }
 
         .result-icon {
-            font-size: 2em;
-            text-align: center;
+            font-size: 3em;
             margin-bottom: 10px;
         }
 
         .result-text {
-            text-align: center;
-            color: #333;
+            color: #166534;
             font-weight: 600;
+            font-size: 1.2em;
             margin-bottom: 15px;
         }
 
         .download-btn {
             width: 100%;
-            padding: 12px;
-            background: #10b981;
+            padding: 15px;
+            background: linear-gradient(135deg, #10b981 0%, #059669 100%);
             color: white;
             border: none;
-            border-radius: 8px;
-            font-size: 1em;
+            border-radius: 10px;
+            font-size: 1.1em;
             font-weight: 600;
             cursor: pointer;
-            transition: background 0.3s ease;
+            transition: transform 0.2s ease, box-shadow 0.2s ease;
         }
 
         .download-btn:hover {
-            background: #059669;
+            transform: translateY(-2px);
+            box-shadow: 0 5px 20px rgba(16, 185, 129, 0.4);
         }
 
+        /* Error Container */
         .error-container {
             display: none;
             margin-top: 20px;
             padding: 20px;
-            background: #fef2f2;
-            border-radius: 10px;
+            background: linear-gradient(135deg, #fef2f2 0%, #fee2e2 100%);
+            border-radius: 15px;
             border: 2px solid #fca5a5;
         }
 
@@ -261,9 +464,36 @@
             display: block;
         }
 
+        .error-icon {
+            font-size: 2em;
+            text-align: center;
+            margin-bottom: 10px;
+        }
+
         .error-text {
             color: #dc2626;
             text-align: center;
+            font-weight: 500;
+        }
+
+        /* Cancel Button */
+        .cancel-btn {
+            width: 100%;
+            margin-top: 15px;
+            padding: 12px;
+            background: #f3f4f6;
+            color: #6b7280;
+            border: 1px solid #d1d5db;
+            border-radius: 8px;
+            font-size: 0.95em;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+
+        .cancel-btn:hover {
+            background: #e5e7eb;
+            color: #374151;
         }
     </style>
 </head>
@@ -319,10 +549,41 @@
         </button>
 
         <div class="progress-container" id="progressContainer">
-            <div class="progress-bar">
-                <div class="progress-fill" id="progressFill"></div>
+            <div class="progress-header">
+                <span class="progress-title">Translation Progress</span>
+                <span class="progress-percentage" id="progressPercentage">0%</span>
             </div>
-            <div class="progress-text" id="progressText">Processing your document...</div>
+            
+            <div class="progress-bar-container">
+                <div class="progress-bar">
+                    <div class="progress-fill" id="progressFill"></div>
+                </div>
+            </div>
+
+            <div class="current-stage">
+                <div class="current-stage-label">Current Step</div>
+                <div class="current-stage-name">
+                    <div class="stage-spinner" id="stageSpinner"></div>
+                    <span id="currentStageName">Initializing...</span>
+                </div>
+                <div class="stage-progress">
+                    <div class="stage-progress-bar">
+                        <div class="stage-progress-fill" id="stageProgressFill"></div>
+                    </div>
+                    <span class="stage-progress-text" id="stageProgressText">0 / 0</span>
+                </div>
+            </div>
+
+            <div class="stages-list" id="stagesList">
+                <div class="stages-list-title">Processing Pipeline</div>
+                <div id="stagesContainer"></div>
+            </div>
+
+            <div class="part-info" id="partInfo" style="display: none;">
+                Processing part <span id="currentPart">1</span> of <span id="totalParts">1</span>
+            </div>
+
+            <button class="cancel-btn" id="cancelBtn">Cancel Translation</button>
         </div>
 
         <div class="result-container" id="resultContainer">
@@ -332,17 +593,22 @@
         </div>
 
         <div class="error-container" id="errorContainer">
+            <div class="error-icon">❌</div>
             <div class="error-text" id="errorText"></div>
         </div>
     </div>
 
     <script>
-        // API Configuration - UPDATE THIS WITH YOUR BACKEND URL
-        const API_BASE_URL = window.location.origin;  // Change this to your deployed backend URL
+        // API Configuration
+        const API_BASE_URL = window.location.origin;
 
         let selectedFile = null;
-        let translatedFileBlob = null;
+        let currentSessionId = null;
+        let eventSource = null;
+        let completedStages = new Set();
+        let allStages = [];
 
+        // DOM Elements
         const uploadArea = document.getElementById('uploadArea');
         const fileInput = document.getElementById('fileInput');
         const fileInfo = document.getElementById('fileInfo');
@@ -351,19 +617,116 @@
         const translateBtn = document.getElementById('translateBtn');
         const progressContainer = document.getElementById('progressContainer');
         const progressFill = document.getElementById('progressFill');
-        const progressText = document.getElementById('progressText');
+        const progressPercentage = document.getElementById('progressPercentage');
+        const currentStageName = document.getElementById('currentStageName');
+        const stageProgressFill = document.getElementById('stageProgressFill');
+        const stageProgressText = document.getElementById('stageProgressText');
+        const stagesContainer = document.getElementById('stagesContainer');
+        const partInfo = document.getElementById('partInfo');
+        const currentPart = document.getElementById('currentPart');
+        const totalParts = document.getElementById('totalParts');
         const resultContainer = document.getElementById('resultContainer');
         const errorContainer = document.getElementById('errorContainer');
         const errorText = document.getElementById('errorText');
         const downloadBtn = document.getElementById('downloadBtn');
+        const cancelBtn = document.getElementById('cancelBtn');
+        const stageSpinner = document.getElementById('stageSpinner');
 
-        // Upload area click
+        // Default stages (will be replaced by server data)
+        const defaultStages = [
+            { name: 'Create IL', display_name: '📄 Parsing PDF Structure' },
+            { name: 'Detect Scanned File', display_name: '🔍 Detecting Scanned Content' },
+            { name: 'Layout', display_name: '📐 Analyzing Page Layout' },
+            { name: 'Table', display_name: '📊 Processing Tables' },
+            { name: 'Paragraph', display_name: '📝 Finding Paragraphs' },
+            { name: 'Styles And Formulas', display_name: '🔢 Processing Formulas & Styles' },
+            { name: 'AutomaticTermExtractor', display_name: '📚 Extracting Terms' },
+            { name: 'Translate', display_name: '🌐 Translating Content' },
+            { name: 'Typesetting', display_name: '✍️ Typesetting Document' },
+            { name: 'Font Mapper', display_name: '🔤 Mapping Fonts' },
+            { name: 'PDF Creater', display_name: '📑 Generating PDF' },
+            { name: 'Subset Font', display_name: '⚙️ Subsetting Fonts' },
+            { name: 'Save PDF', display_name: '💾 Saving Document' },
+        ];
+
+        // Initialize stages
+        function initializeStages(stages = null) {
+            allStages = stages || defaultStages;
+            completedStages.clear();
+            stagesContainer.innerHTML = '';
+            
+            allStages.forEach(stage => {
+                const stageEl = document.createElement('div');
+                stageEl.className = 'stage-item pending';
+                stageEl.id = `stage-${stage.name.replace(/\s+/g, '-')}`;
+                stageEl.innerHTML = `
+                    <div class="stage-icon">⏳</div>
+                    <div class="stage-name">${stage.display_name}</div>
+                    <div class="stage-status">Pending</div>
+                `;
+                stagesContainer.appendChild(stageEl);
+            });
+        }
+
+        // Update stage status
+        function updateStageStatus(stageName, status, displayName) {
+            // Find stage element by partial match
+            const stageEl = Array.from(stagesContainer.children).find(el => {
+                const elName = el.querySelector('.stage-name').textContent;
+                return elName.includes(stageName) || 
+                       displayName && elName === displayName ||
+                       el.id.toLowerCase().includes(stageName.toLowerCase().replace(/\s+/g, '-'));
+            });
+            
+            if (!stageEl) return;
+
+            stageEl.className = `stage-item ${status}`;
+            const iconEl = stageEl.querySelector('.stage-icon');
+            const statusEl = stageEl.querySelector('.stage-status');
+
+            if (status === 'completed') {
+                iconEl.textContent = '✅';
+                statusEl.textContent = 'Complete';
+                completedStages.add(stageName);
+            } else if (status === 'active') {
+                iconEl.textContent = '⚡';
+                statusEl.textContent = 'Processing...';
+            } else {
+                iconEl.textContent = '⏳';
+                statusEl.textContent = 'Pending';
+            }
+        }
+
+        // Find and update stage by matching name
+        function findAndUpdateStage(stageName, displayName, status) {
+            const stageEls = stagesContainer.children;
+            for (const stageEl of stageEls) {
+                const nameEl = stageEl.querySelector('.stage-name');
+                if (nameEl && (
+                    nameEl.textContent === displayName ||
+                    nameEl.textContent.includes(stageName) ||
+                    stageName.toLowerCase().includes(nameEl.textContent.split(' ').pop()?.toLowerCase() || '')
+                )) {
+                    stageEl.className = `stage-item ${status}`;
+                    const iconEl = stageEl.querySelector('.stage-icon');
+                    const statusEl = stageEl.querySelector('.stage-status');
+
+                    if (status === 'completed') {
+                        iconEl.textContent = '✅';
+                        statusEl.textContent = 'Complete';
+                    } else if (status === 'active') {
+                        iconEl.textContent = '⚡';
+                        statusEl.textContent = 'Processing...';
+                    }
+                    break;
+                }
+            }
+        }
+
+        // Upload area event handlers
         uploadArea.addEventListener('click', () => fileInput.click());
-
-        // File input change
         fileInput.addEventListener('change', handleFileSelect);
 
-        // Drag and drop
         uploadArea.addEventListener('dragover', (e) => {
             e.preventDefault();
             uploadArea.classList.add('dragover');
@@ -429,76 +792,218 @@
                 return;
             }
 
-            await translateDocument(selectedFile, sourceLang, targetLang);
+            await startTranslation(selectedFile, sourceLang, targetLang);
         });
 
-        async function translateDocument(file, sourceLang, targetLang) {
+        // Cancel button
+        cancelBtn.addEventListener('click', () => {
+            if (eventSource) {
+                eventSource.close();
+                eventSource = null;
+            }
+            hideProgress();
+            translateBtn.disabled = false;
+            showError('Translation cancelled');
+        });
+
+        async function startTranslation(file, sourceLang, targetLang) {
             hideError();
             hideResult();
-            showProgress('Uploading document...');
+            showProgress();
             translateBtn.disabled = true;
+            initializeStages();
 
             try {
+                // Step 1: Start translation and get session ID
                 const formData = new FormData();
                 formData.append('file', file);
                 formData.append('source_lang', sourceLang);
                 formData.append('target_lang', targetLang);
 
-                const response = await fetch(`${API_BASE_URL}/translate`, {
+                updateCurrentStage('📤 Uploading document...', 0, 0, 0);
+
+                const startResponse = await fetch(`${API_BASE_URL}/translate/start`, {
                     method: 'POST',
                     body: formData
                 });
 
-                if (!response.ok) {
-                    const errorData = await response.json();
-                    throw new Error(errorData.detail || 'Translation failed');
+                if (!startResponse.ok) {
+                    const errorData = await startResponse.json();
+                    throw new Error(errorData.detail || 'Failed to start translation');
                 }
 
-                updateProgress('Translation complete! Preparing download...');
-                
-                translatedFileBlob = await response.blob();
-                showResult();
-                hideProgress();
+                const { session_id } = await startResponse.json();
+                currentSessionId = session_id;
+
+                // Step 2: Connect to progress stream
+                connectToProgressStream(session_id);
 
             } catch (error) {
                 console.error('Translation error:', error);
                 showError(error.message || 'An error occurred during translation');
                 hideProgress();
-            } finally {
                 translateBtn.disabled = false;
             }
         }
 
-        downloadBtn.addEventListener('click', () => {
-            if (!translatedFileBlob) return;
+        function connectToProgressStream(sessionId) {
+            eventSource = new EventSource(`${API_BASE_URL}/translate/progress/${sessionId}`);
 
-            const url = window.URL.createObjectURL(translatedFileBlob);
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = `translated_${selectedFile.name}`;
-            document.body.appendChild(a);
-            a.click();
-            window.URL.revokeObjectURL(url);
-            document.body.removeChild(a);
-        });
+            let currentActiveStage = null;
 
-        function showProgress(text) {
-            progressText.textContent = text;
-            progressContainer.classList.add('active');
-            progressFill.style.width = '100%';
+            eventSource.onmessage = (event) => {
+                try {
+                    const data = JSON.parse(event.data);
+                    
+                    switch (data.type) {
+                        case 'init':
+                            updateCurrentStage('⏳ Initializing translation...', 0, 0, 0);
+                            break;
+
+                        case 'stage_summary':
+                            // Reinitialize stages with server data
+                            if (data.stages && data.stages.length > 0) {
+                                initializeStages(data.stages);
+                            }
+                            break;
+
+                        case 'progress_start':
+                            // Mark previous stage as completed
+                            if (currentActiveStage && currentActiveStage !== data.stage) {
+                                findAndUpdateStage(currentActiveStage, '', 'completed');
+                            }
+                            currentActiveStage = data.stage;
+                            
+                            // Update current stage
+                            findAndUpdateStage(data.stage, data.display_name, 'active');
+                            updateCurrentStage(
+                                data.display_name,
+                                0,
+                                data.stage_current,
+                                data.stage_total
+                            );
+                            updateOverallProgress(data.overall_progress || 0);
+                            updatePartInfo(data.part_index, data.total_parts);
+                            break;
+
+                        case 'progress_update':
+                            currentActiveStage = data.stage;
+                            findAndUpdateStage(data.stage, data.display_name, 'active');
+                            updateCurrentStage(
+                                data.display_name,
+                                data.stage_progress,
+                                data.stage_current,
+                                data.stage_total
+                            );
+                            updateOverallProgress(data.overall_progress);
+                            updatePartInfo(data.part_index, data.total_parts);
+                            break;
+
+                        case 'progress_end':
+                            findAndUpdateStage(data.stage, data.display_name, 'completed');
+                            updateOverallProgress(data.overall_progress);
+                            break;
+
+                        case 'finish':
+                            // Mark all stages as completed
+                            Array.from(stagesContainer.children).forEach(el => {
+                                el.className = 'stage-item completed';
+                                el.querySelector('.stage-icon').textContent = '✅';
+                                el.querySelector('.stage-status').textContent = 'Complete';
+                            });
+                            
+                            updateOverallProgress(100);
+                            stageSpinner.style.display = 'none';
+                            currentStageName.textContent = '✅ Translation Complete!';
+                            
+                            eventSource.close();
+                            eventSource = null;
+                            
+                            setTimeout(() => {
+                                hideProgress();
+                                showResult();
+                            }, 1000);
+                            break;
+
+                        case 'error':
+                            eventSource.close();
+                            eventSource = null;
+                            hideProgress();
+                            showError(data.error || 'An error occurred during translation');
+                            translateBtn.disabled = false;
+                            break;
+                    }
+                } catch (e) {
+                    console.error('Error parsing progress event:', e);
+                }
+            };
+
+            eventSource.onerror = (error) => {
+                console.error('EventSource error:', error);
+                if (eventSource) {
+                    eventSource.close();
+                    eventSource = null;
+                }
+                // Don't show error if translation completed
+                if (!resultContainer.classList.contains('active')) {
+                    hideProgress();
+                    showError('Connection lost. Please try again.');
+                    translateBtn.disabled = false;
+                }
+            };
         }
 
-        function updateProgress(text) {
-            progressText.textContent = text;
+        function updateCurrentStage(name, progress, current, total) {
+            currentStageName.textContent = name;
+            stageProgressFill.style.width = `${progress}%`;
+            
+            if (total > 0) {
+                stageProgressText.textContent = `${current} / ${total}`;
+            } else {
+                stageProgressText.textContent = progress > 0 ? `${Math.round(progress)}%` : 'Starting...';
+            }
+        }
+
+        function updateOverallProgress(progress) {
+            const roundedProgress = Math.round(progress);
+            progressFill.style.width = `${roundedProgress}%`;
+            progressPercentage.textContent = `${roundedProgress}%`;
+        }
+
+        function updatePartInfo(partIndex, totalPartsCount) {
+            if (totalPartsCount > 1) {
+                partInfo.style.display = 'block';
+                currentPart.textContent = partIndex;
+                totalParts.textContent = totalPartsCount;
+            } else {
+                partInfo.style.display = 'none';
+            }
+        }
+
+        // Download button click
+        downloadBtn.addEventListener('click', () => {
+            if (!currentSessionId) return;
+            
+            // Open download URL in new tab/window
+            window.open(`${API_BASE_URL}/translate/download/${currentSessionId}`, '_blank');
+        });
+
+        function showProgress() {
+            progressContainer.classList.add('active');
+            progressFill.style.width = '0%';
+            progressPercentage.textContent = '0%';
+            stageProgressFill.style.width = '0%';
+            stageProgressText.textContent = 'Starting...';
+            stageSpinner.style.display = 'block';
         }
 
         function hideProgress() {
             progressContainer.classList.remove('active');
-            progressFill.style.width = '0%';
         }
 
         function showResult() {
             resultContainer.classList.add('active');
+            translateBtn.disabled = false;
         }
 
         function hideResult() {
