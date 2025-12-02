@@ -226,8 +226,8 @@ class ParagraphFinder:
                     para_info = {
                         'page': page_idx + 1,
                         'paragraph_id': para_idx + 1,
-                        'text': para.unicode if hasattr(para, 'unicode') else '',
-                        'char_count': len(para.unicode) if hasattr(para, 'unicode') else 0,
+                        'text': para.unicode if hasattr(para, 'unicode') and para.unicode else '',
+                        'char_count': len(para.unicode) if hasattr(para, 'unicode') and para.unicode else 0,
                         'layout_label': para.layout_label if hasattr(para, 'layout_label') else 'unknown',
                         'box': str(para.box) if hasattr(para, 'box') else 'N/A'
                     }
