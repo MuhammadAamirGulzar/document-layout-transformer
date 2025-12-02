@@ -1094,7 +1094,7 @@ def _do_translate_single(
                     'text': para.unicode if hasattr(para, 'unicode') else '',
                     'layout_label': para.layout_label if hasattr(para, 'layout_label') else 'N/A',
                     'box': str(para.box) if hasattr(para, 'box') else 'N/A',
-                    'char_count': len(para.unicode) if hasattr(para, 'unicode') else 0
+                    'char_count': len(para.unicode) if hasattr(para, 'unicode') and para.unicode else 0
                 })
 
         detailed_logger.end_stage("Parse Paragraphs")
