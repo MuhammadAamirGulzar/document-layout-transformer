@@ -194,6 +194,8 @@ class ILTranslatorLLMOnly:
         return text
 
     def calc_token_count(self, text: str) -> int:
+        if text is None:  # ADD THIS LINE
+            return 0       # ADD THIS LINE
         try:
             return len(self.tokenizer.encode(text, disallowed_special=()))
         except Exception:
@@ -601,7 +603,7 @@ class ILTranslatorLLMOnly:
                 continue
 
             # Check minimum length - advance progress bar if filtered out
-            if len(paragraph.unicode) < self.translation_config.min_text_length:
+            if not paragraph.unicode or len(paragraph.unicode) < self.translation_config.min_text_length:
                 if pbar:
                     pbar.advance(1)
                 continue
