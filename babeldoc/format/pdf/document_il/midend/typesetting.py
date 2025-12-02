@@ -821,7 +821,6 @@ class Typesetting:
         self.detailed_logger = None
         self.is_cjk = (
             # Why zh-CN/zh-HK/zh-TW here but not zh-Hans and so on?
-            # See https://funstory-ai.github.io/BabelDOC/supported_languages/
             ("ZH" in self.lang_code)  # C
             or ("JA" in self.lang_code)
             or ("JP" in self.lang_code)  # J
