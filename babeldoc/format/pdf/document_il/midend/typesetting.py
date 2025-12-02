@@ -199,11 +199,11 @@ class TypesettingUnit:
         unicode = self.try_get_unicode()
         if unicode:
             return unicode in [
-                "Â£",
-                "ØŒ",
-                "ï¼",
-                "ï¼š",
-                "ï¼‰",
+                "Ã‚Â£",
+                "Ã˜Å’",
+                "Ã¯Â¼Â",
+                "Ã¯Â¼Å¡",
+                "Ã¯Â¼â€°",
             ]
         return False
 
@@ -241,20 +241,20 @@ class TypesettingUnit:
             return False
         assert len(unicode) == 1, "Unicode must be a single character"
         if unicode in [
-            "ï¼ˆ",
-            "ï¼‰",
-            "ØŒ",
-            "ã€‚",
-            "ã€",
-            "ï¼›",
-            "ï¼š",
-            "ï¼Ÿ",
-            "ï¼",
-            "ï¼‰",
-            "ØŒ",
-            "ï¼",
-            "ï¼š",
-            "ï¼‰",
+            "Ã¯Â¼Ë†",
+            "Ã¯Â¼â€°",
+            "Ã˜Å’",
+            "Ã£â‚¬â€š",
+            "Ã£â‚¬Â",
+            "Ã¯Â¼â€º",
+            "Ã¯Â¼Å¡",
+            "Ã¯Â¼Å¸",
+            "Ã¯Â¼Â",
+            "Ã¯Â¼â€°",
+            "Ã˜Å’",
+            "Ã¯Â¼Â",
+            "Ã¯Â¼Å¡",
+            "Ã¯Â¼â€°",
         ]:
             return True
         if unicode:
@@ -327,33 +327,33 @@ class TypesettingUnit:
                 "?",
                 "!",
                 # Chinese punctuation
-                "ØŒ",  # Comma
-                "ã€‚",  # Period
-                "ï¼š",  # Colon
-                "ï¼›",  # Semicolon
-                "ï¼Ÿ",  # Question mark
-                "ï¼",  # Exclamation mark
-                "ã€",  # Enumeration comma
+                "Ã˜Å’",  # Comma
+                "Ã£â‚¬â€š",  # Period
+                "Ã¯Â¼Å¡",  # Colon
+                "Ã¯Â¼â€º",  # Semicolon
+                "Ã¯Â¼Å¸",  # Question mark
+                "Ã¯Â¼Â",  # Exclamation mark
+                "Ã£â‚¬Â",  # Enumeration comma
                 # Closing brackets
                 ")",  # Right parenthesis
                 "]",  # Right square bracket
                 "}",  # Right curly bracket
-                "ï¼‰",  # Right parenthesis
-                "ã€‘",  # Right square bracket
-                "ã€‹",  # Right double angle bracket
-                "ã€",  # Right single quotation mark
-                "ã€",  # Right corner bracket
+                "Ã¯Â¼â€°",  # Right parenthesis
+                "Ã£â‚¬â€˜",  # Right square bracket
+                "Ã£â‚¬â€¹",  # Right double angle bracket
+                "Ã£â‚¬Â",  # Right single quotation mark
+                "Ã£â‚¬Â",  # Right corner bracket
                 # Connected line symbols
-                "â€“",  # EN DASH
-                "â€”",  # EM DASH
+                "Ã¢â‚¬â€œ",  # EN DASH
+                "Ã¢â‚¬â€",  # EM DASH
                 # Special punctuation
-                "Â·",  # Middle dot
-                "â€¦",  # Ellipsis
-                "Â°",  # Degree symbol
+                "Ã‚Â·",  # Middle dot
+                "Ã¢â‚¬Â¦",  # Ellipsis
+                "Ã‚Â°",  # Degree symbol
                 # Slash
                 "/",  # Slash
-                "ï¼",  # Fullwidth solidus
-                "â€°",  # Per mille sign
+                "Ã¯Â¼Â",  # Fullwidth solidus
+                "Ã¢â‚¬Â°",  # Per mille sign
             ]
         return False
 
@@ -376,21 +376,21 @@ class TypesettingUnit:
             # Opening brackets
             """,  # Left double quotation mark
             "'",  # Left single quotation mark
-            "ã€Š",  # Left double angle bracket
-            "ã€Ž",  # Left single quotation mark
+            "Ã£â‚¬Å ",  # Left double angle bracket
+            "Ã£â‚¬Å½",  # Left single quotation mark
             # Opening brackets
             "(",  # Left parenthesis
             "[",  # Left square bracket
             "{",  # Left curly bracket
-            "ï¼ˆ",  # Left parenthesis
-            "ã€",  # Left square bracket
-            "ã€Š",  # Left double angle bracket
-            "ã€Ž",  # Left single quotation mark
+            "Ã¯Â¼Ë†",  # Left parenthesis
+            "Ã£â‚¬Â",  # Left square bracket
+            "Ã£â‚¬Å ",  # Left double angle bracket
+            "Ã£â‚¬Å½",  # Left single quotation mark
             # Cannot appear at end of line - combined with closing brackets
             """,  # Right double quotation mark
             "'",  # Right single quotation mark
-            "ã€‹",  # Right double angle bracket
-            "ã€",  # Right single quotation mark
+            "Ã£â‚¬â€¹",  # Right double angle bracket
+            "Ã£â‚¬Â",  # Right single quotation mark
         ]
 
     def passthrough(
@@ -821,6 +821,7 @@ class Typesetting:
         self.detailed_logger = None
         self.is_cjk = (
             # Why zh-CN/zh-HK/zh-TW here but not zh-Hans and so on?
+            
             ("ZH" in self.lang_code)  # C
             or ("JA" in self.lang_code)
             or ("JP" in self.lang_code)  # J
@@ -828,6 +829,12 @@ class Typesetting:
             or ("CN" in self.lang_code)
             or ("HK" in self.lang_code)
             or ("TW" in self.lang_code)
+        )
+        # Arabic needs extra line spacing due to diacritical marks (harakat) above/below letters
+        self.is_arabic = (
+            ("AR" in self.lang_code)
+            or ("ARABIC" in self.lang_code)
+            or ("ARA" in self.lang_code)
         )
 
     def preprocess_document(self, document: il_version_1.Document, pbar):
@@ -982,7 +989,15 @@ class Typesetting:
 
         box = paragraph.box
         scale = initial_scale
-        line_skip = 1.50 if self.is_cjk else 1.3
+        # Arabic needs extra line spacing (1.5) due to diacritical marks above/below letters
+        # CJK also needs 1.5 due to character height
+        # Other languages use 1.3
+        if self.is_cjk:
+            line_skip = 1.50
+        elif self.is_arabic:
+            line_skip = 1.50  # Arabic needs extra space for diacritical marks (harakat)
+        else:
+            line_skip = 1.3
         min_scale = 0.1
         expand_space_flag = 0
         final_typeset_units = None
@@ -1975,7 +1990,7 @@ class Typesetting:
                     and not last_unit.mixed_character_blacklist and not unit.mixed_character_blacklist
                     and current_x > box.x and unit.try_get_unicode() != " "
                     and last_unit.try_get_unicode() != " "
-                    and last_unit.try_get_unicode() not in ["ã€", "ØŒ", "ã€‚", "ï¼š", "ï¼", "ï¼Ÿ"]):
+                    and last_unit.try_get_unicode() not in ["Ã£â‚¬Â", "Ã˜Å’", "Ã£â‚¬â€š", "Ã¯Â¼Å¡", "Ã¯Â¼Â", "Ã¯Â¼Å¸"]):
                     current_x += space_width * 0.5
                 
                 if use_english_line_break:
@@ -2018,56 +2033,9 @@ class Typesetting:
 
                 last_unit = relocated_unit
         
-        # Check if output language is Arabic
-        lang_out = (self.translation_config.lang_out or "").lower()
-        is_arabic = False
-        if lang_out in ("en-ar", "ar", "ara", "arabic"):
-            is_arabic = True
-        elif "-ar" in lang_out or "->ar" in lang_out or "/ar" in lang_out:
-            is_arabic = True
-        
-        # If Arabic, reverse the line order
-        if is_arabic and typeset_units:
-            # Group units by line (using Y coordinates)
-            lines_dict = {}
-            for unit in typeset_units:
-                if unit.box and unit.box.y is not None:
-                    # Round Y coordinate to group units on the same line
-                    line_y = round(unit.box.y, 1)
-                    if line_y not in lines_dict:
-                        lines_dict[line_y] = []
-                    lines_dict[line_y].append(unit)
-            
-            # Sort lines by Y coordinate (top to bottom) and reverse
-            sorted_line_ys = sorted(lines_dict.keys(), reverse=True)
-            
-            # Rebuild typeset_units with reversed line order
-            reversed_typeset_units = []
-            for line_y in reversed(sorted_line_ys):
-                reversed_typeset_units.extend(lines_dict[line_y])
-            
-            # Now reposition all units to swap their Y coordinates
-            # Map old Y positions to new Y positions
-            y_mapping = {}
-            for i, old_y in enumerate(sorted_line_ys):
-                new_y = sorted_line_ys[len(sorted_line_ys) - 1 - i]
-                y_mapping[old_y] = new_y
-            
-            # Update Y coordinates for all units
-            for unit in reversed_typeset_units:
-                if unit.box and unit.box.y is not None:
-                    old_y = round(unit.box.y, 1)
-                    if old_y in y_mapping:
-                        new_y = y_mapping[old_y]
-                        y_diff = new_y - old_y
-                        # Update the unit's Y position
-                        if unit.y is not None:
-                            unit.y += y_diff
-                        if unit.box:
-                            unit.box.y += y_diff
-                            unit.box.y2 += y_diff
-            
-            typeset_units = reversed_typeset_units
+        # NOTE: Arabic RTL text flows RIGHT-to-LEFT horizontally but still TOP-to-BOTTOM vertically
+        # The right-alignment is already handled in the Arabic layout logic above (lines 1909-1963)
+        # DO NOT reverse Y positions - this was causing text overlap issues
         
         return typeset_units, all_units_fit
 
