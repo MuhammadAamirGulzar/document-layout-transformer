@@ -134,6 +134,8 @@ class AutomaticTermExtractor:
             )
 
     def calc_token_count(self, text: str) -> int:
+        if text is None:  # ADD THIS LINE
+            return 0       # ADD THIS LINE
         try:
             return len(self.tokenizer.encode(text, disallowed_special=()))
         except Exception:
