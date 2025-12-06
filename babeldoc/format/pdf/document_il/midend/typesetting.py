@@ -199,11 +199,11 @@ class TypesettingUnit:
         unicode = self.try_get_unicode()
         if unicode:
             return unicode in [
-                "Ã‚Â£",
-                "Ã˜Å’",
-                "Ã¯Â¼Â",
-                "Ã¯Â¼Å¡",
-                "Ã¯Â¼â€°",
+                "Ãƒâ€šÃ‚Â£",
+                "ÃƒËœÃ…â€™",
+                "ÃƒÂ¯Ã‚Â¼Ã‚Â",
+                "ÃƒÂ¯Ã‚Â¼Ã…Â¡",
+                "ÃƒÂ¯Ã‚Â¼Ã¢â‚¬Â°",
             ]
         return False
 
@@ -241,20 +241,20 @@ class TypesettingUnit:
             return False
         assert len(unicode) == 1, "Unicode must be a single character"
         if unicode in [
-            "Ã¯Â¼Ë†",
-            "Ã¯Â¼â€°",
-            "Ã˜Å’",
-            "Ã£â‚¬â€š",
-            "Ã£â‚¬Â",
-            "Ã¯Â¼â€º",
-            "Ã¯Â¼Å¡",
-            "Ã¯Â¼Å¸",
-            "Ã¯Â¼Â",
-            "Ã¯Â¼â€°",
-            "Ã˜Å’",
-            "Ã¯Â¼Â",
-            "Ã¯Â¼Å¡",
-            "Ã¯Â¼â€°",
+            "ÃƒÂ¯Ã‚Â¼Ã‹â€ ",
+            "ÃƒÂ¯Ã‚Â¼Ã¢â‚¬Â°",
+            "ÃƒËœÃ…â€™",
+            "ÃƒÂ£Ã¢â€šÂ¬Ã¢â‚¬Å¡",
+            "ÃƒÂ£Ã¢â€šÂ¬Ã‚Â",
+            "ÃƒÂ¯Ã‚Â¼Ã¢â‚¬Âº",
+            "ÃƒÂ¯Ã‚Â¼Ã…Â¡",
+            "ÃƒÂ¯Ã‚Â¼Ã…Â¸",
+            "ÃƒÂ¯Ã‚Â¼Ã‚Â",
+            "ÃƒÂ¯Ã‚Â¼Ã¢â‚¬Â°",
+            "ÃƒËœÃ…â€™",
+            "ÃƒÂ¯Ã‚Â¼Ã‚Â",
+            "ÃƒÂ¯Ã‚Â¼Ã…Â¡",
+            "ÃƒÂ¯Ã‚Â¼Ã¢â‚¬Â°",
         ]:
             return True
         if unicode:
@@ -327,33 +327,33 @@ class TypesettingUnit:
                 "?",
                 "!",
                 # Chinese punctuation
-                "Ã˜Å’",  # Comma
-                "Ã£â‚¬â€š",  # Period
-                "Ã¯Â¼Å¡",  # Colon
-                "Ã¯Â¼â€º",  # Semicolon
-                "Ã¯Â¼Å¸",  # Question mark
-                "Ã¯Â¼Â",  # Exclamation mark
-                "Ã£â‚¬Â",  # Enumeration comma
+                "ÃƒËœÃ…â€™",  # Comma
+                "ÃƒÂ£Ã¢â€šÂ¬Ã¢â‚¬Å¡",  # Period
+                "ÃƒÂ¯Ã‚Â¼Ã…Â¡",  # Colon
+                "ÃƒÂ¯Ã‚Â¼Ã¢â‚¬Âº",  # Semicolon
+                "ÃƒÂ¯Ã‚Â¼Ã…Â¸",  # Question mark
+                "ÃƒÂ¯Ã‚Â¼Ã‚Â",  # Exclamation mark
+                "ÃƒÂ£Ã¢â€šÂ¬Ã‚Â",  # Enumeration comma
                 # Closing brackets
                 ")",  # Right parenthesis
                 "]",  # Right square bracket
                 "}",  # Right curly bracket
-                "Ã¯Â¼â€°",  # Right parenthesis
-                "Ã£â‚¬â€˜",  # Right square bracket
-                "Ã£â‚¬â€¹",  # Right double angle bracket
-                "Ã£â‚¬Â",  # Right single quotation mark
-                "Ã£â‚¬Â",  # Right corner bracket
+                "ÃƒÂ¯Ã‚Â¼Ã¢â‚¬Â°",  # Right parenthesis
+                "ÃƒÂ£Ã¢â€šÂ¬Ã¢â‚¬Ëœ",  # Right square bracket
+                "ÃƒÂ£Ã¢â€šÂ¬Ã¢â‚¬Â¹",  # Right double angle bracket
+                "ÃƒÂ£Ã¢â€šÂ¬Ã‚Â",  # Right single quotation mark
+                "ÃƒÂ£Ã¢â€šÂ¬Ã‚Â",  # Right corner bracket
                 # Connected line symbols
-                "Ã¢â‚¬â€œ",  # EN DASH
-                "Ã¢â‚¬â€",  # EM DASH
+                "ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“",  # EN DASH
+                "ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â",  # EM DASH
                 # Special punctuation
-                "Ã‚Â·",  # Middle dot
-                "Ã¢â‚¬Â¦",  # Ellipsis
-                "Ã‚Â°",  # Degree symbol
+                "Ãƒâ€šÃ‚Â·",  # Middle dot
+                "ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦",  # Ellipsis
+                "Ãƒâ€šÃ‚Â°",  # Degree symbol
                 # Slash
                 "/",  # Slash
-                "Ã¯Â¼Â",  # Fullwidth solidus
-                "Ã¢â‚¬Â°",  # Per mille sign
+                "ÃƒÂ¯Ã‚Â¼Ã‚Â",  # Fullwidth solidus
+                "ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â°",  # Per mille sign
             ]
         return False
 
@@ -376,21 +376,21 @@ class TypesettingUnit:
             # Opening brackets
             """,  # Left double quotation mark
             "'",  # Left single quotation mark
-            "Ã£â‚¬Å ",  # Left double angle bracket
-            "Ã£â‚¬Å½",  # Left single quotation mark
+            "ÃƒÂ£Ã¢â€šÂ¬Ã… ",  # Left double angle bracket
+            "ÃƒÂ£Ã¢â€šÂ¬Ã…Â½",  # Left single quotation mark
             # Opening brackets
             "(",  # Left parenthesis
             "[",  # Left square bracket
             "{",  # Left curly bracket
-            "Ã¯Â¼Ë†",  # Left parenthesis
-            "Ã£â‚¬Â",  # Left square bracket
-            "Ã£â‚¬Å ",  # Left double angle bracket
-            "Ã£â‚¬Å½",  # Left single quotation mark
+            "ÃƒÂ¯Ã‚Â¼Ã‹â€ ",  # Left parenthesis
+            "ÃƒÂ£Ã¢â€šÂ¬Ã‚Â",  # Left square bracket
+            "ÃƒÂ£Ã¢â€šÂ¬Ã… ",  # Left double angle bracket
+            "ÃƒÂ£Ã¢â€šÂ¬Ã…Â½",  # Left single quotation mark
             # Cannot appear at end of line - combined with closing brackets
             """,  # Right double quotation mark
             "'",  # Right single quotation mark
-            "Ã£â‚¬â€¹",  # Right double angle bracket
-            "Ã£â‚¬Â",  # Right single quotation mark
+            "ÃƒÂ£Ã¢â€šÂ¬Ã¢â‚¬Â¹",  # Right double angle bracket
+            "ÃƒÂ£Ã¢â€šÂ¬Ã‚Â",  # Right single quotation mark
         ]
 
     def passthrough(
@@ -1316,6 +1316,76 @@ class Typesetting:
             return True
         return False
 
+    def _get_effective_arabic_box(
+        self, 
+        paragraph: il_version_1.PdfParagraph, 
+        page: il_version_1.Page,
+        original_box: Box
+    ) -> Box:
+        """Get the effective bounding box for Arabic text layout.
+        
+        This calculates where the text will actually end up after RTL margin mirroring,
+        and ensures the box stays within page bounds. This prevents text from overflowing
+        the page margins.
+        
+        Args:
+            paragraph: The paragraph being laid out
+            page: The page containing the paragraph
+            original_box: The original bounding box from the English source
+            
+        Returns:
+            A new Box that represents the effective layout area after considering
+            RTL margin mirroring and page bounds
+        """
+        if not page.cropbox or not page.cropbox.box:
+            return original_box
+        
+        page_box = page.cropbox.box
+        
+        # Get the margin shift that will be applied later
+        shift_x = self._calculate_rtl_margin_shift(paragraph, page)
+        
+        # Calculate where the box will be after margin shifting
+        final_x = original_box.x + shift_x
+        final_x2 = original_box.x2 + shift_x
+        
+        # Get safe page margins (2% from each edge)
+        page_left_margin = page_box.x + (page_box.x2 - page_box.x) * 0.02
+        page_right_margin = page_box.x2 - (page_box.x2 - page_box.x) * 0.02
+        
+        # Check if the shifted box would overflow the right margin
+        if final_x2 > page_right_margin:
+            # Calculate how much we need to shrink the box
+            overflow = final_x2 - page_right_margin
+            # Reduce the box width from the right side
+            new_x2 = original_box.x2 - overflow
+            # Ensure we don't make the box too small
+            min_width = (page_box.x2 - page_box.x) * 0.1  # At least 10% of page width
+            if new_x2 - original_box.x < min_width:
+                new_x2 = original_box.x + min_width
+            
+            return Box(
+                x=original_box.x,
+                y=original_box.y,
+                x2=new_x2,
+                y2=original_box.y2
+            )
+        
+        # Check if the shifted box would overflow the left margin
+        if final_x < page_left_margin:
+            # This shouldn't normally happen with RTL, but handle it
+            overflow = page_left_margin - final_x
+            new_x = original_box.x + overflow
+            
+            return Box(
+                x=new_x,
+                y=original_box.y,
+                x2=original_box.x2,
+                y2=original_box.y2
+            )
+        
+        return original_box
+
     def _calculate_rtl_margin_shift(self, paragraph: il_version_1.PdfParagraph, page: il_version_1.Page) -> float:
         """Calculate the X shift needed for RTL margin mirroring.
         
@@ -1324,6 +1394,8 @@ class Typesetting:
         
         IMPORTANT: When there are sidebars or page decorations, we mirror within the
         CONTENT AREA (excluding decorations), not the full page width.
+        
+        The shift is clamped to ensure the paragraph stays within page bounds.
         
         Args:
             paragraph: The paragraph to mirror
@@ -1351,6 +1423,22 @@ class Typesetting:
         
         new_x = content_left + original_right_margin
         shift_x = new_x - box.x
+        
+        # CLAMP: Ensure the paragraph's right edge doesn't exceed content_right after shifting
+        # new_x2 = box.x2 + shift_x should be <= content_right
+        new_x2 = box.x2 + shift_x
+        if new_x2 > content_right:
+            # Reduce the shift to keep the right edge at content_right
+            overflow = new_x2 - content_right
+            shift_x -= overflow
+        
+        # CLAMP: Ensure the paragraph's left edge doesn't go below content_left
+        # new_x = box.x + shift_x should be >= content_left
+        new_x_clamped = box.x + shift_x
+        if new_x_clamped < content_left:
+            # Increase the shift to keep the left edge at content_left
+            underflow = content_left - new_x_clamped
+            shift_x += underflow
         
         return shift_x
 
@@ -1469,16 +1557,28 @@ class Typesetting:
     def _apply_rtl_margin_shift_to_composition(
         self, 
         composition: list[PdfParagraphComposition], 
-        shift_x: float
+        shift_x: float,
+        page: il_version_1.Page = None
     ) -> None:
         """Apply RTL margin shift to all characters in a composition list.
         
         Args:
             composition: List of paragraph compositions to shift
             shift_x: The X shift to apply
+            page: Optional page for clamping to page bounds
         """
         if shift_x == 0:
             return
+        
+        # Get page bounds for clamping if page is provided
+        clamp_right = None
+        clamp_left = None
+        if page and page.cropbox and page.cropbox.box:
+            page_box = page.cropbox.box
+            # Use a small margin (2%) from page edges for safety
+            page_margin = (page_box.x2 - page_box.x) * 0.02
+            clamp_left = page_box.x + page_margin
+            clamp_right = page_box.x2 - page_margin
             
         for comp in composition:
             if comp.pdf_character:
@@ -1486,9 +1586,28 @@ class Typesetting:
                 if char.box:
                     char.box.x += shift_x
                     char.box.x2 += shift_x
+                    # Clamp to page bounds if clamping is enabled
+                    if clamp_right is not None:
+                        if char.box.x2 > clamp_right:
+                            overflow = char.box.x2 - clamp_right
+                            char.box.x -= overflow
+                            char.box.x2 -= overflow
+                        if char.box.x < clamp_left:
+                            underflow = clamp_left - char.box.x
+                            char.box.x += underflow
+                            char.box.x2 += underflow
                 if char.visual_bbox and char.visual_bbox.box:
                     char.visual_bbox.box.x += shift_x
                     char.visual_bbox.box.x2 += shift_x
+                    if clamp_right is not None:
+                        if char.visual_bbox.box.x2 > clamp_right:
+                            overflow = char.visual_bbox.box.x2 - clamp_right
+                            char.visual_bbox.box.x -= overflow
+                            char.visual_bbox.box.x2 -= overflow
+                        if char.visual_bbox.box.x < clamp_left:
+                            underflow = clamp_left - char.visual_bbox.box.x
+                            char.visual_bbox.box.x += underflow
+                            char.visual_bbox.box.x2 += underflow
             elif comp.pdf_formula:
                 formula = comp.pdf_formula
                 if formula.box:
@@ -1731,12 +1850,25 @@ class Typesetting:
                 if shift_x != 0:
                     self._apply_rtl_margin_shift_to_composition(
                         paragraph.pdf_paragraph_composition, 
-                        shift_x
+                        shift_x,
+                        page  # Pass page for clamping
                     )
                     # Also update the paragraph box to reflect the new position
                     if paragraph.box:
                         paragraph.box.x += shift_x
                         paragraph.box.x2 += shift_x
+                        # Clamp paragraph box to page bounds
+                        if page.cropbox and page.cropbox.box:
+                            page_box = page.cropbox.box
+                            page_margin = (page_box.x2 - page_box.x) * 0.02
+                            if paragraph.box.x2 > page_box.x2 - page_margin:
+                                overflow = paragraph.box.x2 - (page_box.x2 - page_margin)
+                                paragraph.box.x -= overflow
+                                paragraph.box.x2 -= overflow
+                            if paragraph.box.x < page_box.x + page_margin:
+                                underflow = (page_box.x + page_margin) - paragraph.box.x
+                                paragraph.box.x += underflow
+                                paragraph.box.x2 += underflow
         else:
             # Use precomputed scale factor to layout typesetting units
             precomputed_scale = (
@@ -1761,12 +1893,25 @@ class Typesetting:
                 if shift_x != 0:
                     self._apply_rtl_margin_shift_to_composition(
                         paragraph.pdf_paragraph_composition, 
-                        shift_x
+                        shift_x,
+                        page  # Pass page for clamping
                     )
                     # Also update the paragraph box to reflect the new position
                     if paragraph.box:
                         paragraph.box.x += shift_x
                         paragraph.box.x2 += shift_x
+                        # Clamp paragraph box to page bounds
+                        if page.cropbox and page.cropbox.box:
+                            page_box = page.cropbox.box
+                            page_margin = (page_box.x2 - page_box.x) * 0.02
+                            if paragraph.box.x2 > page_box.x2 - page_margin:
+                                overflow = paragraph.box.x2 - (page_box.x2 - page_margin)
+                                paragraph.box.x -= overflow
+                                paragraph.box.x2 -= overflow
+                            if paragraph.box.x < page_box.x + page_margin:
+                                underflow = (page_box.x + page_margin) - paragraph.box.x
+                                paragraph.box.x += underflow
+                                paragraph.box.x2 += underflow
 
     def _is_arabic_char(self, char: str) -> bool:
         """Check if character is Arabic - OPTIMIZED"""
@@ -1841,9 +1986,12 @@ class Typesetting:
             arabic_word_spacing = space_width * ARABIC_WORD_SPACING_RATIO
             line_units_map: dict[int, list[TypesettingUnit]] = {}
             
+            # Calculate effective line width for wrapping
+            effective_line_width = box.x2 - box.x
+            
             i = 0
             safety_counter = 0
-            max_iterations = len(typesetting_units) * 2  # Safety limit
+            max_iterations = len(typesetting_units) * 3  # Increased safety limit for char-level breaks
             
             while i < len(typesetting_units) and safety_counter < max_iterations:
                 safety_counter += 1
@@ -1871,54 +2019,136 @@ class Typesetting:
                 if current_x == box.x and word_units and word_units[0].is_space:
                     continue
                 
-                # Check if needs new line
-                if current_x + word_width > box.x2 and current_x > box.x:
-                    current_x = box.x
-                    if current_line_heights:
-                        max_height = max(current_line_heights)
-                        mode_height = statistics.mode(current_line_heights) if len(current_line_heights) > 1 else max_height
-                        current_y -= max(mode_height * line_skip, max_height * 1.05)
-                        line_ys.append(current_y)
-                        current_line_heights = []
-                    
-                    if current_y < box.y:
-                        all_units_fit = False
-                    
-                    current_line_index += 1
+                # Calculate remaining space on current line
+                remaining_space = box.x2 - current_x
                 
-                # Place word units
-                relocated_word_units = []
-                for unit in word_units:
-                    if unit.is_space and current_x == box.x:
-                        continue
+                # Case 1: Word fits on current line
+                if word_width <= remaining_space:
+                    # Place all word units on current line
+                    relocated_word_units = []
+                    for unit in word_units:
+                        if unit.is_space and current_x == box.x:
+                            continue
+                        
+                        unit_width = unit.width * scale
+                        unit_height = unit.height * scale
+                        
+                        # CJK spacing
+                        if (last_unit and last_unit.is_cjk_char ^ unit.is_cjk_char 
+                            and not unit.is_space and current_x > box.x):
+                            current_x += space_width * 0.5
+                        
+                        relocated_unit = unit.relocate(current_x, current_y, scale)
+                        relocated_unit.line_id = current_line_index
+                        relocated_word_units.append(relocated_unit)
+                        typeset_units.append(relocated_unit)
+                        
+                        if not unit.is_space:
+                            current_line_heights.append(unit_height)
+                        
+                        current_x = relocated_unit.box.x2
+                        last_unit = relocated_unit
                     
-                    unit_width = unit.width * scale
-                    unit_height = unit.height * scale
-                    
-                    # CJK spacing
-                    if (last_unit and last_unit.is_cjk_char ^ unit.is_cjk_char 
-                        and not unit.is_space and current_x > box.x):
-                        current_x += space_width * 0.5
-                    
-                    relocated_unit = unit.relocate(current_x, current_y, scale)
-                    relocated_unit.line_id = current_line_index
-                    relocated_word_units.append(relocated_unit)
-                    typeset_units.append(relocated_unit)
-                    
-                    if not unit.is_space:
-                        current_line_heights.append(unit_height)
-                    
-                    current_x = relocated_unit.box.x2
-                    last_unit = relocated_unit
+                    if relocated_word_units:
+                        relocated_word_units[-1].ends_word = True
+                        line_units_map.setdefault(current_line_index, []).extend(relocated_word_units)
                 
-                if relocated_word_units:
-                    relocated_word_units[-1].ends_word = True
-                    line_units_map.setdefault(current_line_index, []).extend(relocated_word_units)
+                # Case 2: Word is too long - need to handle line break
+                else:
+                    # Check if we're not at the start of line - wrap to next line first
+                    if current_x > box.x:
+                        current_x = box.x
+                        if current_line_heights:
+                            max_height = max(current_line_heights)
+                            mode_height = statistics.mode(current_line_heights) if len(current_line_heights) > 1 else max_height
+                            current_y -= max(mode_height * line_skip, max_height * 1.05)
+                            line_ys.append(current_y)
+                            current_line_heights = []
+                        
+                        if current_y < box.y:
+                            all_units_fit = False
+                        
+                        current_line_index += 1
+                    
+                    # Now check if word fits on a fresh line
+                    if word_width <= effective_line_width:
+                        # Word fits on a line by itself
+                        relocated_word_units = []
+                        for unit in word_units:
+                            if unit.is_space and current_x == box.x:
+                                continue
+                            
+                            unit_width = unit.width * scale
+                            unit_height = unit.height * scale
+                            
+                            relocated_unit = unit.relocate(current_x, current_y, scale)
+                            relocated_unit.line_id = current_line_index
+                            relocated_word_units.append(relocated_unit)
+                            typeset_units.append(relocated_unit)
+                            
+                            if not unit.is_space:
+                                current_line_heights.append(unit_height)
+                            
+                            current_x = relocated_unit.box.x2
+                            last_unit = relocated_unit
+                        
+                        if relocated_word_units:
+                            relocated_word_units[-1].ends_word = True
+                            line_units_map.setdefault(current_line_index, []).extend(relocated_word_units)
+                    
+                    else:
+                        # Word is too long even for a full line - break at character level
+                        # This handles long Arabic strings without spaces
+                        relocated_word_units = []
+                        for unit_idx, unit in enumerate(word_units):
+                            if unit.is_space and current_x == box.x:
+                                continue
+                            
+                            unit_width = unit.width * scale
+                            unit_height = unit.height * scale
+                            
+                            # Check if this character fits on current line
+                            if current_x + unit_width > box.x2 and current_x > box.x:
+                                # Start a new line
+                                # Mark previous unit as ending a "word" (partial word)
+                                if relocated_word_units:
+                                    relocated_word_units[-1].ends_word = True
+                                    line_units_map.setdefault(current_line_index, []).extend(relocated_word_units)
+                                    relocated_word_units = []
+                                
+                                current_x = box.x
+                                if current_line_heights:
+                                    max_height = max(current_line_heights)
+                                    mode_height = statistics.mode(current_line_heights) if len(current_line_heights) > 1 else max_height
+                                    current_y -= max(mode_height * line_skip, max_height * 1.05)
+                                    line_ys.append(current_y)
+                                    current_line_heights = []
+                                
+                                if current_y < box.y:
+                                    all_units_fit = False
+                                
+                                current_line_index += 1
+                            
+                            relocated_unit = unit.relocate(current_x, current_y, scale)
+                            relocated_unit.line_id = current_line_index
+                            relocated_word_units.append(relocated_unit)
+                            typeset_units.append(relocated_unit)
+                            
+                            if not unit.is_space:
+                                current_line_heights.append(unit_height)
+                            
+                            current_x = relocated_unit.box.x2
+                            last_unit = relocated_unit
+                        
+                        if relocated_word_units:
+                            relocated_word_units[-1].ends_word = True
+                            line_units_map.setdefault(current_line_index, []).extend(relocated_word_units)
                 
             
             # Apply post-layout spacing so wrapping stays unchanged
+            # Pass box to ensure spacing doesn't cause overflow
             if typeset_units and line_units_map:
-                self._apply_arabic_word_spacing(line_units_map, arabic_word_spacing)
+                self._apply_arabic_word_spacing(line_units_map, arabic_word_spacing, box)
             
             # Right-align Arabic lines (but NOT table content)
             # Check if this paragraph is inside a table by examining layout_label
@@ -1969,10 +2199,22 @@ class Typesetting:
                         self._justify_arabic_line(line_units, box.x, box.x2, line_min_x, line_max_x)
                     else:
                         # For last line or non-justified paragraphs:
-                        # Just right-align the line
+                        # Right-align the line, but CLAMP to prevent left-side overflow
+                        
+                        # Calculate shift to align right edge with box.x2
                         target_right_position = box.x2
                         shift_x = target_right_position - line_max_x
                         
+                        # CRITICAL: After shifting, the LEFT edge must not go below box.x
+                        # new_left = line_min_x + shift_x must be >= box.x
+                        new_left_after_shift = line_min_x + shift_x
+                        
+                        if new_left_after_shift < box.x:
+                            # Shifting would push left edge beyond left margin
+                            # Clamp the shift so left edge stays at box.x
+                            shift_x = box.x - line_min_x
+                        
+                        # Apply the clamped shift
                         for unit in line_units:
                             self._shift_unit_x(unit, shift_x)
         else:
@@ -1990,7 +2232,7 @@ class Typesetting:
                     and not last_unit.mixed_character_blacklist and not unit.mixed_character_blacklist
                     and current_x > box.x and unit.try_get_unicode() != " "
                     and last_unit.try_get_unicode() != " "
-                    and last_unit.try_get_unicode() not in ["Ã£â‚¬Â", "Ã˜Å’", "Ã£â‚¬â€š", "Ã¯Â¼Å¡", "Ã¯Â¼Â", "Ã¯Â¼Å¸"]):
+                    and last_unit.try_get_unicode() not in ["ÃƒÂ£Ã¢â€šÂ¬Ã‚Â", "ÃƒËœÃ…â€™", "ÃƒÂ£Ã¢â€šÂ¬Ã¢â‚¬Å¡", "ÃƒÂ¯Ã‚Â¼Ã…Â¡", "ÃƒÂ¯Ã‚Â¼Ã‚Â", "ÃƒÂ¯Ã‚Â¼Ã…Â¸"]):
                     current_x += space_width * 0.5
                 
                 if use_english_line_break:
@@ -2043,18 +2285,54 @@ class Typesetting:
         self,
         line_units_map: dict[int, list[TypesettingUnit]],
         spacing: float,
+        box: Box = None,
     ):
-        """Apply additional spacing between Arabic words post layout."""
+        """Apply additional spacing between Arabic words post layout.
+        
+        If box is provided, ensures the total line width doesn't exceed box width.
+        """
         if spacing <= 0:
             return
 
-        for units in line_units_map.values():
+        for line_idx, units in line_units_map.items():
+            if not units:
+                continue
+            
+            # Count word gaps
+            word_gap_count = sum(1 for unit in units if getattr(unit, "ends_word", False))
+            if word_gap_count == 0:
+                continue
+            
+            # Calculate total spacing that would be added
+            total_spacing = word_gap_count * spacing
+            
+            # If box is provided, check if spacing would cause overflow
+            actual_spacing = spacing
+            if box is not None:
+                box_width = box.x2 - box.x
+                # Get current line width
+                line_min_x = min(u.box.x for u in units if u.box and u.box.x is not None)
+                line_max_x = max(u.box.x2 for u in units if u.box and u.box.x2 is not None)
+                current_width = line_max_x - line_min_x
+                
+                # Calculate available space for word spacing
+                available_space = box_width - current_width
+                
+                if available_space <= 0:
+                    # Line already at or beyond box width, skip spacing
+                    continue
+                
+                # If total spacing would exceed available space, reduce it
+                if total_spacing > available_space:
+                    actual_spacing = available_space / word_gap_count
+            
+            # Apply the (possibly reduced) spacing
             cumulative_shift = 0.0
             for unit in units:
                 if cumulative_shift:
                     self._shift_unit_x(unit, cumulative_shift)
                 if getattr(unit, "ends_word", False):
-                    cumulative_shift += spacing
+                    cumulative_shift += actual_spacing
 
     def _shift_unit_x(self, unit: TypesettingUnit, shift_x: float):
         """Shift a typesetting unit horizontally."""
@@ -2091,6 +2369,8 @@ class Typesetting:
         - Extend to the left margin (target_left)
         - Space between words is distributed evenly to fill the gap
         
+        IMPORTANT: The line must stay within bounds - left edge >= target_left
+        
         Args:
             line_units: List of typesetting units in the line
             target_left: Target left edge (box.x)
@@ -2106,7 +2386,15 @@ class Typesetting:
         
         if current_width <= 0 or target_width <= current_width:
             # Line already fills the space or is wider, just right-align
+            # But clamp to prevent left-side overflow!
             shift_x = target_right - current_right
+            
+            # Check if shifting would push left edge beyond target_left
+            new_left = current_left + shift_x
+            if new_left < target_left:
+                # Clamp shift to keep left edge at target_left
+                shift_x = target_left - current_left
+            
             for unit in line_units:
                 self._shift_unit_x(unit, shift_x)
             return
