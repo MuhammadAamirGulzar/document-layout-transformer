@@ -1,4 +1,17 @@
-<!-- # Yet Another Document Translator -->
+# Arabic-RTL Document Translator
+
+A fork of [BabelDOC](https://github.com/funstory-ai/BabelDOC) (by awwaawwa / funstory.ai) extended for right-to-left document translation. BabelDOC's typesetting pipeline is built for left-to-right languages; translating into Arabic requires more than swapping the target language code — glyph shaping, bidirectional text ordering, and layout mirroring all need separate handling to keep the output readable and correctly justified.
+
+## What's different from upstream
+
+- `babeldoc/format/pdf/document_il/utils/rtl.py` — Arabic text shaping (contextual letter forms and ligatures via `arabic_reshaper`) combined with the Unicode bidi algorithm (`python-bidi`) so shaped Arabic renders correctly inside the PDF's left-to-right glyph stream.
+- `babeldoc/tools/arabic_text_shaper.py` — standalone CLI for inspecting shaping output character-by-character, used to debug reshaping regressions independent of the full PDF pipeline.
+- Typesetting and mid-end translation stages (`typesetting.py`, `il_translator.py`) updated to route Arabic output through the shaper before layout, and to handle RTL-specific line and paragraph direction.
+- Test coverage in `tests/test_arabic_typesetting.py` and `babeldoc/tools/test_arabic_reshaping.py`.
+
+Everything else — layout analysis, PDF reconstruction, translation backends, glossary handling, offline asset packaging — is BabelDOC's existing pipeline; the reference documentation below is inherited from upstream and still describes this fork's CLI accurately.
+
+This project is licensed under AGPL-3.0, the same as upstream — see [LICENSE](LICENSE). It's a derivative work of BabelDOC and inherits its copyleft terms; the license cannot be changed to something more permissive or non-commercial by a downstream fork.
 
 ## Getting Started
 
@@ -55,11 +68,11 @@ We still recommend using [uv](https://github.com/astral-sh/uv) to manage virtual
 2. Use the following command to install yadt:
 
 ```bash
-# clone the project
-git clone https://github.com/funstory-ai/BabelDOC
+# clone this fork
+git clone https://github.com/muhammadaamirgulzar/Doc_Translator_MultiLingual
 
 # enter the project directory
-cd BabelDOC
+cd Doc_Translator_MultiLingual
 
 # install dependencies and run babeldoc
 uv run babeldoc --help
