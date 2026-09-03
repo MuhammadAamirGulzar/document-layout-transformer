@@ -144,6 +144,252 @@
             border-color: #667eea;
         }
 
+        /* Model Selection Styles */
+        .model-selection {
+            margin-bottom: 25px;
+        }
+
+        .model-selection > label {
+            display: block;
+            color: #333;
+            font-weight: 600;
+            margin-bottom: 12px;
+            font-size: 0.95em;
+        }
+
+        .model-toggle-group {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+
+        .model-card {
+            border: 2px solid #e2e8f0;
+            background: #ffffff;
+            border-radius: 12px;
+            padding: 12px 16px;
+            cursor: pointer;
+            transition: all 0.25s ease;
+            position: relative;
+            user-select: none;
+        }
+
+        .model-card:hover {
+            border-color: #818cf8;
+            background: #f8faff;
+            transform: translateY(-1px);
+        }
+
+        .model-card.active {
+            border-color: #6366f1;
+            background: #f5f7ff;
+            box-shadow: 0 4px 14px rgba(99, 102, 241, 0.15);
+        }
+
+        .model-card-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 5px;
+        }
+
+        .model-card-left {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .model-radio-custom {
+            width: 18px;
+            height: 18px;
+            border: 2px solid #cbd5e1;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.2s ease;
+        }
+
+        .model-card.active .model-radio-custom {
+            border-color: #6366f1;
+            background: #6366f1;
+        }
+
+        .model-radio-custom::after {
+            content: '';
+            width: 7px;
+            height: 7px;
+            background: white;
+            border-radius: 50%;
+            display: none;
+        }
+
+        .model-card.active .model-radio-custom::after {
+            display: block;
+        }
+
+        .model-title {
+            font-weight: 700;
+            color: #1e293b;
+            font-size: 0.95em;
+        }
+
+        .model-badge {
+            font-size: 0.72em;
+            font-weight: 700;
+            padding: 3px 9px;
+            border-radius: 20px;
+            letter-spacing: 0.3px;
+        }
+
+        .badge-recommended {
+            background: #dcfce7;
+            color: #15803d;
+            border: 1px solid #bbf7d0;
+        }
+
+        .badge-fast {
+            background: #fef3c7;
+            color: #b45309;
+            border: 1px solid #fde68a;
+        }
+
+        .badge-cloud {
+            background: #ede9fe;
+            color: #6d28d9;
+            border: 1px solid #ddd6fe;
+        }
+
+        .model-desc {
+            font-size: 0.82em;
+            color: #64748b;
+            margin-left: 28px;
+            line-height: 1.4;
+        }
+
+        /* Layout Selection Styles */
+        .layout-selection {
+            margin-bottom: 25px;
+        }
+
+        .layout-selection > label {
+            display: block;
+            color: #333;
+            font-weight: 600;
+            margin-bottom: 12px;
+            font-size: 0.95em;
+        }
+
+        .layout-toggle-group {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+
+        .layout-card {
+            border: 2px solid #e2e8f0;
+            background: #ffffff;
+            border-radius: 12px;
+            padding: 12px 16px;
+            cursor: pointer;
+            transition: all 0.25s ease;
+            position: relative;
+            user-select: none;
+        }
+
+        .layout-card:hover {
+            border-color: #38bdf8;
+            background: #f0f9ff;
+            transform: translateY(-1px);
+        }
+
+        .layout-card.active {
+            border-color: #0284c7;
+            background: #f0f9ff;
+            box-shadow: 0 4px 14px rgba(2, 132, 199, 0.15);
+        }
+
+        .layout-card-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 5px;
+        }
+
+        .layout-card-left {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .layout-radio-custom {
+            width: 18px;
+            height: 18px;
+            border: 2px solid #cbd5e1;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.2s ease;
+        }
+
+        .layout-card.active .layout-radio-custom {
+            border-color: #0284c7;
+            background: #0284c7;
+        }
+
+        .layout-radio-custom::after {
+            content: '';
+            width: 7px;
+            height: 7px;
+            background: white;
+            border-radius: 50%;
+            display: none;
+        }
+
+        .layout-card.active .layout-radio-custom::after {
+            display: block;
+        }
+
+        .layout-title {
+            font-weight: 700;
+            color: #1e293b;
+            font-size: 0.95em;
+        }
+
+        .layout-badge {
+            font-size: 0.72em;
+            font-weight: 700;
+            padding: 3px 9px;
+            border-radius: 20px;
+            letter-spacing: 0.3px;
+        }
+
+        .badge-all {
+            background: #e0e7ff;
+            color: #4338ca;
+            border: 1px solid #c7d2fe;
+        }
+
+        .badge-dual {
+            background: #e0f2fe;
+            color: #0369a1;
+            border: 1px solid #bae6fd;
+        }
+
+        .badge-mono {
+            background: #dcfce7;
+            color: #15803d;
+            border: 1px solid #bbf7d0;
+        }
+
+        .layout-desc {
+            font-size: 0.82em;
+            color: #64748b;
+            margin-left: 28px;
+            line-height: 1.4;
+        }
+
         .translate-btn {
             width: 100%;
             padding: 15px;
@@ -429,25 +675,99 @@
             color: #166534;
             font-weight: 600;
             font-size: 1.2em;
-            margin-bottom: 15px;
+            margin-bottom: 5px;
+        }
+
+        .result-subtext {
+            font-size: 0.9em;
+            color: #15803d;
+            margin-bottom: 20px;
+        }
+
+        .download-action-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 15px;
+            margin-top: 15px;
+        }
+
+        @media (max-width: 600px) {
+            .download-action-grid {
+                grid-template-columns: 1fr;
+            }
         }
 
         .download-btn {
             width: 100%;
-            padding: 15px;
-            background: linear-gradient(135deg, #10b981 0%, #059669 100%);
+            padding: 14px 16px;
             color: white;
             border: none;
-            border-radius: 10px;
-            font-size: 1.1em;
-            font-weight: 600;
+            border-radius: 12px;
             cursor: pointer;
-            transition: transform 0.2s ease, box-shadow 0.2s ease;
+            transition: all 0.25s ease;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
         }
 
         .download-btn:hover {
             transform: translateY(-2px);
-            box-shadow: 0 5px 20px rgba(16, 185, 129, 0.4);
+        }
+
+        .download-btn-dual {
+            background: linear-gradient(135deg, #4f46e5 0%, #3730a3 100%);
+        }
+
+        .download-btn-dual:hover {
+            box-shadow: 0 6px 20px rgba(79, 70, 229, 0.4);
+        }
+
+        .download-btn-mono {
+            background: linear-gradient(135deg, #059669 0%, #047857 100%);
+        }
+
+        .download-btn-mono:hover {
+            box-shadow: 0 6px 20px rgba(5, 150, 105, 0.4);
+        }
+
+        .dl-btn-icon {
+            font-size: 1.4em;
+        }
+
+        .dl-btn-content {
+            display: flex;
+            flex-direction: column;
+            text-align: left;
+        }
+
+        .dl-btn-main {
+            font-size: 0.95em;
+            font-weight: 700;
+        }
+
+        .dl-btn-sub {
+            font-size: 0.75em;
+            font-weight: 400;
+            opacity: 0.88;
+        }
+
+        .download-both-link {
+            display: inline-block;
+            margin-top: 14px;
+            background: none;
+            border: none;
+            color: #4338ca;
+            text-decoration: underline;
+            cursor: pointer;
+            font-size: 0.88em;
+            font-weight: 600;
+            transition: color 0.2s;
+        }
+
+        .download-both-link:hover {
+            color: #312e81;
         }
 
         /* Error Container */
@@ -544,6 +864,84 @@
             </div>
         </div>
 
+        <div class="model-selection">
+            <label>Translation AI Engine:</label>
+            <div class="model-toggle-group">
+                <div class="model-card active" data-model="nllb" onclick="selectModel('nllb')">
+                    <div class="model-card-header">
+                        <div class="model-card-left">
+                            <div class="model-radio-custom"></div>
+                            <span class="model-title">Meta NLLB-200</span>
+                        </div>
+                        <span class="model-badge badge-recommended">⭐ Recommended Offline</span>
+                    </div>
+                    <div class="model-desc">Meta's 200-language model with GPU acceleration. Rich vocabulary and superior sentence structure.</div>
+                </div>
+
+                <div class="model-card" data-model="marianmt" onclick="selectModel('marianmt')">
+                    <div class="model-card-header">
+                        <div class="model-card-left">
+                            <div class="model-radio-custom"></div>
+                            <span class="model-title">MarianMT (Helsinki / Marefa)</span>
+                        </div>
+                        <span class="model-badge badge-fast">⚡ Fast Offline</span>
+                    </div>
+                    <div class="model-desc">Lightweight seq2seq neural model for fast translation with lower memory usage.</div>
+                </div>
+
+                <div class="model-card" data-model="gpt-4o-mini" onclick="selectModel('gpt-4o-mini')">
+                    <div class="model-card-header">
+                        <div class="model-card-left">
+                            <div class="model-radio-custom"></div>
+                            <span class="model-title">OpenAI GPT-4o-mini</span>
+                        </div>
+                        <span class="model-badge badge-cloud">☁️ Cloud LLM</span>
+                    </div>
+                    <div class="model-desc">Deep document context & formatting preservation (requires OPENAI_API_KEY).</div>
+                </div>
+            </div>
+            <input type="hidden" id="selectedModel" value="nllb">
+        </div>
+
+        <div class="layout-selection">
+            <label>Output Document Layout:</label>
+            <div class="layout-toggle-group">
+                <div class="layout-card active" data-layout="both" onclick="selectLayout('both')">
+                    <div class="layout-card-header">
+                        <div class="layout-card-left">
+                            <div class="layout-radio-custom"></div>
+                            <span class="layout-title">✨ Both (Dual Side-by-Side + Mono Arabic)</span>
+                        </div>
+                        <span class="layout-badge badge-all">Recommended</span>
+                    </div>
+                    <div class="layout-desc">Generates both bilingual side-by-side reading and pure Arabic document.</div>
+                </div>
+
+                <div class="layout-card" data-layout="dual" onclick="selectLayout('dual')">
+                    <div class="layout-card-header">
+                        <div class="layout-card-left">
+                            <div class="layout-radio-custom"></div>
+                            <span class="layout-title">📖 Dual Bilingual (Side-by-Side)</span>
+                        </div>
+                        <span class="layout-badge badge-dual">Dual</span>
+                    </div>
+                    <div class="layout-desc">English original on the left, Arabic translation on the right for parallel reading.</div>
+                </div>
+
+                <div class="layout-card" data-layout="mono" onclick="selectLayout('mono')">
+                    <div class="layout-card-header">
+                        <div class="layout-card-left">
+                            <div class="layout-radio-custom"></div>
+                            <span class="layout-title">📄 Monolingual (Arabic Only)</span>
+                        </div>
+                        <span class="layout-badge badge-mono">Mono</span>
+                    </div>
+                    <div class="layout-desc">Clean Arabic-only document with 1:1 original visual layout.</div>
+                </div>
+            </div>
+            <input type="hidden" id="selectedLayout" value="both">
+        </div>
+
         <button class="translate-btn" id="translateBtn" disabled>
             Translate Document
         </button>
@@ -587,9 +985,29 @@
         </div>
 
         <div class="result-container" id="resultContainer">
-            <div class="result-icon">✅</div>
-            <div class="result-text">Translation completed successfully!</div>
-            <button class="download-btn" id="downloadBtn">Download Translated PDF</button>
+            <div class="result-icon">🎉</div>
+            <div class="result-text">Translation Completed!</div>
+            <div class="result-subtext">Your document has been translated with preserved layout. Choose your preferred format to download:</div>
+            
+            <div class="download-action-grid" id="downloadActionGrid">
+                <button class="download-btn download-btn-dual" id="downloadDualBtn">
+                    <span class="dl-btn-icon">📖</span>
+                    <div class="dl-btn-content">
+                        <span class="dl-btn-main">Download Dual (Side-by-Side)</span>
+                        <span class="dl-btn-sub">Bilingual English + Arabic</span>
+                    </div>
+                </button>
+                <button class="download-btn download-btn-mono" id="downloadMonoBtn">
+                    <span class="dl-btn-icon">📄</span>
+                    <div class="dl-btn-content">
+                        <span class="dl-btn-main">Download Arabic Only</span>
+                        <span class="dl-btn-sub">Monolingual Preserved Layout</span>
+                    </div>
+                </button>
+            </div>
+            <button class="download-both-link" id="downloadBothBtn">
+                ⬇️ Download Both Files (Opens 2 tabs)
+            </button>
         </div>
 
         <div class="error-container" id="errorContainer">
@@ -628,7 +1046,9 @@
         const resultContainer = document.getElementById('resultContainer');
         const errorContainer = document.getElementById('errorContainer');
         const errorText = document.getElementById('errorText');
-        const downloadBtn = document.getElementById('downloadBtn');
+        const downloadDualBtn = document.getElementById('downloadDualBtn');
+        const downloadMonoBtn = document.getElementById('downloadMonoBtn');
+        const downloadBothBtn = document.getElementById('downloadBothBtn');
         const cancelBtn = document.getElementById('cancelBtn');
         const stageSpinner = document.getElementById('stageSpinner');
 
@@ -806,6 +1226,30 @@
             showError('Translation cancelled');
         });
 
+        // Model Selection
+        function selectModel(modelKey) {
+            document.querySelectorAll('.model-card').forEach(card => {
+                if (card.dataset.model === modelKey) {
+                    card.classList.add('active');
+                } else {
+                    card.classList.remove('active');
+                }
+            });
+            document.getElementById('selectedModel').value = modelKey;
+        }
+
+        // Layout Mode Selection
+        function selectLayout(layoutKey) {
+            document.querySelectorAll('.layout-card').forEach(card => {
+                if (card.dataset.layout === layoutKey) {
+                    card.classList.add('active');
+                } else {
+                    card.classList.remove('active');
+                }
+            });
+            document.getElementById('selectedLayout').value = layoutKey;
+        }
+
         async function startTranslation(file, sourceLang, targetLang) {
             hideError();
             hideResult();
@@ -814,11 +1258,16 @@
             initializeStages();
 
             try {
+                const selectedModel = document.getElementById('selectedModel').value || 'nllb';
+                const selectedLayout = document.getElementById('selectedLayout').value || 'both';
+
                 // Step 1: Start translation and get session ID
                 const formData = new FormData();
                 formData.append('file', file);
                 formData.append('source_lang', sourceLang);
                 formData.append('target_lang', targetLang);
+                formData.append('model', selectedModel);
+                formData.append('layout', selectedLayout);
 
                 updateCurrentStage('📤 Uploading document...', 0, 0, 0);
 
@@ -918,6 +1367,8 @@
                             
                             eventSource.close();
                             eventSource = null;
+
+                            configureDownloadButtons(data);
                             
                             setTimeout(() => {
                                 hideProgress();
@@ -980,13 +1431,41 @@
             }
         }
 
-        // Download button click
-        downloadBtn.addEventListener('click', () => {
-            if (!currentSessionId) return;
-            
-            // Open download URL in new tab/window
-            window.open(`${API_BASE_URL}/translate/download/${currentSessionId}`, '_blank');
-        });
+        function configureDownloadButtons(data) {
+            const hasDual = data ? (data.has_dual !== false) : true;
+            const hasMono = data ? (data.has_mono !== false) : true;
+
+            if (downloadDualBtn) downloadDualBtn.style.display = hasDual ? 'flex' : 'none';
+            if (downloadMonoBtn) downloadMonoBtn.style.display = hasMono ? 'flex' : 'none';
+            if (downloadBothBtn) downloadBothBtn.style.display = (hasDual && hasMono) ? 'inline-block' : 'none';
+        }
+
+        // Dual download button click
+        if (downloadDualBtn) {
+            downloadDualBtn.addEventListener('click', () => {
+                if (!currentSessionId) return;
+                window.open(`${API_BASE_URL}/translate/download/${currentSessionId}?type=dual`, '_blank');
+            });
+        }
+
+        // Mono download button click
+        if (downloadMonoBtn) {
+            downloadMonoBtn.addEventListener('click', () => {
+                if (!currentSessionId) return;
+                window.open(`${API_BASE_URL}/translate/download/${currentSessionId}?type=mono`, '_blank');
+            });
+        }
+
+        // Download both files click
+        if (downloadBothBtn) {
+            downloadBothBtn.addEventListener('click', () => {
+                if (!currentSessionId) return;
+                window.open(`${API_BASE_URL}/translate/download/${currentSessionId}?type=dual`, '_blank');
+                setTimeout(() => {
+                    window.open(`${API_BASE_URL}/translate/download/${currentSessionId}?type=mono`, '_blank');
+                }, 400);
+            });
+        }
 
         function showProgress() {
             progressContainer.classList.add('active');

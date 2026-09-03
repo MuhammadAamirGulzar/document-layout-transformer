@@ -40,10 +40,9 @@ from babeldoc.format.pdf.document_il.utils.paragraph_helper import (
 )
 from babeldoc.format.pdf.document_il.utils.style_helper import GRAY80
 from babeldoc.format.pdf.translation_config import TranslationConfig
-from babeldoc.translator.translator import BaseTranslator
+from babeldoc.translator.translator import BaseTranslator, _is_pure_passthrough
 from babeldoc.utils.priority_thread_pool_executor import PriorityThreadPoolExecutor
 from arabic_reshaper import reshape
-from bidi.algorithm import get_display
 
 logger = logging.getLogger(__name__)
 
@@ -318,101 +317,246 @@ class ILTranslator:
         self.docs = None
 
     def shape_arabic_text(self, text: str) -> str:
-        """Shape and reorder Arabic text if output language is Arabic.
+        """Shape Arabic text for proper glyph joining (ligatures, contextual forms).
+
+        IMPORTANT: This function only applies arabic_reshaper for character joining.
+        It does NOT apply bidi get_display() reordering, because the PDF layout engine
+        handles character positioning via explicit (x,y) coordinates. Applying get_display()
+        was stripping U+0020 spaces and scrambling sentence order.
 
         Args:
             text: Input text to shape
 
         Returns:
-            Shaped and reordered text if language is Arabic, original text otherwise
+            Shaped text if language is Arabic, original text otherwise
         """
         if not text:
             return text
 
-        # Robust Arabic output detection: accept explicit 'ar', 'ara', 'arabic'
-        # or formats containing '-ar', '->ar', or '/ar' as a target marker (e.g. 'en-ar', 'en->ar')
+        # Robust Arabic output detection
         lang_out = (self.translation_config.lang_out or "").lower()
         is_arabic = False
-        if lang_out in ("en-ar, ar", "ara", "arabic"):
+        if lang_out in ("en-ar", "ar", "ara", "arabic"):
             is_arabic = True
         elif "-ar" in lang_out or "->ar" in lang_out or "/ar" in lang_out:
             is_arabic = True
 
         if is_arabic:
-            logger.debug("Shaping Arabic text")
-            # Flip parentheses and brackets for RTL display
-            # text = text.replace("(", "\x00")
-            # text = text.replace(")", "(")
-            # text = text.replace("\x00", ")")
-            # text = text.replace("[", "\x01")
-            # text = text.replace("]", "[")
-            # text = text.replace("\x01", "]")
-            # text = text.replace("{", "\x02")
-            # text = text.replace("}", "{")
-            # text = text.replace("\x02", "}")
+            logger.debug("Shaping Arabic text (reshape only, no bidi reorder)")
             try:
+                # Only reshape if text is NOT already in presentation forms
                 if not re.search(r'[\uFB50-\uFDFF\uFE70-\uFEFF]', text):
-                    # Extract inline tags before shaping to prevent corruption
-                    tag_pattern = r'<[^>]+>'
-                    tags = []
-                    tag_positions = []
-                    for match in re.finditer(tag_pattern, text):
-                        tags.append(match.group(0))
-                        tag_positions.append((match.start(), match.end()))
-                    
-                    if tags:
-                        text_without_tags = text
-                        placeholder_map = {}
-                        for i in range(len(tags) - 1, -1, -1):
-                            start, end = tag_positions[i]
-                            placeholder = f"\u200D{i}\u200D"
-                            placeholder_map[placeholder] = tags[i]
-                            text_without_tags = text_without_tags[:start] + placeholder + text_without_tags[end:]
-                        
-                        # Reshape Arabic text for proper character joining
-                        from arabic_reshaper import ArabicReshaper
-                        configuration = {
-                            'delete_harakat': False,  # Keep diacritical marks
-                            'support_ligatures': True,  # Support Arabic ligatures
-                            'RIAL SIGN': True,
-                            'ARABIC COMMA': True,
-                            'ARABIC SEMICOLON': True,
-                            'ARABIC QUESTION MARK': True,
-                            'ZWNJ': True,  # Zero Width Non-Joiner
-                        }
-
-                        reshaper = ArabicReshaper(configuration=configuration)
-                        reshaped_text = reshaper.reshape(text_without_tags)
-                        display_text = get_display(reshaped_text, base_dir='R')
-                        
-                        # Restore tags
-                        # for placeholder, tag in placeholder_map.items():
-                        #     display_text = display_text.replace(placeholder, tag)
-                        return display_text
-                    else:
-                        # No tags, process normally
-                        # Reshape Arabic text for proper character joining
-                        from arabic_reshaper import ArabicReshaper
-                        configuration = {
-                            'delete_harakat': False,  # Keep diacritical marks
-                            'support_ligatures': True,  # Support Arabic ligatures
-                            'RIAL SIGN': True,
-                            'ARABIC COMMA': True,
-                            'ARABIC SEMICOLON': True,
-                            'ARABIC QUESTION MARK': True,
-                            'ZWNJ': True,  # Zero Width Non-Joiner
-                        }
-
-                        reshaper = ArabicReshaper(configuration=configuration)
-                        reshaped_text = reshaper.reshape(text)
-                        display_text = get_display(reshaped_text, base_dir='R')
-                        return display_text
+                    from arabic_reshaper import ArabicReshaper
+                    configuration = {
+                        'delete_harakat': False,
+                        'support_ligatures': True,
+                        'RIAL SIGN': True,
+                        'ARABIC COMMA': True,
+                        'ARABIC SEMICOLON': True,
+                        'ARABIC QUESTION MARK': True,
+                        'ZWNJ': True,
+                    }
+                    reshaper = ArabicReshaper(configuration=configuration)
+                    # reshape() handles glyph joining while preserving spaces
+                    reshaped_text = reshaper.reshape(text)
+                    # DO NOT call get_display() — the PDF layout engine
+                    # handles RTL positioning via coordinates
+                    return reshaped_text
                 else:
-                    display_text = text
-                return display_text
+                    # Already in presentation forms, return as-is
+                    return text
             except Exception as e:
                 logger.warning(f"Failed to shape Arabic text: {e}")
                 return text
+
+        return text
+
+    def _pre_translate_terminology(self, text: str) -> str:
+        """Lock and standardize technical financial terms before sending to translation model."""
+        if not text:
+            return text
+
+        # Financial rates and central banking terms
+        text = re.sub(r'\b(?:The\s+)?QMR\s+Lending\s+Rate\b', 'سعر فائدة الإقراض في سوق قطر النقدي', text, flags=re.I)
+        text = re.sub(r'\b(?:The\s+)?Repo\s+Rate\b', 'سعر اتفاقيات إعادة الشراء (الريبو)', text, flags=re.I)
+        text = re.sub(r'\b(\d+(?:[,.]\d+)?)\s*(?:basis\s+points|bps)\b', r'\1 نقطة أساس', text, flags=re.I)
+        text = re.sub(r'\b(?:basis\s+points|bps)\b', 'نقطة أساس', text, flags=re.I)
+        text = re.sub(r'\b(?:barrels?|bbl)\b', 'برميل', text, flags=re.I)
+
+        # Strategy and institutional abbreviations
+        text = re.sub(r'\b(?:the\s+)?Third\s+National\s+Development\s+Strategy\s*\(\s*NDS\s*3?\s*\)', 'استراتيجية التنمية الوطنية الثالثة (NDS3)', text, flags=re.I)
+        text = re.sub(r'\bNDS\s*3\b', 'NDS3', text, flags=re.I)
+
+        # Currency with billion: QR 89.0 billion -> 89.0 مليار ريال قطري
+        text = re.sub(r'\bQR\s*(\d+(?:[,.]\d+)?)\s*billions?\b', r'\1 مليار ريال قطري', text, flags=re.I)
+        text = re.sub(r'\b(\d+(?:[,.]\d+)?)\s*billions?\s*QR\b', r'\1 مليار ريال قطري', text, flags=re.I)
+        text = re.sub(r'\bQR\s*billions?\b', 'مليار ريال قطري', text, flags=re.I)
+        text = re.sub(r'\bbillions?\s*QR\b', 'مليار ريال قطري', text, flags=re.I)
+
+        # Currency with million: QR 250,661 million -> 250,661 مليون ريال قطري
+        text = re.sub(r'\bQR\s*(\d+(?:[,.]\d+)?)\s*(?:mn|millions?)\b', r'\1 مليون ريال قطري', text, flags=re.I)
+        text = re.sub(r'\b(\d+(?:[,.]\d+)?)\s*(?:mn|millions?)\s*QR\b', r'\1 مليون ريال قطري', text, flags=re.I)
+        text = re.sub(r'\bQR\s*[-–—]?\s*(?:mn|millions?)\b', 'مليون ريال قطري', text, flags=re.I)
+        text = re.sub(r'\b(?:mn|millions?)\s*QR\b', 'مليون ريال قطري', text, flags=re.I)
+
+        # Currency standard: QR 50 -> 50 ريال قطري
+        text = re.sub(r'\bQR\s*(\d+(?:[,.]\d+)?)', r'\1 ريال قطري', text)
+        text = re.sub(r'(\d+(?:[,.]\d+)?)\s*QR\b', r'\1 ريال قطري', text)
+
+        # Quarter references
+        text = re.sub(r'\bQ1[- ](\d{4})\b', r'الربع الأول من \1', text)
+        text = re.sub(r'\bQ2[- ](\d{4})\b', r'الربع الثاني من \1', text)
+        text = re.sub(r'\bQ3[- ](\d{4})\b', r'الربع الثالث من \1', text)
+        text = re.sub(r'\bQ4[- ](\d{4})\b', r'الربع الرابع من \1', text)
+
+        # Contact and communication terminology: Tel, Fax, E-Mail
+        text = re.sub(r'\bTel\b(?:\s*[:：])?', 'الهاتف:', text, flags=re.I)
+        text = re.sub(r'\bFax\b(?:\s*[:：])?', 'الفاكس:', text, flags=re.I)
+        text = re.sub(r'\bE-?Mail\b(?:\s*[:：])?', 'البريد الإلكتروني:', text, flags=re.I)
+
+        return text
+
+    def _translate_with_line_preservation(self, text: str, rate_limit_params: dict) -> str:
+        """Translate text while preserving newline structure for chart legends and tables."""
+        if not text:
+            return text
+
+        # Pre-translation terminology replacement
+        text = self._pre_translate_terminology(text)
+
+        # Check if text contains Table of Contents (TOC) entries with dotted leader lines
+        # e.g. "1. Introduction ................................................................................................. 1306"
+        toc_leader_pattern = re.compile(r'^(.*?)\s*(\.{4,})\s*(\d+)\s*$')
+
+        # If text has multiple non-empty lines
+        lines = text.split("\n")
+        non_empty = [l for l in lines if l.strip()]
+
+        # Only preserve lines for short labels/legends/table cells or TOC entries
+        is_toc_block = any(toc_leader_pattern.match(l.strip()) for l in non_empty)
+        is_short_labels = (len(non_empty) > 1 and max(len(l.split()) for l in non_empty) <= 6) or is_toc_block
+
+        if is_short_labels:
+            translated_lines = []
+            for line in lines:
+                stripped_line = line.strip()
+                toc_match = toc_leader_pattern.match(stripped_line) if stripped_line else None
+                if toc_match:
+                    title, dots, page_num = toc_match.group(1).strip(), toc_match.group(2), toc_match.group(3)
+                    tr_title = self.translate_engine.translate(title, rate_limit_params=rate_limit_params) if title else ""
+                    translated_lines.append(f"{tr_title} {dots} {page_num}")
+                elif stripped_line:
+                    tr = self.translate_engine.translate(line, rate_limit_params=rate_limit_params)
+                    translated_lines.append(tr)
+                else:
+                    translated_lines.append(line)
+            return "\n".join(translated_lines)
+        else:
+            # Check if single-line paragraph is a TOC entry
+            if len(non_empty) == 1:
+                toc_match = toc_leader_pattern.match(non_empty[0])
+                if toc_match:
+                    title, dots, page_num = toc_match.group(1).strip(), toc_match.group(2), toc_match.group(3)
+                    tr_title = self.translate_engine.translate(title, rate_limit_params=rate_limit_params) if title else ""
+                    return f"{tr_title} {dots} {page_num}"
+
+            # For flowing body text paragraphs, join soft linebreaks with a space so
+            # the translation model receives complete, grammatically coherent sentences
+            if len(non_empty) > 1:
+                normalized_text = " ".join(line.strip() for line in lines if line.strip())
+            else:
+                normalized_text = text
+            return self.translate_engine.translate(normalized_text, rate_limit_params=rate_limit_params)
+
+    def _normalize_arabic_output(self, text: str) -> str:
+        """Post-translation normalization for Arabic text.
+
+        Fixes:
+        - Inconsistent percent signs (% vs ٪)
+        - Stray periods around percent signs (e.g. '5.7 .٪' -> '5.7 ٪.')
+        - Compound tokens like Q4-2022
+        - Phonetic table header translations (يـو يـو -> Y-o-Y)
+        - Petroleum economic terminology (الزيت -> النفط for sector labels)
+        - Currency unit standardization (QR / كرو -> ريال قطري)
+        - Financial mistranslations cleanup (bps, bbl, repo rate)
+        - Chart and chapter reference cleanup (الشريط -> المخطط)
+        - Atomic parenthetical acronym protection with LRM
+        - Latin acronyms/numbers spacing around Arabic text
+        """
+        if not text:
+            return text
+
+        lang_out = (self.translation_config.lang_out or "").lower()
+        is_arabic = any(marker in lang_out for marker in ["ar", "arabic", "ara"])
+        if not is_arabic:
+            return text
+
+        # 1. Normalize percent signs: replace Western % with Arabic ٪
+        text = text.replace('%', '\u066A')  # U+066A = Arabic percent sign ٪
+
+        # 2. Fix stray periods around percent signs (e.g. "8.6 .٪" -> "8.6٪.", ".٪ 8.6" -> "8.6٪.")
+        text = re.sub(r'\.\s*(\u066A)\s*(\d+(?:[,.]\d+)?)', r'\2\1.', text)
+        text = re.sub(r'(\d+(?:[,.]\d+)?)\s*\.\s*(\u066A)', r'\1\2.', text)
+        text = re.sub(r'(\d+(?:[,.]\d+)?)\s*(\u066A)\s*\.', r'\1\2.', text)
+        text = re.sub(r'(\d+(?:[,.]\d+)?)\s+(\u066A)', r'\1\2', text)
+
+        # 3. Compound alphanumeric tokens: preserve Q4-2022 as an atomic token
+        text = re.sub(r'\bQ\s*([1-4])\s*[-–—]\s*(\d{4})\b', r'Q\1-\2', text)
+
+        # 4. Table header YoY phonetic translation fix (يـو يـو / يـا هـو -> Y-o-Y)
+        text = re.sub(r'(?:ﻳـﻮ|يـو|يو)\s*[-_–—ـ]*\s*(?:ﻳـﻮ|يـو|يو)', 'Y-o-Y', text)
+        text = re.sub(r'(?:ﻳـﺎ|يـا|يا)\s*[-_–—ـ]*\s*(?:ﻫـﻮ|هـو|هو)', 'Y-o-Y', text)
+
+        # 5. Petroleum terminology: standardize oil/non-oil sector labels
+        text = re.sub(r'\bغير\s+الزيت\b', 'غير النفط', text)
+        text = re.sub(r'\bالزيت\s+غير\b', 'غير النفط', text)
+        text = re.sub(r'\bقطاع\s+الزيت\b', 'قطاع النفط', text)
+        text = re.sub(r'\bالقطاع\s+الزيتي\b', 'قطاع النفط', text)
+        if text.strip().lower() == 'oil':
+            text = 'النفط'
+
+        # 6. Currency standardization: eliminate كرو / sporadic QR
+        text = re.sub(r'\bمليارات\s+(?:الكرو|كرو)\b', 'مليارات الريالات القطرية', text)
+        text = re.sub(r'\b(?:الكرو|كرو)\s+مليون\b', 'مليون ريال قطري', text)
+        text = re.sub(r'\bمليون\s+(?:الكرو|كرو)\b', 'مليون ريال قطري', text)
+        text = re.sub(r'\b(?:الكرو|كرو)\b', 'ريال قطري', text)
+        text = re.sub(r'\bمليارات\s+QR\b', 'مليار ريال قطري', text)
+        text = re.sub(r'\bQR\s*(\d+(?:[,.]\d+)?)', r'\1 ريال قطري', text)
+        text = re.sub(r'(\d+(?:[,.]\d+)?)\s*QR\b', r'\1 ريال قطري', text)
+        text = re.sub(r'\bمليارات\s+الدولارات\b', 'مليارات الريالات القطرية', text)
+
+        # 7. Financial unit mistranslations cleanup
+        text = re.sub(r'\bبيليومتر\b', 'برميل', text)
+        text = re.sub(r'\bنقاط\s+(?:أوروبية|أرضية|أوراق)\b', 'نقطة أساس', text)
+        text = re.sub(r'\bإعادة\s+التأمين\b', 'سعر الريبو', text)
+
+        # 8. Structural reference preservation (Chart / Chapter / Table)
+        text = re.sub(r'\b(?:الشريط|شريط)\s+(\d+[-–—]\d+)', r'المخطط \1', text)
+        text = re.sub(r'\bCHAPTER\s+(\d+)', r'الفصل \1', text, flags=re.I)
+        text = re.sub(r'\bTable\s+(\d+[-–—]\d+)', r'الجدول \1', text, flags=re.I)
+        text = re.sub(r'\bChart\s+(\d+[-–—]\d+)', r'المخطط \1', text, flags=re.I)
+
+        # 9. Wrap Latin parenthetical acronyms with Left-to-Right Mark (\u200E) to preserve BiDi order
+        text = re.sub(r'\([A-Z0-9]{2,}\)', lambda m: f'\u200E{m.group(0)}\u200E', text)
+
+        # 10. Insert spaces at Arabic letters ↔ Latin/digit script boundaries (excluding Arabic percent sign \u066A)
+        ar_letters = r'[\u0621-\u064A\u066E-\u06D3\u06D5\uFB50-\uFDFF\uFE70-\uFEFF]'
+        text = re.sub(rf'({ar_letters})([A-Za-z0-9])', r'\1 \2', text)
+        text = re.sub(rf'([A-Za-z0-9])({ar_letters})', r'\1 \2', text)
+
+        # 11. Punctuation BiDi Locking: Ensure trailing neutral punctuation (. , : ; ! ؟)
+        # following digits, Arabic percent sign (\u066A), or Latin letters/parentheses
+        # stays pinned to the left end of the Arabic sentence by appending RLM (\u200F)
+        text = re.sub(r'([\d\u066A%A-Za-z\)\u200E])\s*([.:;!؟])\s*$', lambda m: f"{m.group(1)}{m.group(2)}\u200F", text)
+
+        # 12. Clean up telephone mistranslation (التلفزيون -> الهاتف) in contact context
+        text = re.sub(r'\bالتلفزيون\s*:\s*(\+?\d+)', r'الهاتف: \1', text)
+        text = re.sub(r'^\s*التلفزيون\s*:\s*$', 'الهاتف:', text, flags=re.M)
+        if text.strip() in ['التلفزيون :', 'التلفزيون:']:
+            text = 'الهاتف:'
+
+        # 13. Collapse multiple spaces to single space
+        text = re.sub(r'  +', ' ', text).strip()
 
         return text
 
@@ -551,7 +695,12 @@ class ILTranslator:
         if isinstance(placeholder, tuple):
             placeholder, regex_pattern = placeholder
         else:
-            regex_pattern = re.escape(placeholder)
+            tag_match = re.match(r'^<([A-Za-z]+)(\d+)>$', str(placeholder))
+            if tag_match:
+                tag_name, tag_id = tag_match.groups()
+                regex_pattern = rf"<\s*{tag_name}\s*{tag_id}\s*>"
+            else:
+                regex_pattern = re.escape(str(placeholder))
         if re.match(regex_pattern, paragraph.unicode, re.IGNORECASE):
             return self.create_formula_placeholder(formula, formula_id + 1, paragraph)
 
@@ -572,11 +721,22 @@ class ILTranslator:
         if isinstance(left_placeholder, tuple):
             left_placeholder, left_placeholder_regex_pattern = left_placeholder
         else:
-            left_placeholder_regex_pattern = re.escape(left_placeholder)
+            tag_match = re.match(r'^<([A-Za-z]+)(\d+)>$', str(left_placeholder))
+            if tag_match:
+                tag_name, tag_id = tag_match.groups()
+                left_placeholder_regex_pattern = rf"<\s*{tag_name}\s*{tag_id}\s*>"
+            else:
+                left_placeholder_regex_pattern = re.escape(str(left_placeholder))
+
         if isinstance(right_placeholder, tuple):
             right_placeholder, right_placeholder_regex_pattern = right_placeholder
         else:
-            right_placeholder_regex_pattern = re.escape(right_placeholder)
+            tag_match = re.match(r'^</([A-Za-z]+)(\d+)>$', str(right_placeholder))
+            if tag_match:
+                tag_name, tag_id = tag_match.groups()
+                right_placeholder_regex_pattern = rf"<\s*/\s*{tag_name}\s*{tag_id}\s*>"
+            else:
+                right_placeholder_regex_pattern = re.escape(str(right_placeholder))
         if re.match(
             f"{left_placeholder_regex_pattern}|{right_placeholder_regex_pattern}",
             paragraph.unicode,
@@ -1172,6 +1332,8 @@ Now, please carefully read the following text to be translated and directly outp
                 )
                 if text is None:
                     return
+                lbl = paragraph.layout_label or 'unknown'
+                logger.info(f"[{lbl}] Translating paragraph {paragraph.debug_id}: {text[:80] if text else ''}")
                 llm_translate_tracker = tracker.new_llm_translate_tracker()
                 # Perform translation
                 if self.support_llm_translate:
@@ -1191,14 +1353,33 @@ Now, please carefully read the following text to be translated and directly outp
                     translated_text = self.shape_arabic_text(translated_text)
                     llm_translate_tracker.set_output(translated_text)
                 else:
-                    translated_text = self.translate_engine.translate(
+                    translated_text = self._translate_with_line_preservation(
                         text,
                         rate_limit_params={
                             "paragraph_token_count": paragraph_token_count
                         },
                     )
+                translated_text = self._normalize_arabic_output(translated_text)
                 translated_text = self.shape_arabic_text(translated_text)
-                translated_text = re.sub(r"[. 。…，]{20,}", ".", translated_text)
+                # Only collapse repetitive punctuation if not a TOC leader line (\.{4,}\s*\d+)
+                if not re.search(r'\.{4,}\s*\d+', translated_text):
+                    translated_text = re.sub(r"[. 。…，]{20,}", ".", translated_text)
+
+                # Attach diagnostic pipeline trace for paragraph routing analysis
+                engine_name = getattr(self.translate_engine, 'name', self.translate_engine.__class__.__name__)
+                paragraph.pipeline_trace = {
+                    "debug_id": paragraph.debug_id,
+                    "layout_label": lbl,
+                    "engine": engine_name,
+                    "source_len": len(text) if text else 0,
+                    "trans_len": len(translated_text) if translated_text else 0,
+                    "is_pure_passthrough": _is_pure_passthrough(text) if text else False,
+                }
+                logger.info(
+                    f"[TRACE P{paragraph.debug_id}] label='{lbl}' engine='{engine_name}' "
+                    f"in_len={len(text) if text else 0} out_len={len(translated_text) if translated_text else 0}"
+                )
+
                 # Post-translation processing
                 self.post_translate_paragraph(
                     paragraph, tracker, translate_input, translated_text

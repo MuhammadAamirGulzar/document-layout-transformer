@@ -33,7 +33,6 @@ from babeldoc.format.pdf.translation_config import TranslationConfig
 from babeldoc.translator.translator import BaseTranslator
 from babeldoc.utils.priority_thread_pool_executor import PriorityThreadPoolExecutor
 from arabic_reshaper import reshape
-from bidi.algorithm import get_display
 
 logger = logging.getLogger(__name__)
 
@@ -95,101 +94,133 @@ class ILTranslatorLLMOnly:
         self.total_count = 0
     
     def shape_arabic_text(self, text: str) -> str:
-        """Shape and reorder Arabic text if output language is Arabic.
+        """Shape Arabic text for proper glyph joining (ligatures, contextual forms).
+
+        IMPORTANT: This function only applies arabic_reshaper for character joining.
+        It does NOT apply bidi get_display() reordering, because the PDF layout engine
+        handles character positioning via explicit (x,y) coordinates.
 
         Args:
             text: Input text to shape
 
         Returns:
-            Shaped and reordered text if language is Arabic, original text otherwise
+            Shaped text if language is Arabic, original text otherwise
         """
         if not text:
             return text
 
-        # Robust Arabic output detection: accept explicit 'ar', 'ara', 'arabic'
-        # or formats containing '-ar', '->ar', or '/ar' as a target marker (e.g. 'en-ar', 'en->ar')
+        # Robust Arabic output detection
         lang_out = (self.translation_config.lang_out or "").lower()
         is_arabic = False
-        if lang_out in ("en-ar, ar", "ara", "arabic"):
+        if lang_out in ("en-ar", "ar", "ara", "arabic"):
             is_arabic = True
         elif "-ar" in lang_out or "->ar" in lang_out or "/ar" in lang_out:
             is_arabic = True
 
         if is_arabic:
-            logger.debug("Shaping Arabic text")
-            # Flip parentheses and brackets for RTL display
-            # text = text.replace("(", "\x00")
-            # text = text.replace(")", "(")
-            # text = text.replace("\x00", ")")
-            # text = text.replace("[", "\x01")
-            # text = text.replace("]", "[")
-            # text = text.replace("\x01", "]")
-            # text = text.replace("{", "\x02")
-            # text = text.replace("}", "{")
-            # text = text.replace("\x02", "}")
+            logger.debug("Shaping Arabic text (reshape only, no bidi reorder)")
             try:
                 if not re.search(r'[\uFB50-\uFDFF\uFE70-\uFEFF]', text):
-                    # Extract inline tags before shaping to prevent corruption
-                    tag_pattern = r'<[^>]+>'
-                    tags = []
-                    tag_positions = []
-                    for match in re.finditer(tag_pattern, text):
-                        tags.append(match.group(0))
-                        tag_positions.append((match.start(), match.end()))
-                    
-                    if tags:
-                        text_without_tags = text
-                        placeholder_map = {}
-                        for i in range(len(tags) - 1, -1, -1):
-                            start, end = tag_positions[i]
-                            placeholder = f"\u200D{i}\u200D"
-                            placeholder_map[placeholder] = tags[i]
-                            text_without_tags = text_without_tags[:start] + placeholder + text_without_tags[end:]
-                        
-                        # Reshape Arabic text for proper character joining
-                        from arabic_reshaper import ArabicReshaper
-                        configuration = {
-                            'delete_harakat': False,  # Keep diacritical marks
-                            'support_ligatures': True,  # Support Arabic ligatures
-                            'RIAL SIGN': True,
-                            'ARABIC COMMA': True,
-                            'ARABIC SEMICOLON': True,
-                            'ARABIC QUESTION MARK': True,
-                            'ZWNJ': True,  # Zero Width Non-Joiner
-                        }
-
-                        reshaper = ArabicReshaper(configuration=configuration)
-                        reshaped_text = reshaper.reshape(text_without_tags)
-                        display_text = get_display(reshaped_text, base_dir='R')
-                        
-                        # Restore tags
-                        # for placeholder, tag in placeholder_map.items():
-                        #     display_text = display_text.replace(placeholder, tag)
-                        return display_text
-                    else:
-                        # No tags, process normally
-                        # Reshape Arabic text for proper character joining
-                        from arabic_reshaper import ArabicReshaper
-                        configuration = {
-                            'delete_harakat': False,  # Keep diacritical marks
-                            'support_ligatures': True,  # Support Arabic ligatures
-                            'RIAL SIGN': True,
-                            'ARABIC COMMA': True,
-                            'ARABIC SEMICOLON': True,
-                            'ARABIC QUESTION MARK': True,
-                            'ZWNJ': True,  # Zero Width Non-Joiner
-                        }
-
-                        reshaper = ArabicReshaper(configuration=configuration)
-                        reshaped_text = reshaper.reshape(text)
-                        display_text = get_display(reshaped_text, base_dir='R')
-                        return display_text
+                    from arabic_reshaper import ArabicReshaper
+                    configuration = {
+                        'delete_harakat': False,
+                        'support_ligatures': True,
+                        'RIAL SIGN': True,
+                        'ARABIC COMMA': True,
+                        'ARABIC SEMICOLON': True,
+                        'ARABIC QUESTION MARK': True,
+                        'ZWNJ': True,
+                    }
+                    reshaper = ArabicReshaper(configuration=configuration)
+                    reshaped_text = reshaper.reshape(text)
+                    # DO NOT call get_display() - PDF layout engine handles positioning
+                    return reshaped_text
                 else:
-                    display_text = text
-                return display_text
+                    return text
             except Exception as e:
                 logger.warning(f"Failed to shape Arabic text: {e}")
                 return text
+
+        return text
+
+    def _normalize_arabic_output(self, text: str) -> str:
+        """Post-translation normalization for Arabic text.
+
+        Fixes:
+        - Inconsistent percent signs (% vs ٪)
+        - Stray periods around percent signs (e.g. '5.7 .٪' -> '5.7 ٪.')
+        - Compound tokens like Q4-2022
+        - Phonetic table header translations (يـو يـو -> Y-o-Y)
+        - Petroleum economic terminology (الزيت -> النفط for sector labels)
+        - Currency unit standardization (QR / كرو -> ريال قطري)
+        - Financial mistranslations cleanup (bps, bbl, repo rate)
+        - Chart and chapter reference cleanup (الشريط -> المخطط)
+        - Atomic parenthetical acronym protection with LRM
+        - Latin acronyms/numbers spacing around Arabic text
+        """
+        if not text:
+            return text
+
+        lang_out = (self.translation_config.lang_out or "").lower()
+        is_arabic = any(marker in lang_out for marker in ["ar", "arabic", "ara"])
+        if not is_arabic:
+            return text
+
+        # 1. Normalize percent signs: replace Western % with Arabic ٪
+        text = text.replace('%', '\u066A')  # U+066A = Arabic percent sign ٪
+
+        # 2. Fix stray periods around percent signs (e.g. "8.6 .٪" -> "8.6٪.", ".٪ 8.6" -> "8.6٪.")
+        text = re.sub(r'\.\s*(\u066A)\s*(\d+(?:[,.]\d+)?)', r'\2\1.', text)
+        text = re.sub(r'(\d+(?:[,.]\d+)?)\s*\.\s*(\u066A)', r'\1\2.', text)
+        text = re.sub(r'(\d+(?:[,.]\d+)?)\s*(\u066A)\s*\.', r'\1\2.', text)
+        text = re.sub(r'(\d+(?:[,.]\d+)?)\s+(\u066A)', r'\1\2', text)
+
+        # 3. Compound alphanumeric tokens: preserve Q4-2022 as an atomic token
+        text = re.sub(r'\bQ\s*([1-4])\s*[-–—]\s*(\d{4})\b', r'Q\1-\2', text)
+
+        # 4. Table header YoY phonetic translation fix (يـو يـو / يـا هـو -> Y-o-Y)
+        text = re.sub(r'(?:ﻳـﻮ|يـو|يو)\s*[-_–—ـ]*\s*(?:ﻳـﻮ|يـو|يو)', 'Y-o-Y', text)
+        text = re.sub(r'(?:ﻳـﺎ|يـا|يا)\s*[-_–—ـ]*\s*(?:ﻫـﻮ|هـو|هو)', 'Y-o-Y', text)
+
+        # 5. Petroleum terminology: standardize oil/non-oil sector labels
+        text = re.sub(r'\bغير\s+الزيت\b', 'غير النفط', text)
+        text = re.sub(r'\bالزيت\s+غير\b', 'غير النفط', text)
+        text = re.sub(r'\bقطاع\s+الزيت\b', 'قطاع النفط', text)
+        text = re.sub(r'\bالقطاع\s+الزيتي\b', 'قطاع النفط', text)
+        if text.strip().lower() == 'oil':
+            text = 'النفط'
+
+        # 6. Currency standardization: eliminate كرو / sporadic QR
+        text = re.sub(r'\bمليارات\s+(?:الكرو|كرو)\b', 'مليارات الريالات القطرية', text)
+        text = re.sub(r'\b(?:الكرو|كرو)\s+مليون\b', 'مليون ريال قطري', text)
+        text = re.sub(r'\bمليون\s+(?:الكرو|كرو)\b', 'مليون ريال قطري', text)
+        text = re.sub(r'\b(?:الكرو|كرو)\b', 'ريال قطري', text)
+        text = re.sub(r'\bمليارات\s+QR\b', 'مليار ريال قطري', text)
+        text = re.sub(r'\bQR\s*(\d+(?:[,.]\d+)?)', r'\1 ريال قطري', text)
+        text = re.sub(r'(\d+(?:[,.]\d+)?)\s*QR\b', r'\1 ريال قطري', text)
+        text = re.sub(r'\bمليارات\s+الدولارات\b', 'مليارات الريالات القطرية', text)
+
+        # 7. Financial unit mistranslations cleanup
+        text = re.sub(r'\bبيليومتر\b', 'برميل', text)
+        text = re.sub(r'\bنقاط\s+(?:أوروبية|أرضية|أوراق)\b', 'نقطة أساس', text)
+        text = re.sub(r'\bإعادة\s+التأمين\b', 'سعر الريبو', text)
+
+        # 8. Structural reference preservation (Chart / Chapter / Table)
+        text = re.sub(r'\b(?:الشريط|شريط)\s+(\d+[-–—]\d+)', r'المخطط \1', text)
+        text = re.sub(r'\bCHAPTER\s+(\d+)', r'الفصل \1', text, flags=re.I)
+        text = re.sub(r'\bTable\s+(\d+[-–—]\d+)', r'الجدول \1', text, flags=re.I)
+        text = re.sub(r'\bChart\s+(\d+[-–—]\d+)', r'المخطط \1', text, flags=re.I)
+
+        # 9. Wrap Latin parenthetical acronyms with Left-to-Right Mark (\u200E) to preserve BiDi order
+        text = re.sub(r'\([A-Z0-9]{2,}\)', lambda m: f'\u200E{m.group(0)}\u200E', text)
+
+        # 10. Insert spaces at Arabic letters ↔ Latin/digit script boundaries (excluding Arabic percent sign \u066A)
+        ar_letters = r'[\u0621-\u064A\u066E-\u06D3\u06D5\uFB50-\uFDFF\uFE70-\uFEFF]'
+        text = re.sub(rf'({ar_letters})([A-Za-z0-9])', r'\1 \2', text)
+        text = re.sub(rf'([A-Za-z0-9])({ar_letters})', r'\1 \2', text)
+
+        # 11. Collapse multiple spaces to single space
+        text = re.sub(r'  +', ' ', text).strip()
 
         return text
 
@@ -963,74 +994,10 @@ class ILTranslatorLLMOnly:
                         lang_out = (self.translation_config.lang_out or "").lower()
                         logger.info(f"Output language configured as: '{lang_out}'")
 
-                        # Apply Arabic shaping and BiDi processing if output language is Arabic
-                        is_arabic = False
-                        if lang_out in ("en-ar", "ar", "ara", "arabic"):
-                            is_arabic = True
-                            logger.info(f"Arabic detected via direct match: {lang_out}")
-                        elif "-ar" in lang_out or "->ar" in lang_out or "/ar" in lang_out:
-                            is_arabic = True
-                            logger.info(f"Arabic detected via pattern match: {lang_out}")
-
-                        if is_arabic:
-                            logger.info("="*60)
-                            logger.info(f"ARABIC SHAPING STARTED")
-                            logger.info(f"BEFORE Arabic Shaping: {translated_text}")
-                            try:
-                                # Check if text is already shaped (contains presentation forms)
-                                # Set RTL attributes for proper layout
-                                inputs[id_][2].text_direction = "rtl"
-                                inputs[id_][2].text_align = "right"
-                                logger.info(f"Set RTL attributes: text_direction=rtl, text_align=right")
-                                if not re.search(r'[\uFB50-\uFDFF\uFE70-\uFEFF]', translated_text):
-                                    logger.info("Text is not pre-shaped, applying reshape and bidi...")
-                                    
-                                    # Extract inline tags before shaping to prevent corruption
-                                    tag_pattern = r'<[^>]+>'
-                                    tags = []
-                                    tag_positions = []
-                                    for match in re.finditer(tag_pattern, translated_text):
-                                        tags.append(match.group(0))
-                                        tag_positions.append((match.start(), match.end()))
-                                    
-                                    if tags:
-                                        logger.info(f"Found {len(tags)} inline tags to protect")
-                                        text_without_tags = translated_text
-                                        placeholder_map = {}
-                                        for i in range(len(tags) - 1, -1, -1):
-                                            start, end = tag_positions[i]
-                                            placeholder = f"\u200D{i}\u200D"
-                                            placeholder_map[placeholder] = tags[i]
-                                            text_without_tags = text_without_tags[:start] + placeholder + text_without_tags[end:]
-                                        
-                                        # Reshape Arabic text for proper character joining
-                                        reshaped_text = reshape(text_without_tags)
-                                        logger.info(f"AFTER Reshaping: {reshaped_text}")
-                                        # Apply bidirectional algorithm for proper text ordering
-                                        translated_text = get_display(reshaped_text, base_dir='R')
-                                        
-                                        # Restore tags
-                                        for placeholder, tag in placeholder_map.items():
-                                            translated_text = translated_text.replace(placeholder, tag)
-                                        logger.info(f"Restored {len(tags)} inline tags")
-                                    else:
-                                        # No tags, process normally
-                                        # Reshape Arabic text for proper character joining
-                                        reshaped_text = reshape(translated_text)
-                                        logger.info(f"AFTER Reshaping: {reshaped_text}")
-                                        # Apply bidirectional algorithm for proper text ordering
-                                        translated_text = get_display(reshaped_text, base_dir='R')
-                                    logger.info(f"AFTER BiDi Display: {translated_text}")
-                                    logger.info("Arabic shaping completed successfully")
-                                else:
-                                    logger.info("Text already contains Arabic presentation forms - skipping reshape")
-                                logger.info("="*60)
-                            except Exception as e:
-                                logger.error(f"Failed to shape Arabic text: {e}", exc_info=True)
-                                logger.info("="*60)
-                                # Continue with original text if shaping fails
-                        else:
-                            logger.info(f"Not Arabic language, skipping Arabic shaping. Language: {lang_out}")
+                        # Apply Arabic shaping (reshape for glyph joining, no bidi reorder)
+                        translated_text = self.shape_arabic_text(translated_text)
+                        # Apply Arabic post-translation normalization (percent signs, Latin spacing)
+                        translated_text = self._normalize_arabic_output(translated_text)
 
                         logger.info(f"Final Translated paragraph: {translated_text}")
 

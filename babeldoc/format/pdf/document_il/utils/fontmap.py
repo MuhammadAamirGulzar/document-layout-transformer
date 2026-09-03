@@ -154,13 +154,23 @@ class FontMapper:
     def map(self, original_font: PdfFont, char_unicode: str):
         current_char = ord(char_unicode)
         if isinstance(original_font, pymupdf.Font):
-            bold = original_font.is_bold
-            italic = original_font.is_italic
+            font_name_lower = (getattr(original_font, "name", "") or "").lower()
+            bold = bool(original_font.is_bold) or any(
+                b in font_name_lower for b in ["bold", "black", "heavy", "semibold", "demibold"]
+            )
+            italic = bool(original_font.is_italic) or any(
+                it in font_name_lower for it in ["italic", "oblique"]
+            )
             monospaced = original_font.is_monospaced
             serif = original_font.is_serif
         elif isinstance(original_font, PdfFont):
-            bold = original_font.bold
-            italic = original_font.italic
+            font_name_lower = (getattr(original_font, "name", "") or getattr(original_font, "font_name", "") or "").lower()
+            bold = bool(original_font.bold) or any(
+                b in font_name_lower for b in ["bold", "black", "heavy", "semibold", "demibold"]
+            )
+            italic = bool(original_font.italic) or any(
+                it in font_name_lower for it in ["italic", "oblique"]
+            )
             monospaced = original_font.monospace
             serif = original_font.serif
         else:

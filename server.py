@@ -17,7 +17,7 @@ from fastapi.staticfiles import StaticFiles
 from babeldoc.format.pdf.high_level import async_translate, init
 from babeldoc.format.pdf.translation_config import TranslationConfig
 from babeldoc.progress_monitor import ProgressMonitor
-from babeldoc.translator.translator import OpenAITranslator
+from babeldoc.translator.translator import OpenAITranslator, MarianMTTranslator, NLLBTranslator
 
 # Configure logging
 logging.basicConfig(
@@ -34,7 +34,7 @@ logging.getLogger("openai").setLevel("CRITICAL")
 app = FastAPI(
     title="TransDOC Translation API",
     description="Intelligent PDF Translation with Layout Preservation",
-    version="1.0.0"
+    version="2.1.0"
 )
 
 # Configure CORS
@@ -173,7 +173,7 @@ async def start_translation(
     file: UploadFile = File(...),
     source_lang: str = Form(...),
     target_lang: str = Form(...),
-    model: Optional[str] = Form("gpt-4o-mini"),
+    model: Optional[str] = Form("nllb"),
 ):
     """
     Start a translation job and return a session ID for progress tracking.
@@ -238,12 +238,6 @@ async def get_translation_progress(session_id: str):
     async def event_generator():
         """Generate SSE events for translation progress"""
         try:
-            # Verify API key
-            openai_api_key = os.getenv("OPENAI_API_KEY")
-            if not openai_api_key:
-                yield f"data: {json.dumps({'type': 'error', 'error': 'OPENAI_API_KEY not configured'})}\n\n"
-                return
-            
             # Update session status
             session["status"] = "processing"
             
@@ -251,13 +245,36 @@ async def get_translation_progress(session_id: str):
             yield f"data: {json.dumps({'type': 'init', 'message': 'Starting translation...'})}\n\n"
             
             # Create translator
-            translator = OpenAITranslator(
-                lang_in=LANGUAGE_CODES[session["source_lang"]],
-                lang_out=LANGUAGE_CODES[session["target_lang"]],
-                model=session["model"],
-                api_key=openai_api_key,
-                ignore_cache=True
-            )
+            selected_model = session.get("model", "nllb")
+            openai_api_key = os.getenv("OPENAI_API_KEY")
+            
+            if selected_model and selected_model.startswith("gpt") and openai_api_key:
+                logger.info(f"Using OpenAITranslator with model {selected_model}")
+                translator = OpenAITranslator(
+                    lang_in=LANGUAGE_CODES[session["source_lang"]],
+                    lang_out=LANGUAGE_CODES[session["target_lang"]],
+                    model=selected_model,
+                    api_key=openai_api_key,
+                    ignore_cache=True
+                )
+                auto_extract = True
+            elif selected_model and ("nllb" in selected_model.lower() or "facebook" in selected_model.lower()):
+                logger.info(f"Using local Meta NLLBTranslator (model: {selected_model})")
+                translator = NLLBTranslator(
+                    lang_in=LANGUAGE_CODES[session["source_lang"]],
+                    lang_out=LANGUAGE_CODES[session["target_lang"]],
+                    model_name=selected_model,
+                    ignore_cache=True
+                )
+                auto_extract = False
+            else:
+                logger.info("Using local MarianMTTranslator (offline, no API key required)")
+                translator = MarianMTTranslator(
+                    lang_in=LANGUAGE_CODES[session["source_lang"]],
+                    lang_out=LANGUAGE_CODES[session["target_lang"]],
+                    ignore_cache=True
+                )
+                auto_extract = False
             
             # Configure translation
             config = TranslationConfig(
@@ -269,6 +286,7 @@ async def get_translation_progress(session_id: str):
                 doc_layout_model=None,
                 pages=None,
                 skip_clean=False,
+                auto_extract_glossary=auto_extract,
             )
             
             # Process translation and stream progress
@@ -354,24 +372,50 @@ async def get_translation_progress(session_id: str):
                     session["progress"] = 100
                     session["result"] = translate_result
                     
-                    # Find output file
-                    output_pdf = None
+                    # Find output files (both mono and dual side-by-side)
+                    mono_pdf = None
+                    dual_pdf = None
                     output_directory = Path(session["output_directory"])
                     
                     if translate_result:
                         if hasattr(translate_result, 'mono_pdf_path') and translate_result.mono_pdf_path:
-                            output_pdf = translate_result.mono_pdf_path
+                            mono_pdf = translate_result.mono_pdf_path
                         elif hasattr(translate_result, 'no_watermark_mono_pdf_path') and translate_result.no_watermark_mono_pdf_path:
-                            output_pdf = translate_result.no_watermark_mono_pdf_path
+                            mono_pdf = translate_result.no_watermark_mono_pdf_path
+
+                        if hasattr(translate_result, 'dual_pdf_path') and translate_result.dual_pdf_path:
+                            dual_pdf = translate_result.dual_pdf_path
+                        elif hasattr(translate_result, 'no_watermark_dual_pdf_path') and translate_result.no_watermark_dual_pdf_path:
+                            dual_pdf = translate_result.no_watermark_dual_pdf_path
                     
-                    if not output_pdf or not Path(output_pdf).exists():
-                        pdf_files = list(output_directory.glob("*.pdf"))
-                        if pdf_files:
-                            output_pdf = str(pdf_files[0])
+                    # Fallback to searching output directory
+                    if not mono_pdf or not Path(mono_pdf).exists():
+                        monos = list(output_directory.glob("*.mono.pdf"))
+                        if monos:
+                            mono_pdf = str(monos[0])
+                        else:
+                            all_pdfs = [p for p in output_directory.glob("*.pdf") if not p.name.endswith(".dual.pdf")]
+                            if all_pdfs:
+                                mono_pdf = str(all_pdfs[0])
+
+                    if not dual_pdf or not Path(dual_pdf).exists():
+                        duals = list(output_directory.glob("*.dual.pdf"))
+                        if duals:
+                            dual_pdf = str(duals[0])
                     
-                    if output_pdf:
-                        session["output_path"] = str(output_pdf)
-                        yield f"data: {json.dumps({'type': 'finish', 'overall_progress': 100, 'message': 'Translation completed!'})}\n\n"
+                    session["mono_output_path"] = str(mono_pdf) if mono_pdf and Path(mono_pdf).exists() else None
+                    session["dual_output_path"] = str(dual_pdf) if dual_pdf and Path(dual_pdf).exists() else None
+                    session["output_path"] = session["mono_output_path"] or session["dual_output_path"]
+                    
+                    if session["output_path"]:
+                        finish_payload = {
+                            "type": "finish",
+                            "overall_progress": 100,
+                            "message": "Translation completed!",
+                            "has_mono": bool(session["mono_output_path"]),
+                            "has_dual": bool(session["dual_output_path"])
+                        }
+                        yield f"data: {json.dumps(finish_payload)}\n\n"
                     else:
                         yield f"data: {json.dumps({'type': 'error', 'error': 'Translation completed but output file not found'})}\n\n"
                     
@@ -405,23 +449,53 @@ async def get_translation_progress(session_id: str):
 
 
 @app.get("/translate/download/{session_id}")
-async def download_translation(session_id: str):
+async def download_translation(session_id: str, type: Optional[str] = "mono"):
     """
     Download the translated PDF file.
+    type: 'mono' (Arabic only) or 'dual' (side-by-side English + Arabic)
     """
-    if session_id not in translation_sessions:
-        raise HTTPException(status_code=404, detail="Session not found")
-    
-    session = translation_sessions[session_id]
-    
-    if session["status"] != "completed":
-        raise HTTPException(status_code=400, detail="Translation not completed yet")
-    
-    output_path = session.get("output_path")
+    session = translation_sessions.get(session_id)
+    req_type = (type or "mono").lower()
+
+    output_path = None
+    output_filename = "translated.pdf"
+
+    if session and session.get("status") == "completed":
+        stem = Path(session.get("filename", "document")).stem
+        if req_type == "dual" and session.get("dual_output_path"):
+            output_path = session["dual_output_path"]
+            output_filename = f"{stem}_dual_bilingual.pdf"
+        else:
+            output_path = session.get("mono_output_path") or session.get("output_path")
+            output_filename = f"{stem}_translated_mono.pdf"
+    else:
+        # Fallback to checking disk in TEMP_DIR (preserves downloads across server reloads)
+        session_dir = TEMP_DIR / session_id
+        if not session_dir.exists():
+            raise HTTPException(status_code=404, detail="Session not found")
+        output_dir = session_dir / "output"
+        if not output_dir.exists():
+            raise HTTPException(status_code=404, detail="Session output not found")
+        
+        duals = list(output_dir.glob("*.dual.pdf"))
+        monos = list(output_dir.glob("*.mono.pdf"))
+        
+        if req_type == "dual" and duals:
+            output_path = str(duals[0])
+            output_filename = duals[0].name
+        elif monos:
+            output_path = str(monos[0])
+            output_filename = monos[0].name
+        else:
+            all_pdfs = list(output_dir.glob("*.pdf"))
+            if all_pdfs:
+                output_path = str(all_pdfs[0])
+                output_filename = all_pdfs[0].name
+            else:
+                raise HTTPException(status_code=404, detail="No PDF output found in session")
+
     if not output_path or not Path(output_path).exists():
-        raise HTTPException(status_code=404, detail="Output file not found")
-    
-    output_filename = f"translated_{session['filename']}"
+        raise HTTPException(status_code=404, detail=f"Output file ({req_type}) not found")
     
     return FileResponse(
         path=output_path,
@@ -438,7 +512,7 @@ async def translate_document(
     file: UploadFile = File(...),
     source_lang: str = Form(...),
     target_lang: str = Form(...),
-    model: Optional[str] = Form("gpt-4o-mini"),
+    model: Optional[str] = Form("nllb"),
 ):
     """
     Translate a PDF document (non-streaming, for backwards compatibility).
@@ -475,19 +549,35 @@ async def translate_document(
         with open(input_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
         
-        # Verify API key
-        openai_api_key = os.getenv("OPENAI_API_KEY")
-        if not openai_api_key:
-            raise HTTPException(status_code=500, detail="OPENAI_API_KEY not configured on server")
-        
         # Create translator
-        translator = OpenAITranslator(
-            lang_in=LANGUAGE_CODES[source_lang],
-            lang_out=LANGUAGE_CODES[target_lang],
-            model=model,
-            api_key=openai_api_key,
-            ignore_cache=True
-        )
+        openai_api_key = os.getenv("OPENAI_API_KEY")
+        if model and model.startswith("gpt") and openai_api_key:
+            logger.info(f"Using OpenAITranslator with model {model}")
+            translator = OpenAITranslator(
+                lang_in=LANGUAGE_CODES[source_lang],
+                lang_out=LANGUAGE_CODES[target_lang],
+                model=model,
+                api_key=openai_api_key,
+                ignore_cache=True
+            )
+            auto_extract = True
+        elif model and ("nllb" in model.lower() or "facebook" in model.lower()):
+            logger.info(f"Using local Meta NLLBTranslator (model: {model})")
+            translator = NLLBTranslator(
+                lang_in=LANGUAGE_CODES[source_lang],
+                lang_out=LANGUAGE_CODES[target_lang],
+                model_name=model,
+                ignore_cache=True
+            )
+            auto_extract = False
+        else:
+            logger.info("Using local MarianMTTranslator (offline, no API key required)")
+            translator = MarianMTTranslator(
+                lang_in=LANGUAGE_CODES[source_lang],
+                lang_out=LANGUAGE_CODES[target_lang],
+                ignore_cache=True
+            )
+            auto_extract = False
         
         # Configure translation
         config = TranslationConfig(
@@ -499,6 +589,7 @@ async def translate_document(
             doc_layout_model=None,
             pages=None,
             skip_clean=False,
+            auto_extract_glossary=auto_extract,
         )
         
         # Perform translation

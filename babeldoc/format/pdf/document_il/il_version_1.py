@@ -1191,6 +1191,13 @@ class PdfParagraph:
             "type": "Attribute",
         },
     )
+    pipeline_trace: dict | None = field(
+        default=None,
+        metadata={
+            "name": "pipelineTrace",
+            "type": "Attribute",
+        },
+    )
 
 
 @dataclass(slots=True)

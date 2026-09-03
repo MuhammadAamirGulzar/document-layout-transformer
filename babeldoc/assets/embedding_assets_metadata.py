@@ -641,6 +641,24 @@ EN_FONT_FAMILY = {
     ],
 }
 
+AR_FONT_FAMILY = {
+    "script": [
+        "GoNotoKurrent-Regular.ttf",
+        "GoNotoKurrent-Bold.ttf",
+    ],
+    "normal": [
+        "GoNotoKurrent-Regular.ttf",
+        "GoNotoKurrent-Bold.ttf",
+    ],
+    "fallback": [
+        "GoNotoKurrent-Regular.ttf",
+        "GoNotoKurrent-Bold.ttf",
+    ],
+    "base": [
+        "GoNotoKurrent-Regular.ttf",
+    ],
+}
+
 ALL_FONT_FAMILY = {
     "CN": CN_FONT_FAMILY,
     "TW": TW_FONT_FAMILY,
@@ -649,6 +667,7 @@ ALL_FONT_FAMILY = {
     "JP": JP_FONT_FAMILY,
     "EN": EN_FONT_FAMILY,
     "JA": JP_FONT_FAMILY,
+    "AR": AR_FONT_FAMILY,
 }
 
 
@@ -686,7 +705,9 @@ __cleanup_unused_font_metadata()
 
 def get_font_family(lang_code: str):
     lang_code = lang_code.upper()
-    if "KR" in lang_code:
+    if "AR" in lang_code:
+        font_family = AR_FONT_FAMILY
+    elif "KR" in lang_code:
         font_family = KR_FONT_FAMILY
     elif "JP" in lang_code or "JA" in lang_code:
         font_family = JP_FONT_FAMILY

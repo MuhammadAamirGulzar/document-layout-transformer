@@ -24,7 +24,7 @@ from babeldoc.format.pdf.document_il.utils.layout_helper import box_to_tuple
 from babeldoc.format.pdf.translation_config import TranslationConfig
 from babeldoc.format.pdf.translation_config import WatermarkOutputMode
 from arabic_reshaper import reshape
-from bidi.algorithm import get_display
+import bidi.algorithm as ba
 
 
 logger = logging.getLogger(__name__)
@@ -902,31 +902,41 @@ class Typesetting:
                 )
                 mode_scale = statistics.median(all_scales)
             # Too many times using a smaller scale will affect readability, so use the mode as the upper limit
+            # Do NOT clamp titles, headers, captions, or table content to body text mode_scale
             for paragraph in all_paragraphs:
-                if (
-                    paragraph.optimal_scale is not None
-                    and paragraph.optimal_scale > mode_scale
-                ):
-                    paragraph.optimal_scale = mode_scale
+                layout_label = (paragraph.layout_label or "").lower()
+                is_hierarchy_exempt = any(
+                    marker in layout_label
+                    for marker in ["title", "heading", "caption", "table", "footnote", "fallback_line"]
+                )
+                if not is_hierarchy_exempt:
+                    if (
+                        paragraph.optimal_scale is not None
+                        and paragraph.optimal_scale > mode_scale
+                    ):
+                        paragraph.optimal_scale = mode_scale
         else:
             logger.error(
                 "document_scales is empty, there seems no paragraph in this PDF"
             )
 
     def shape_arabic_text(self, text: str) -> str:
-        """Shape and reorder Arabic text if output language is Arabic.
+        """Shape Arabic text for proper glyph joining (ligatures, contextual forms).
+
+        IMPORTANT: This function only applies arabic_reshaper for character joining.
+        It does NOT apply bidi get_display() reordering, because the PDF layout engine
+        handles character positioning via explicit (x,y) coordinates.
 
         Args:
             text: Input text to shape
 
         Returns:
-            Shaped and reordered text if language is Arabic, original text otherwise
+            Shaped text if language is Arabic, original text otherwise
         """
         if not text:
             return text
 
-        # Robust Arabic output detection: accept explicit 'ar', 'ara', 'arabic'
-        # or formats containing '-ar', '->ar', or '/ar' as a target marker (e.g. 'en-ar', 'en->ar')
+        # Robust Arabic output detection
         lang_out = (self.translation_config.lang_out or "").lower()
         is_arabic = False
         if lang_out in ("en-ar", "ar", "ara", "arabic"):
@@ -935,27 +945,25 @@ class Typesetting:
             is_arabic = True
 
         if is_arabic:
-            logger.debug("Shaping Arabic text")
+            logger.debug("Shaping Arabic text (reshape only, no bidi reorder)")
             try:
                 if not re.search(r'[\uFB50-\uFDFF\uFE70-\uFEFF]', text):
-                    # Reshape Arabic text for proper character joining
                     from arabic_reshaper import ArabicReshaper
                     configuration = {
-                        'delete_harakat': False,  # Keep diacritical marks
-                        'support_ligatures': True,  # Support Arabic ligatures
+                        'delete_harakat': False,
+                        'support_ligatures': True,
                         'RIAL SIGN': True,
                         'ARABIC COMMA': True,
                         'ARABIC SEMICOLON': True,
                         'ARABIC QUESTION MARK': True,
-                        'ZWNJ': True,  # Zero Width Non-Joiner
+                        'ZWNJ': True,
                     }
-
                     reshaper = ArabicReshaper(configuration=configuration)
                     reshaped_text = reshaper.reshape(text)
-                    display_text = get_display(reshaped_text, base_dir='R')
+                    # DO NOT call get_display() - PDF layout engine handles positioning
+                    return reshaped_text
                 else:
-                    display_text = text
-                return display_text
+                    return text
             except Exception as e:
                 logger.warning(f"Failed to shape Arabic text: {e}")
                 return text
@@ -998,7 +1006,20 @@ class Typesetting:
             line_skip = 1.50  # Arabic needs extra space for diacritical marks (harakat)
         else:
             line_skip = 1.3
-        min_scale = 0.1
+
+        # Role-based minimum scale floors to preserve typographic hierarchy
+        layout_label = (paragraph.layout_label or "").lower()
+        if "title" in layout_label or "heading" in layout_label:
+            min_scale = 0.88  # Headings never shrink below 88% of original size
+        elif "caption" in layout_label:
+            min_scale = 0.82
+        elif "table_footnote" in layout_label or "footnote" in layout_label:
+            min_scale = 0.75
+        elif "table" in layout_label:
+            min_scale = 0.65
+        else:
+            min_scale = 0.72  # Body text floor
+
         expand_space_flag = 0
         final_typeset_units = None
 
@@ -1410,6 +1431,12 @@ class Typesetting:
         box = paragraph.box
         page_box = page.cropbox.box
         
+        # Symmetrical page-level mirroring for running headers, footers, and page numbers
+        if self._is_header_or_footer(paragraph, page):
+            orig_right_margin = page_box.x2 - box.x2
+            new_x = page_box.x + orig_right_margin
+            return new_x - box.x
+
         # Detect content area boundaries (accounting for sidebars/decorations)
         content_left, content_right = self._get_content_area_bounds(page)
         
@@ -1567,7 +1594,7 @@ class Typesetting:
             shift_x: The X shift to apply
             page: Optional page for clamping to page bounds
         """
-        if shift_x == 0:
+        if shift_x == 0 or not composition:
             return
         
         # Get page bounds for clamping if page is provided
@@ -1575,59 +1602,84 @@ class Typesetting:
         clamp_left = None
         if page and page.cropbox and page.cropbox.box:
             page_box = page.cropbox.box
-            # Use a small margin (2%) from page edges for safety
             page_margin = (page_box.x2 - page_box.x) * 0.02
             clamp_left = page_box.x + page_margin
             clamp_right = page_box.x2 - page_margin
-            
+
+        # RIGID BODY CLAMPING: Clamp shift_x as a whole so that all characters
+        # retain their exact relative spacing without stacking or colliding at the margin.
+        effective_shift = shift_x
+        if clamp_right is not None or clamp_left is not None:
+            char_x2_list = []
+            char_x_list = []
+            for comp in composition:
+                if comp.pdf_character and comp.pdf_character.box:
+                    char_x_list.append(comp.pdf_character.box.x)
+                    char_x2_list.append(comp.pdf_character.box.x2)
+                elif comp.pdf_formula and comp.pdf_formula.box:
+                    char_x_list.append(comp.pdf_formula.box.x)
+                    char_x2_list.append(comp.pdf_formula.box.x2)
+
+            if char_x2_list:
+                max_x2 = max(char_x2_list)
+                min_x = min(char_x_list)
+                if clamp_right is not None and (max_x2 + effective_shift) > clamp_right:
+                    effective_shift = clamp_right - max_x2
+                if clamp_left is not None and (min_x + effective_shift) < clamp_left:
+                    effective_shift = clamp_left - min_x
+
+        if effective_shift == 0:
+            return
+
         for comp in composition:
             if comp.pdf_character:
                 char = comp.pdf_character
                 if char.box:
-                    char.box.x += shift_x
-                    char.box.x2 += shift_x
-                    # Clamp to page bounds if clamping is enabled
-                    if clamp_right is not None:
-                        if char.box.x2 > clamp_right:
-                            overflow = char.box.x2 - clamp_right
-                            char.box.x -= overflow
-                            char.box.x2 -= overflow
-                        if char.box.x < clamp_left:
-                            underflow = clamp_left - char.box.x
-                            char.box.x += underflow
-                            char.box.x2 += underflow
+                    char.box.x += effective_shift
+                    char.box.x2 += effective_shift
                 if char.visual_bbox and char.visual_bbox.box:
-                    char.visual_bbox.box.x += shift_x
-                    char.visual_bbox.box.x2 += shift_x
-                    if clamp_right is not None:
-                        if char.visual_bbox.box.x2 > clamp_right:
-                            overflow = char.visual_bbox.box.x2 - clamp_right
-                            char.visual_bbox.box.x -= overflow
-                            char.visual_bbox.box.x2 -= overflow
-                        if char.visual_bbox.box.x < clamp_left:
-                            underflow = clamp_left - char.visual_bbox.box.x
-                            char.visual_bbox.box.x += underflow
-                            char.visual_bbox.box.x2 += underflow
+                    char.visual_bbox.box.x += effective_shift
+                    char.visual_bbox.box.x2 += effective_shift
             elif comp.pdf_formula:
                 formula = comp.pdf_formula
                 if formula.box:
-                    formula.box.x += shift_x
-                    formula.box.x2 += shift_x
+                    formula.box.x += effective_shift
+                    formula.box.x2 += effective_shift
                 for char in formula.pdf_character:
                     if char.box:
-                        char.box.x += shift_x
-                        char.box.x2 += shift_x
+                        char.box.x += effective_shift
+                        char.box.x2 += effective_shift
                     if char.visual_bbox and char.visual_bbox.box:
-                        char.visual_bbox.box.x += shift_x
-                        char.visual_bbox.box.x2 += shift_x
+                        char.visual_bbox.box.x += effective_shift
+                        char.visual_bbox.box.x2 += effective_shift
                 for curve in formula.pdf_curve:
                     if curve.box:
-                        curve.box.x += shift_x
-                        curve.box.x2 += shift_x
+                        curve.box.x += effective_shift
+                        curve.box.x2 += effective_shift
                 for form in formula.pdf_form:
                     if form.box:
-                        form.box.x += shift_x
-                        form.box.x2 += shift_x
+                        form.box.x += effective_shift
+                        form.box.x2 += effective_shift
+
+    def _is_header_or_footer(self, paragraph: il_version_1.PdfParagraph, page: il_version_1.Page) -> bool:
+        """Detect if paragraph is a running header, footer, or page number."""
+        if paragraph.layout_label:
+            lbl = paragraph.layout_label.lower()
+            if any(h in lbl for h in ['header', 'footer', 'page_number', 'page_header', 'page_footer']):
+                return True
+        if paragraph.box and page.cropbox and page.cropbox.box:
+            p_box = page.cropbox.box
+            p_height = p_box.y2 - p_box.y
+            # Top 6% or bottom 6% of page
+            if paragraph.box.y > p_box.y2 - p_height * 0.06 or paragraph.box.y2 < p_box.y + p_height * 0.06:
+                return True
+        return False
+
+    def _should_skip_margin_mirroring(self, paragraph: il_version_1.PdfParagraph, page: il_version_1.Page) -> bool:
+        """Check if a paragraph should NOT have margin mirroring applied."""
+        if self._is_header_or_footer(paragraph, page):
+            return False  # Always mirror running headers, footers, and page numbers!
+        return self._is_paragraph_inside_table(paragraph, page)
 
     def _is_paragraph_inside_table(self, paragraph: il_version_1.PdfParagraph, page: il_version_1.Page) -> bool:
         """Check if a paragraph should NOT have margin mirroring applied.
@@ -1654,11 +1706,11 @@ class Typesetting:
         if paragraph.layout_label:
             layout_label_lower = paragraph.layout_label.lower()
             
-            # Table cell content markers
+            # Table cell and structural content markers
             table_cell_markers = [
                 'table_cell', 'table_cell_hybrid', 'table_text', 
                 'wired_table_cell', 'wireless_table_cell',
-                'table_footnote'  # Table footnotes should stay with the table
+                'table_footnote', 'table_caption', 'fallback_line'
             ]
             
             # Figure content markers
@@ -1836,6 +1888,16 @@ class Typesetting:
         # Note: table_caption, table_title, table_footnote are NOT excluded - they should be mirrored
         is_table_content = self._is_paragraph_inside_table(paragraph, page)
         
+        # Initialize or update pipeline trace for diagnostic reporting
+        if not hasattr(paragraph, "pipeline_trace") or paragraph.pipeline_trace is None:
+            paragraph.pipeline_trace = {}
+        paragraph.pipeline_trace.update({
+            "is_arabic_output": is_arabic_output,
+            "is_table_content": is_table_content,
+            "layout_label": paragraph.layout_label,
+            "can_passthrough": all(unit.can_passthrough for unit in typesetting_units),
+        })
+
         # If all typesetting units can be passed through directly, no need to layout
         if all(unit.can_passthrough for unit in typesetting_units):
             paragraph.scale = 1.0
@@ -1885,10 +1947,9 @@ class Typesetting:
             self._update_paragraph_render_order(paragraph)
             
             # Apply RTL margin mirroring for Arabic output on layout paragraphs
-            # The _layout_typesetting_units function already right-aligns within the original box,
-            # but we need to shift to the mirrored margin position as well
-            # Skip table content to maintain table structure
-            if is_arabic_output and not is_table_content:
+            # Apply RTL margin mirroring for Arabic output on body paragraphs
+            # Skip tables, figures, charts, captions, footnotes, and fallback lines
+            if is_arabic_output and not self._should_skip_margin_mirroring(paragraph, page):
                 shift_x = self._calculate_rtl_margin_shift(paragraph, page)
                 if shift_x != 0:
                     self._apply_rtl_margin_shift_to_composition(
@@ -1900,18 +1961,6 @@ class Typesetting:
                     if paragraph.box:
                         paragraph.box.x += shift_x
                         paragraph.box.x2 += shift_x
-                        # Clamp paragraph box to page bounds
-                        if page.cropbox and page.cropbox.box:
-                            page_box = page.cropbox.box
-                            page_margin = (page_box.x2 - page_box.x) * 0.02
-                            if paragraph.box.x2 > page_box.x2 - page_margin:
-                                overflow = paragraph.box.x2 - (page_box.x2 - page_margin)
-                                paragraph.box.x -= overflow
-                                paragraph.box.x2 -= overflow
-                            if paragraph.box.x < page_box.x + page_margin:
-                                underflow = (page_box.x + page_margin) - paragraph.box.x
-                                paragraph.box.x += underflow
-                                paragraph.box.x2 += underflow
 
     def _is_arabic_char(self, char: str) -> bool:
         """Check if character is Arabic - OPTIMIZED"""
@@ -1981,242 +2030,235 @@ class Typesetting:
         if paragraph.first_line_indent:
             current_x += space_width * 4
         
-        # OPTIMIZED ARABIC WORD-LEVEL PROCESSING
+        # OPTIMIZED ARABIC WORD-LEVEL PROCESSING WITH PER-LINE BIDI
         if is_arabic:
-            arabic_word_spacing = space_width * ARABIC_WORD_SPACING_RATIO
-            line_units_map: dict[int, list[TypesettingUnit]] = {}
-            
-            # Calculate effective line width for wrapping
-            effective_line_width = box.x2 - box.x
-            
-            i = 0
-            safety_counter = 0
-            max_iterations = len(typesetting_units) * 3  # Increased safety limit for char-level breaks
-            
-            while i < len(typesetting_units) and safety_counter < max_iterations:
-                safety_counter += 1
-                
-                # Collect word (simple: until space or end)
-                word_units = []
-                while i < len(typesetting_units):
-                    unit = typesetting_units[i]
-                    if unit.is_space:
-                        if word_units:
-                            i += 1
-                        break
-                    word_units.append(unit)
-                    i += 1
-                    if len(word_units) > 100:  # Safety: max word length
-                        break
-                
-                if not word_units:
-                    continue
-                
-                # Calculate word width
-                word_width = sum(u.width * scale for u in word_units)
-                
-                # Skip leading spaces
-                if current_x == box.x and word_units and word_units[0].is_space:
-                    continue
-                
-                # Calculate remaining space on current line
-                remaining_space = box.x2 - current_x
-                
-                # Case 1: Word fits on current line
-                if word_width <= remaining_space:
-                    # Place all word units on current line
-                    relocated_word_units = []
-                    for unit in word_units:
-                        if unit.is_space and current_x == box.x:
-                            continue
-                        
-                        unit_width = unit.width * scale
-                        unit_height = unit.height * scale
-                        
-                        # CJK spacing
-                        if (last_unit and last_unit.is_cjk_char ^ unit.is_cjk_char 
-                            and not unit.is_space and current_x > box.x):
-                            current_x += space_width * 0.5
-                        
-                        relocated_unit = unit.relocate(current_x, current_y, scale)
-                        relocated_unit.line_id = current_line_index
-                        relocated_word_units.append(relocated_unit)
-                        typeset_units.append(relocated_unit)
-                        
-                        if not unit.is_space:
-                            current_line_heights.append(unit_height)
-                        
-                        current_x = relocated_unit.box.x2
-                        last_unit = relocated_unit
-                    
-                    if relocated_word_units:
-                        relocated_word_units[-1].ends_word = True
-                        line_units_map.setdefault(current_line_index, []).extend(relocated_word_units)
-                
-                # Case 2: Word is too long - need to handle line break
+            def get_bidi_indices_and_chars(text: str, base_dir: str = 'R') -> list[tuple[int, str]]:
+                try:
+                    storage = ba.get_empty_storage()
+                    storage['base_level'] = 1 if base_dir == 'R' else 0
+                    storage['base_dir'] = base_dir
+                    ba.get_embedding_levels(text, storage, False, False)
+                    for i, c in enumerate(storage['chars']):
+                        c['orig_idx'] = i
+                    ba.explicit_embed_and_overrides(storage, False)
+                    ba.resolve_weak_types(storage, False)
+                    ba.resolve_neutral_types(storage, False)
+                    ba.resolve_implicit_levels(storage, False)
+                    ba.reorder_resolved_levels(storage, False)
+                    ba.apply_mirroring(storage, False)
+                    return [(c['orig_idx'], c['ch']) for c in storage['chars']]
+                except Exception as e:
+                    logger.warning(f"Error in per-line bidi: {e}")
+                    return [(i, ch) for i, ch in enumerate(text)]
+
+            from babeldoc.format.pdf.document_il.utils.layout_helper import BULLET_POINT_PATTERN
+
+            # 1. Break typesetting_units into tokens:
+            # Each token is either a single space unit, or a word (list of non-space units).
+            # Bullet points (standard or PUA like \uF0B7) are isolated into their own tokens
+            # so they never glue to adjacent words.
+            tokens: list[list[TypesettingUnit]] = []
+            idx = 0
+            n = len(typesetting_units)
+            while idx < n:
+                u = typesetting_units[idx]
+                u_str = u.try_get_unicode() or ""
+                if u.is_space:
+                    tokens.append([u])
+                    idx += 1
+                elif BULLET_POINT_PATTERN.match(u_str) or (u_str and 0xE000 <= ord(u_str[0]) <= 0xF8FF):
+                    # Standalone bullet token: never glue bullet to following word
+                    tokens.append([u])
+                    idx += 1
                 else:
-                    # Check if we're not at the start of line - wrap to next line first
-                    if current_x > box.x:
-                        current_x = box.x
-                        if current_line_heights:
-                            max_height = max(current_line_heights)
-                            mode_height = statistics.mode(current_line_heights) if len(current_line_heights) > 1 else max_height
-                            current_y -= max(mode_height * line_skip, max_height * 1.05)
-                            line_ys.append(current_y)
-                            current_line_heights = []
-                        
-                        if current_y < box.y:
-                            all_units_fit = False
-                        
-                        current_line_index += 1
-                    
-                    # Now check if word fits on a fresh line
-                    if word_width <= effective_line_width:
-                        # Word fits on a line by itself
-                        relocated_word_units = []
-                        for unit in word_units:
-                            if unit.is_space and current_x == box.x:
-                                continue
-                            
-                            unit_width = unit.width * scale
-                            unit_height = unit.height * scale
-                            
-                            relocated_unit = unit.relocate(current_x, current_y, scale)
-                            relocated_unit.line_id = current_line_index
-                            relocated_word_units.append(relocated_unit)
-                            typeset_units.append(relocated_unit)
-                            
-                            if not unit.is_space:
-                                current_line_heights.append(unit_height)
-                            
-                            current_x = relocated_unit.box.x2
-                            last_unit = relocated_unit
-                        
-                        if relocated_word_units:
-                            relocated_word_units[-1].ends_word = True
-                            line_units_map.setdefault(current_line_index, []).extend(relocated_word_units)
-                    
-                    else:
-                        # Word is too long even for a full line - break at character level
-                        # This handles long Arabic strings without spaces
-                        relocated_word_units = []
-                        for unit_idx, unit in enumerate(word_units):
-                            if unit.is_space and current_x == box.x:
-                                continue
-                            
-                            unit_width = unit.width * scale
-                            unit_height = unit.height * scale
-                            
-                            # Check if this character fits on current line
-                            if current_x + unit_width > box.x2 and current_x > box.x:
-                                # Start a new line
-                                # Mark previous unit as ending a "word" (partial word)
-                                if relocated_word_units:
-                                    relocated_word_units[-1].ends_word = True
-                                    line_units_map.setdefault(current_line_index, []).extend(relocated_word_units)
-                                    relocated_word_units = []
-                                
-                                current_x = box.x
-                                if current_line_heights:
-                                    max_height = max(current_line_heights)
-                                    mode_height = statistics.mode(current_line_heights) if len(current_line_heights) > 1 else max_height
-                                    current_y -= max(mode_height * line_skip, max_height * 1.05)
-                                    line_ys.append(current_y)
-                                    current_line_heights = []
-                                
-                                if current_y < box.y:
-                                    all_units_fit = False
-                                
-                                current_line_index += 1
-                            
-                            relocated_unit = unit.relocate(current_x, current_y, scale)
-                            relocated_unit.line_id = current_line_index
-                            relocated_word_units.append(relocated_unit)
-                            typeset_units.append(relocated_unit)
-                            
-                            if not unit.is_space:
-                                current_line_heights.append(unit_height)
-                            
-                            current_x = relocated_unit.box.x2
-                            last_unit = relocated_unit
-                        
-                        if relocated_word_units:
-                            relocated_word_units[-1].ends_word = True
-                            line_units_map.setdefault(current_line_index, []).extend(relocated_word_units)
-                
-            
-            # Apply post-layout spacing so wrapping stays unchanged
-            # Pass box to ensure spacing doesn't cause overflow
-            if typeset_units and line_units_map:
-                self._apply_arabic_word_spacing(line_units_map, arabic_word_spacing, box)
-            
-            # Right-align Arabic lines (but NOT table content)
-            # Check if this paragraph is inside a table by examining layout_label
+                    word = [u]
+                    idx += 1
+                    while idx < n:
+                        next_u = typesetting_units[idx]
+                        next_str = next_u.try_get_unicode() or ""
+                        if next_u.is_space or BULLET_POINT_PATTERN.match(next_str) or (next_str and 0xE000 <= ord(next_str[0]) <= 0xF8FF):
+                            break
+                        word.append(next_u)
+                        idx += 1
+                    tokens.append(word)
+
+            # 2. Wrap tokens into lines in LOGICAL order:
+            effective_line_width = box.x2 - box.x
+            first_indent = space_width * 4 if paragraph.first_line_indent else 0.0
+
+            # Detect bullet points and list markers for RTL hanging indent (Item 2)
+            is_bullet_para = False
+            bullet_indent = 0.0
+            if tokens and not tokens[0][0].is_space:
+                first_token_str = "".join(u.try_get_unicode() or "" for u in tokens[0])
+                first_char_code = ord(first_token_str[0]) if first_token_str else 0
+                if (
+                    BULLET_POINT_PATTERN.match(first_token_str)
+                    or (0xE000 <= first_char_code <= 0xF8FF)
+                    or re.match(r'^(?:\d{1,3}|[a-zA-Z]|(?:i{1,3}|iv|v|vi{1,3}|ix|x))[\.\):]', first_token_str)
+                    or (paragraph.layout_label and any(m in paragraph.layout_label.lower() for m in ['list_item', 'bullet_item']))
+                ):
+                    is_bullet_para = True
+                    first_token_w = sum(u.width * scale for u in tokens[0])
+                    bullet_indent = max(first_token_w + (space_width * 2.5), 14.0)
+
+            lines_tokens: list[list[TypesettingUnit]] = []
+            current_line_tokens: list[TypesettingUnit] = []
+            current_line_w = 0.0
+
+            for token_idx, token in enumerate(tokens):
+                # Dynamic Table of Contents leader dot adjustment:
+                # If this token is a run of leader dots (4+ dots) followed by a page number,
+                # dynamically resize the dot count so title + dots + page_number fills avail on a single line!
+                if all(u.unicode == '.' for u in token) and len(token) >= 4:
+                    rem = tokens[token_idx + 1:]
+                    non_space = [t for t in rem if not t[0].is_space]
+                    if non_space and all(u.unicode.isdigit() for u in non_space[-1]):
+                        pnum_w = sum(u.width * scale for u in non_space[-1])
+                        dot_unit = token[0]
+                        dot_w = dot_unit.width * scale
+                        avail_dots = avail - current_line_w - pnum_w - (space_width * 3)
+                        if avail_dots > (dot_w * 4):
+                            needed = int(avail_dots / dot_w)
+                            token[:] = [copy.copy(dot_unit) for _ in range(needed)]
+
+                token_w = sum(u.width * scale for u in token)
+                line_idx_current = len(lines_tokens)
+                if is_bullet_para and line_idx_current > 0:
+                    avail = effective_line_width - bullet_indent
+                elif line_idx_current == 0 and paragraph.first_line_indent:
+                    avail = effective_line_width - first_indent
+                else:
+                    avail = effective_line_width
+
+                # Skip leading space on a line
+                if not current_line_tokens and token[0].is_space:
+                    continue
+
+                if current_line_tokens and (current_line_w + token_w > avail):
+                    # Wrap to new line: trim trailing spaces
+                    while current_line_tokens and current_line_tokens[-1].is_space:
+                        current_line_tokens.pop()
+                    if current_line_tokens:
+                        lines_tokens.append(current_line_tokens)
+                    current_line_tokens = []
+                    current_line_w = 0.0
+                    if token[0].is_space:
+                        continue
+
+                current_line_tokens.extend(token)
+                current_line_w += token_w
+
+            if current_line_tokens:
+                while current_line_tokens and current_line_tokens[-1].is_space:
+                    current_line_tokens.pop()
+                if current_line_tokens:
+                    lines_tokens.append(current_line_tokens)
+
+            # Record line stats in pipeline trace
+            if not hasattr(paragraph, "pipeline_trace") or paragraph.pipeline_trace is None:
+                paragraph.pipeline_trace = {}
+            paragraph.pipeline_trace.update({
+                "num_lines": len(lines_tokens),
+                "is_bullet_para": is_bullet_para,
+                "bullet_indent": bullet_indent if is_bullet_para else 0.0,
+            })
+
+            # Check if paragraph is inside table
             is_table_content = False
             if paragraph.layout_label:
                 layout_label_lower = paragraph.layout_label.lower()
-                # Exclude ONLY actual table cell content from right-alignment
-                # NOTE: "table_title", "table_caption" are headings, NOT table content!
-                # We only want to exclude: table_cell, table_text, wired_table_cell, wireless_table_cell
                 if any(table_marker in layout_label_lower for table_marker in [
                     'table_cell', 'table_text', 'wired_table_cell', 'wireless_table_cell'
                 ]):
                     is_table_content = True
-            
-            # Only apply right-alignment if NOT table content
-            if typeset_units and not is_table_content:
-                lines_dict = {}
-                for unit in typeset_units:
-                    if unit.box and unit.box.y is not None:
-                        line_y = round(unit.box.y, 1)
-                        if line_y not in lines_dict:
-                            lines_dict[line_y] = []
-                        lines_dict[line_y].append(unit)
+
+            # 3. Layout each line with per-line BiDi
+            for line_idx, line in enumerate(lines_tokens):
+                if not line:
+                    continue
+
+                line_str = "".join(u.try_get_unicode() or "" for u in line)
                 
-                # Sort lines by Y coordinate (top to bottom for RTL - highest Y first)
-                sorted_line_ys = sorted(lines_dict.keys(), reverse=True)
-                
-                # Check if paragraph is justified and has multiple lines
-                is_justified = getattr(paragraph, 'is_justified', False)
-                num_lines = len(sorted_line_ys)
-                
-                for line_idx, line_y in enumerate(sorted_line_ys):
-                    line_units = lines_dict[line_y]
-                    if not line_units:
-                        continue
-                    
-                    is_last_line = (line_idx == num_lines - 1)
-                    
-                    # Get line boundaries
-                    line_min_x = min(u.box.x for u in line_units if u.box and u.box.x is not None)
-                    line_max_x = max(u.box.x2 for u in line_units if u.box and u.box.x2 is not None)
-                    line_width = line_max_x - line_min_x
-                    target_width = box.x2 - box.x
-                    
-                    if is_justified and not is_last_line and num_lines > 1:
-                        # For justified paragraphs (not last line):
-                        # Distribute space between words to fill the full width
-                        self._justify_arabic_line(line_units, box.x, box.x2, line_min_x, line_max_x)
+                # Check if this line is a chronological time-series axis (e.g., sequence of month/year labels)
+                # In charts, timelines progress Left-to-Right even in Arabic contexts to match the chart data curves
+                months_pattern = r'\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec|يناير|فبراير|مارس|أبريل|مايو|يونيو|يوليو|أغسطس|سبتمبر|أكتوبر|نوفمبر|ديسمبر|أوج)\b'
+                is_chronological_axis = len(re.findall(months_pattern, line_str, re.I)) >= 3
+
+                # Check if line contains isolated Latin alphanumeric codes without any Arabic text
+                # (e.g. ISO country codes AL, BA, GB, CZ; SWIFT BICs, arithmetic formulas)
+                has_arabic_chars = any(
+                    (0x0600 <= ord(c) <= 0x06FF) or (0xFB50 <= ord(c) <= 0xFEFF)
+                    for c in line_str
+                )
+                is_isolated_latin = (not has_arabic_chars) and bool(
+                    re.match(r'^[A-Za-z0-9\s\-–—/._\(\)+:=#\$\€\£\¥\%\*]+$', line_str.strip())
+                )
+
+                if is_chronological_axis or is_isolated_latin:
+                    # Keep native LTR character order matching original code, formula, or timeline
+                    visual_units = line
+                elif line_str.strip():
+                    bidi_map = get_bidi_indices_and_chars(line_str, base_dir='R')
+                    visual_units = []
+                    for orig_idx, mirrored_char in bidi_map:
+                        if orig_idx < len(line):
+                            unit = copy.copy(line[orig_idx])
+                            if mirrored_char and unit.unicode and unit.unicode != mirrored_char:
+                                unit.unicode = mirrored_char
+                            visual_units.append(unit)
+                else:
+                    visual_units = line
+
+                # Calculate total line width
+                visual_line_w = sum(u.width * scale for u in visual_units)
+
+                # Hanging indent on wrapped lines (line_idx >= 1) for bullets
+                if is_bullet_para and line_idx > 0:
+                    current_indent = bullet_indent
+                elif line_idx == 0 and paragraph.first_line_indent:
+                    current_indent = first_indent
+                else:
+                    current_indent = 0.0
+
+                # Determine starting X position
+                if is_chronological_axis or is_isolated_latin:
+                    line_start_x = box.x
+                elif is_table_content:
+                    line_start_x = box.x2 - visual_line_w
+                    if line_start_x < box.x:
+                        line_start_x = box.x
+                else:
+                    line_start_x = (box.x2 - current_indent) - visual_line_w
+                    if line_start_x < box.x:
+                        line_start_x = box.x
+
+                # Place each unit along the line LTR from line_start_x
+                cur_x = line_start_x
+                line_heights = []
+                for u in visual_units:
+                    relocated = u.relocate(cur_x, current_y, scale)
+                    relocated.line_id = line_idx
+                    typeset_units.append(relocated)
+                    cur_x = relocated.box.x2
+                    if not u.is_space:
+                        line_heights.append(u.height * scale)
+
+                # Advance Y for the next line only if there is another line to place
+                if line_idx < len(lines_tokens) - 1:
+                    if line_heights:
+                        max_h = max(line_heights)
+                        try:
+                            mode_h = statistics.mode(line_heights)
+                        except statistics.StatisticsError:
+                            mode_h = max_h
+                        current_y -= max(mode_h * line_skip, max_h * 1.05)
                     else:
-                        # For last line or non-justified paragraphs:
-                        # Right-align the line, but CLAMP to prevent left-side overflow
-                        
-                        # Calculate shift to align right edge with box.x2
-                        target_right_position = box.x2
-                        shift_x = target_right_position - line_max_x
-                        
-                        # CRITICAL: After shifting, the LEFT edge must not go below box.x
-                        # new_left = line_min_x + shift_x must be >= box.x
-                        new_left_after_shift = line_min_x + shift_x
-                        
-                        if new_left_after_shift < box.x:
-                            # Shifting would push left edge beyond left margin
-                            # Clamp the shift so left edge stays at box.x
-                            shift_x = box.x - line_min_x
-                        
-                        # Apply the clamped shift
-                        for unit in line_units:
-                            self._shift_unit_x(unit, shift_x)
+                        current_y -= avg_height * line_skip
+
+                    line_ys.append(current_y)
+                    if current_y < box.y:
+                        all_units_fit = False
         else:
             # ORIGINAL NON-ARABIC LOGIC (UNCHANGED)
             for i, unit in enumerate(typesetting_units):
@@ -2531,6 +2573,7 @@ class Typesetting:
                 if composition.pdf_same_style_unicode_characters.unicode:
                     unicode_text = composition.pdf_same_style_unicode_characters.unicode
                     shaped_text = self.shape_arabic_text(unicode_text)
+                    optical_factor = 1.08 if self.is_arabic else 1.0
                     result.extend(
                         [
                             TypesettingUnit(
@@ -2540,7 +2583,7 @@ class Typesetting:
                                     char_unicode,
                                 ),
                                 original_font=font,
-                                font_size=style.font_size,
+                                font_size=style.font_size * optical_factor,
                                 style=style,
                                 xobj_id=paragraph.xobj_id,
                                 debug_info=composition.pdf_same_style_unicode_characters.debug_info
