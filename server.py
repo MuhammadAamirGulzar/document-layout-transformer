@@ -34,7 +34,7 @@ logging.getLogger("openai").setLevel("CRITICAL")
 app = FastAPI(
     title="TransDOC Translation API",
     description="Intelligent PDF Translation with Layout Preservation",
-    version="2.1.0"
+    version="1.0.0"
 )
 
 # Configure CORS

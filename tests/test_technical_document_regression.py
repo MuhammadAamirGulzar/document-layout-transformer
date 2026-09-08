@@ -35,7 +35,13 @@ from babeldoc.translator.translator import (
 from babeldoc.format.pdf.translation_config import TranslationConfig
 from babeldoc.format.pdf.document_il.midend.il_translator import ILTranslator
 from babeldoc.format.pdf.document_il.midend.typesetting import Typesetting, TypesettingUnit
-from babeldoc.format.pdf.document_il.il_version_1 import Box, PdfParagraph, PdfStyle
+from babeldoc.format.pdf.document_il.il_version_1 import (
+    Box,
+    PdfParagraph,
+    PdfStyle,
+    PdfParagraphComposition,
+    PdfSameStyleUnicodeCharacters,
+)
 from babeldoc.format.pdf.document_il.utils.layout_helper import BULLET_POINT_PATTERN
 
 
@@ -473,6 +479,246 @@ class TestTechnicalDocumentRegression(unittest.TestCase):
                 rightmost_u_x2 = max(u.box.x2 for u in laid_out)
                 self.assertLess(leftmost_page_x, box.x + 100.0, "Page number should be near left margin")
                 self.assertGreater(rightmost_u_x2, box.x2 - 100.0, "Title should be near right margin")
+
+    # --------------------------------------------------------------------------
+    # Bug Group 9: Table Cell Overflow & Row Height Synchronization
+    # --------------------------------------------------------------------------
+    def test_qatar_banks_table_cell_no_overlap_and_synchronized_row_height(self):
+        """Table cells in the Qatar Banks SWIFT table must not overlap adjacent cells,
+        and all cells in each row must share the same synchronized height."""
+        # 1. Verify terminology translation for INTERNATIONAL BANK OF QATAR
+        bank_en = "INTERNATIONAL BANK OF QATAR"
+        bank_ar = self.ilt._pre_translate_terminology(bank_en)
+        self.assertEqual(bank_ar, "بنك قطر الدولي")
+        self.assertNotIn(",", bank_ar)
+        self.assertNotIn("،", bank_ar)
+
+        # 2. Build full 17-row Qatar Banks Swift Code table
+        # Table geometry matching page 6:
+        # Col 0 (Name of Bank): x=56.0, x2=215.0 (w=159.0)
+        # Col 1 (Swift Code): x=220.0, x2=370.0 (w=150.0)
+        # Col 2 (Bank Identifier): x=375.0, x2=476.0 (w=101.0)
+        from babeldoc.format.pdf.document_il import Cropbox, Page
+        page = Page(page_number=0, cropbox=Cropbox(box=Box(x=0.0, y=0.0, x2=595.0, y2=842.0)))
+        page.pdf_paragraph = []
+
+        cur_y = 450.0
+        row_height = 14.0
+        row_cells_map = []
+
+        for b_name, s_code, b_id in QATAR_BANKS_SWIFT_FIXTURE:
+            tr_bname = self.ilt._pre_translate_terminology(b_name)
+            p_name = PdfParagraph(
+                layout_label="table_cell",
+                box=Box(x=56.0, y=cur_y, x2=215.0, y2=cur_y + row_height),
+                unicode=tr_bname,
+            )
+            p_swift = PdfParagraph(
+                layout_label="table_cell",
+                box=Box(x=220.0, y=cur_y, x2=370.0, y2=cur_y + row_height),
+                unicode=s_code,
+            )
+            p_id = PdfParagraph(
+                layout_label="table_cell",
+                box=Box(x=375.0, y=cur_y, x2=476.0, y2=cur_y + row_height),
+                unicode=b_id,
+            )
+            page.pdf_paragraph.extend([p_name, p_swift, p_id])
+            row_cells_map.append((p_name, p_swift, p_id))
+            cur_y -= (row_height + 4.0)
+
+        # 3. Render page through Typesetting
+        fonts = {"base": self.base_font}
+        self.typesetting.render_page(page)
+
+        # 4. Assertions across all 17 rows
+        for row_idx, (p_name, p_swift, p_id) in enumerate(row_cells_map):
+            with self.subTest(row=row_idx, bank=p_name.unicode):
+                # Assertion A: No cell box overlap
+                self.assertLessEqual(
+                    p_name.box.x2,
+                    p_swift.box.x + 0.1,
+                    f"Row {row_idx}: Bank cell x2 ({p_name.box.x2}) overlaps SWIFT cell x ({p_swift.box.x})"
+                )
+                self.assertLessEqual(
+                    p_swift.box.x2,
+                    p_id.box.x + 0.1,
+                    f"Row {row_idx}: SWIFT cell x2 ({p_swift.box.x2}) overlaps Bank ID cell x ({p_id.box.x})"
+                )
+
+                # Assertion B: Synchronized row height
+                self.assertAlmostEqual(
+                    p_name.box.y,
+                    p_swift.box.y,
+                    delta=0.5,
+                    msg=f"Row {row_idx}: Bank cell y ({p_name.box.y}) != SWIFT cell y ({p_swift.box.y})"
+                )
+                self.assertAlmostEqual(
+                    p_swift.box.y,
+                    p_id.box.y,
+                    delta=0.5,
+                    msg=f"Row {row_idx}: SWIFT cell y ({p_swift.box.y}) != Bank ID cell y ({p_id.box.y})"
+                )
+                self.assertAlmostEqual(
+                    p_name.box.y2,
+                    p_swift.box.y2,
+                    delta=0.5,
+                    msg=f"Row {row_idx}: Bank cell y2 ({p_name.box.y2}) != SWIFT cell y2 ({p_swift.box.y2})"
+                )
+                self.assertAlmostEqual(
+                    p_swift.box.y2,
+                    p_id.box.y2,
+                    delta=0.5,
+                    msg=f"Row {row_idx}: SWIFT cell y2 ({p_swift.box.y2}) != Bank ID cell y2 ({p_id.box.y2})"
+                )
+
+                # Assertion C: Rendered characters in p_name must NOT exceed p_swift.box.x
+                if p_name.pdf_paragraph_composition:
+                    for comp in p_name.pdf_paragraph_composition:
+                        if comp.pdf_character and comp.pdf_character.box:
+                            self.assertLessEqual(
+                                comp.pdf_character.box.x2,
+                                p_swift.box.x + 0.5,
+                                f"Row {row_idx}: Rendered character '{comp.pdf_character.char_unicode}' "
+                                f"at x2={comp.pdf_character.box.x2} spilled into SWIFT column at x={p_swift.box.x}"
+                            )
+
+    # --------------------------------------------------------------------------
+    # Bug Group 10: Zero .notdef (tofu) Glyph Usage in BBAN Section
+    # --------------------------------------------------------------------------
+    def test_bban_characteristics_zero_notdef_glyphs(self):
+        """Rendered output for the full BBAN characteristics section must contain
+        zero .notdef / glyph-0 characters across all compositions."""
+        bban_items = [
+            "\uf0b7 It has a fixed length (25 Characters for Qatar).",
+            "\uf0b7 It consists of two parts:",
+            "1) Bank Identifier: The first 4 letters of SWIFT Code (BIC) or Bank Code identified by QCB.",
+            "2) Core Customer Account Number: is an account number which identifies the customer's account at a Bank in Qatar. It may have maximum 21 characters (First 4 character of BIC followed by Core Account Number).",
+        ]
+
+        from babeldoc.format.pdf.document_il import Cropbox, Page
+        page = Page(page_number=1, cropbox=Cropbox(box=Box(x=0.0, y=0.0, x2=595.0, y2=842.0)))
+        page.pdf_font = [self.base_font]
+        page.pdf_font[0].font_id = self.style.font_id
+        page.pdf_paragraph = []
+
+        cur_y = 600.0
+        for item in bban_items:
+            norm = self.ilt._normalize_arabic_output(item)
+            p = PdfParagraph(
+                layout_label="bullet_item",
+                box=Box(x=56.0, y=cur_y, x2=540.0, y2=cur_y + 18.0),
+                unicode=norm,
+                pdf_style=self.style,
+                xobj_id=-1,
+                pdf_paragraph_composition=[
+                    PdfParagraphComposition(
+                        pdf_same_style_unicode_characters=PdfSameStyleUnicodeCharacters(
+                            unicode=norm,
+                            pdf_style=self.style,
+                        )
+                    )
+                ],
+            )
+            page.pdf_paragraph.append(p)
+            cur_y -= 25.0
+
+        fonts = {"base": self.base_font}
+        self.typesetting.render_page(page)
+
+        # Audit every character in every paragraph's composition
+        for p_idx, p in enumerate(page.pdf_paragraph):
+            self.assertTrue(
+                p.pdf_paragraph_composition,
+                f"BBAN item {p_idx} has empty composition"
+            )
+            for comp in p.pdf_paragraph_composition:
+                if comp.pdf_character:
+                    ch = comp.pdf_character.char_unicode
+                    gid = comp.pdf_character.pdf_character_id
+                    if ch and not ch.isspace():
+                        self.assertNotEqual(
+                            gid,
+                            0,
+                            f"BBAN item {p_idx} produced .notdef (glyph 0) for character '{ch}' (U+{ord(ch):04X})"
+                        )
+
+    # --------------------------------------------------------------------------
+    # Bug Group 11: Mixed-Script Inline BiDi Word-Order in Table Cells & Bullets
+    # --------------------------------------------------------------------------
+    def test_mixed_script_bidi_ordering_in_table_cell_and_bullets(self):
+        """Mixed English/Arabic inline text in table cells and bullets must render
+        in strict per-line reading order, matching body paragraphs without reversed parentheticals."""
+        test_phrases = [
+            ("bullet_item", "\uf0b7 وله طول ثابت (25 Characters for Qatar)."),
+            ("bullet_item", "2) رقم الحساب: قد يحتوي على (First 4 character of BIC) متبوعة برقم الحساب."),
+            ("table_cell", "رمز البنك: (First 4 character of BIC)"),
+        ]
+
+        from babeldoc.format.pdf.document_il import Cropbox, Page
+        page = Page(page_number=1, cropbox=Cropbox(box=Box(x=0.0, y=0.0, x2=595.0, y2=842.0)))
+        page.pdf_font = [self.base_font]
+        page.pdf_font[0].font_id = self.style.font_id
+        page.pdf_paragraph = []
+
+        cur_y = 500.0
+        for label, phrase in test_phrases:
+            norm = self.ilt._normalize_arabic_output(phrase)
+            p = PdfParagraph(
+                layout_label=label,
+                box=Box(x=56.0, y=cur_y, x2=540.0, y2=cur_y + 20.0),
+                unicode=norm,
+                pdf_style=self.style,
+                xobj_id=-1,
+                pdf_paragraph_composition=[
+                    PdfParagraphComposition(
+                        pdf_same_style_unicode_characters=PdfSameStyleUnicodeCharacters(
+                            unicode=norm,
+                            pdf_style=self.style,
+                        )
+                    )
+                ],
+            )
+            page.pdf_paragraph.append(p)
+            cur_y -= 30.0
+
+        fonts = {"base": self.base_font}
+        self.typesetting.render_page(page)
+
+        for p_idx, (label, orig_phrase) in enumerate(test_phrases):
+            p = page.pdf_paragraph[p_idx]
+            self.assertTrue(p.pdf_paragraph_composition, f"Empty composition for {label}")
+
+            # Collect rendered character stream
+            rendered_chars = [
+                comp.pdf_character.char_unicode
+                for comp in p.pdf_paragraph_composition
+                if comp.pdf_character and comp.pdf_character.char_unicode
+            ]
+            rendered_str = "".join(rendered_chars)
+
+            # In the rendered visual stream, English sequences inside parentheses must retain LTR order
+            if "First 4 character of BIC" in orig_phrase:
+                self.assertIn("First", rendered_str)
+                self.assertIn("BIC", rendered_str)
+                idx_first = rendered_str.index("First")
+                idx_bic = rendered_str.index("BIC")
+                self.assertLess(
+                    idx_first,
+                    idx_bic,
+                    f"English phrase was reversed inside {label}: 'First' at {idx_first} >= 'BIC' at {idx_bic}"
+                )
+
+            if "25 Characters for Qatar" in orig_phrase:
+                self.assertIn("25", rendered_str)
+                self.assertIn("Qatar", rendered_str)
+                idx_25 = rendered_str.index("25")
+                idx_qatar = rendered_str.index("Qatar")
+                self.assertLess(
+                    idx_25,
+                    idx_qatar,
+                    f"Number jumped after phrase inside {label}: '25' at {idx_25} >= 'Qatar' at {idx_qatar}"
+                )
 
 
 if __name__ == "__main__":

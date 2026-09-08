@@ -767,18 +767,24 @@ class TypesettingUnit:
             # Calculate character width
             char_width = self.width
 
-            # Handle case when font is None (no suitable font found for this character)
+            # Handle case when font is None or character lacks glyph
+            ch_code = ord(self.unicode) if self.unicode else 0
+            if (0xE000 <= ch_code <= 0xF8FF) and (self.font is None or self.font.has_glyph(ch_code) == 0):
+                # Map PUA bullet to standard Unicode bullet (• U+2022)
+                self.unicode = '•'
+                ch_code = 0x2022
+
             if self.font is None:
                 logger.warning(
-                    f"No font available for character '{self.unicode}' (U+{ord(self.unicode):04X}), "
+                    f"No font available for character '{self.unicode}' (U+{ch_code:04X}), "
                     f"using font_id='{self.font_id}' with glyph_id=0"
                 )
                 glyph_id = 0  # Use glyph 0 as fallback (usually .notdef)
             else:
-                glyph_id = self.font.has_glyph(ord(self.unicode))
+                glyph_id = self.font.has_glyph(ch_code)
                 if glyph_id == 0 or glyph_id is None:
                     logger.warning(
-                        f"Font '{self.font_id}' doesn't have glyph for character '{self.unicode}' (U+{ord(self.unicode):04X}), "
+                        f"Font '{self.font_id}' doesn't have glyph for character '{self.unicode}' (U+{ch_code:04X}), "
                         f"using glyph_id=0"
                     )
                     glyph_id = 0
@@ -862,6 +868,9 @@ class Typesetting:
                             and font.font_id
                         ):
                             fonts[xobj.xobj_id][font.font_id] = font
+
+            # Balance table row widths before optimal scale calculation
+            self._balance_table_row_widths(page, fonts)
 
             # Preprocess each paragraph
             for paragraph in page.pdf_paragraph:
@@ -970,6 +979,27 @@ class Typesetting:
 
         return text
 
+    def _commit_layout_to_paragraph(
+        self,
+        paragraph: il_version_1.PdfParagraph,
+        page: il_version_1.Page,
+        typeset_units: list[TypesettingUnit],
+        scale: float,
+    ):
+        """Helper to write laid-out units into paragraph composition, curves, and forms."""
+        paragraph.scale = scale
+        paragraph.pdf_paragraph_composition = []
+        for unit in typeset_units:
+            chars, curves, forms = unit.render()
+            for char in chars:
+                paragraph.pdf_paragraph_composition.append(
+                    PdfParagraphComposition(pdf_character=char),
+                )
+            for curve in curves:
+                page.pdf_curve.append(curve)
+            for form in forms:
+                page.pdf_form.append(form)
+
     def _find_optimal_scale_and_layout(
         self,
         paragraph: il_version_1.PdfParagraph,
@@ -990,7 +1020,7 @@ class Typesetting:
             apply_layout: Whether to apply layout and update the paragraph
 
         Returns:
-            tuple[float, list[TypesettingUnit] | None]: (optimal scale factor, laid out typesetting units or None)
+            tuple[float, list[TypesettingUnit]]: (optimal scale factor, laid out typesetting units)
         """
         if not paragraph.box:
             return initial_scale, None
@@ -1007,25 +1037,66 @@ class Typesetting:
         else:
             line_skip = 1.3
 
-        # Role-based minimum scale floors to preserve typographic hierarchy
+        # Role-based minimum scale floors and relief floors to preserve typographic hierarchy
         layout_label = (paragraph.layout_label or "").lower()
         if "title" in layout_label or "heading" in layout_label:
-            min_scale = 0.88  # Headings never shrink below 88% of original size
+            min_scale = 0.88  # Headings normal floor
+            relief_floor = 0.78  # Relief floor if expansion is blocked
         elif "caption" in layout_label:
             min_scale = 0.82
+            relief_floor = 0.75  # Relief floor if expansion is blocked
         elif "table_footnote" in layout_label or "footnote" in layout_label:
             min_scale = 0.75
+            relief_floor = 0.70
         elif "table" in layout_label:
             min_scale = 0.65
+            relief_floor = 0.58
         else:
             min_scale = 0.72  # Body text floor
+            relief_floor = 0.65
 
-        expand_space_flag = 0
+        best_typeset_units = None
+        best_scale = scale
         final_typeset_units = None
 
-        while scale >= min_scale:
-            try:
-                # Try to layout typesetting units
+        # Compute safe inter-paragraph separation margin based on unit font height
+        unit_heights = [u.height for u in typesetting_units if u.height]
+        try:
+            unit_h = statistics.median(unit_heights) if unit_heights else 10.0
+        except Exception:
+            unit_h = 10.0
+        safety_margin = max(8.0, unit_h * 0.85)
+
+        # Try initial layout at current scale
+        try:
+            typeset_units, all_units_fit = self._layout_typesetting_units(
+                typesetting_units,
+                box,
+                scale,
+                line_skip,
+                paragraph,
+                use_english_line_break,
+            )
+            if typeset_units:
+                best_typeset_units = typeset_units
+                best_scale = scale
+
+            if all_units_fit:
+                if apply_layout:
+                    self._commit_layout_to_paragraph(paragraph, page, typeset_units, scale)
+                    final_typeset_units = typeset_units
+                return scale, final_typeset_units
+        except Exception:
+            pass
+
+        # 1. On overflow, attempt box expansion via get_max_bottom_space FIRST,
+        # before any scale reduction — this preserves full-size type for titles/captions when free space exists below.
+        try:
+            min_avail_y = self.get_max_bottom_space(box, page) + safety_margin
+            if min_avail_y < box.y:
+                expanded_box = Box(x=box.x, y=min_avail_y, x2=box.x2, y2=box.y2)
+                box = expanded_box
+                paragraph.box = expanded_box
                 typeset_units, all_units_fit = self._layout_typesetting_units(
                     typesetting_units,
                     box,
@@ -1034,89 +1105,73 @@ class Typesetting:
                     paragraph,
                     use_english_line_break,
                 )
-
-                # If all typesetting units fit within the box
+                if typeset_units:
+                    best_typeset_units = typeset_units
+                    best_scale = scale
                 if all_units_fit:
                     if apply_layout:
-                        # Apply layout and write to paragraph
-                        paragraph.scale = scale
-                        paragraph.pdf_paragraph_composition = []
-                        for unit in typeset_units:
-                            chars, curves, forms = unit.render()
-                            for char in chars:
-                                paragraph.pdf_paragraph_composition.append(
-                                    PdfParagraphComposition(pdf_character=char),
-                                )
-                            for curve in curves:
-                                page.pdf_curve.append(curve)
-                            for form in forms:
-                                page.pdf_form.append(form)
+                        self._commit_layout_to_paragraph(paragraph, page, typeset_units, scale)
                         final_typeset_units = typeset_units
                     return scale, final_typeset_units
+        except Exception as e:
+            logger.debug(f"Error expanding bottom space: {e}")
+
+        # 2. Only if expansion is blocked, fall into progressive scale reduction down to relief floor
+        while scale > relief_floor:
+            scale -= 0.05
+            if scale < relief_floor:
+                scale = relief_floor
+
+            try:
+                typeset_units, all_units_fit = self._layout_typesetting_units(
+                    typesetting_units,
+                    box,
+                    scale,
+                    line_skip,
+                    paragraph,
+                    use_english_line_break,
+                )
+                if typeset_units:
+                    best_typeset_units = typeset_units
+                    best_scale = scale
+
+                if all_units_fit:
+                    if apply_layout:
+                        self._commit_layout_to_paragraph(paragraph, page, typeset_units, scale)
+                        final_typeset_units = typeset_units
+                    return scale, final_typeset_units
+
+                # Re-check bottom space expansion at this reduced scale
+                min_avail_y = self.get_max_bottom_space(box, page) + safety_margin
+                if min_avail_y < box.y:
+                    expanded_box = Box(x=box.x, y=min_avail_y, x2=box.x2, y2=box.y2)
+                    box = expanded_box
+                    paragraph.box = expanded_box
+                    typeset_units, all_units_fit = self._layout_typesetting_units(
+                        typesetting_units,
+                        box,
+                        scale,
+                        line_skip,
+                        paragraph,
+                        use_english_line_break,
+                    )
+                    if typeset_units:
+                        best_typeset_units = typeset_units
+                        best_scale = scale
+                    if all_units_fit:
+                        if apply_layout:
+                            self._commit_layout_to_paragraph(paragraph, page, typeset_units, scale)
+                            final_typeset_units = typeset_units
+                        return scale, final_typeset_units
             except Exception:
-                # If layout fails, check for overflow and try a smaller scale
                 pass
 
-            # Add retypeset logic if needed
-            if not hasattr(paragraph, "debug_id") or not paragraph.debug_id:
-                return scale, final_typeset_units
+            if scale <= relief_floor:
+                break
 
-            # Reduce scale factor
-            if scale > 0.6:
-                scale -= 0.05
-            else:
-                scale -= 0.1
-
-            if scale < 0.7:
-                space_expanded = False  # Track whether space has been added
-
-                if expand_space_flag == 0:
-                    # Try expanding bottom space
-                    try:
-                        min_y = self.get_max_bottom_space(box, page) + 2
-                        if min_y < box.y:
-                            expanded_box = Box(x=box.x, y=min_y, x2=box.x2, y2=box.y2)
-                            box = expanded_box
-                            if apply_layout:
-                                # Update paragraph box boundary
-                                paragraph.box = expanded_box
-                            space_expanded = True
-                    except Exception:
-                        pass
-                    expand_space_flag = 1
-
-                    # If space expansion is possible, continue to try new scale
-                    if space_expanded:
-                        continue
-
-                elif expand_space_flag == 1:
-                    # Try expanding right space
-                    try:
-                        max_x = self.get_max_right_space(box, page) - 5
-                        if max_x > box.x2:
-                            expanded_box = Box(x=box.x, y=box.y, x2=max_x, y2=box.y2)
-                            box = expanded_box
-                            if apply_layout:
-                                # Update paragraph box boundary
-                                paragraph.box = expanded_box
-                            space_expanded = True
-                    except Exception:
-                        pass
-                    expand_space_flag = 2
-
-                    # If space expansion is possible, continue to try new scale
-                    if space_expanded:
-                        continue
-
-                # If no space can be expanded (expand_space_flag < 2), reset scale
-                # When expand_space_flag >= 2, the space has been exhausted and normal scale selection continues
-                if expand_space_flag < 2:
-                    # Reset if there was no space expansion, retry scale loop from 1.0
-                    scale = 1.0
-
-        # If English line break fails, try fallback with no line break
+        # Fallback with use_english_line_break=False if initial try used it
         if use_english_line_break:
-            return self._find_optimal_scale_and_layout(
+            res_scale, res_units = self._find_optimal_scale_and_layout(
                 paragraph,
                 page,
                 typesetting_units,
@@ -1124,8 +1179,42 @@ class Typesetting:
                 use_english_line_break=False,
                 apply_layout=apply_layout,
             )
+            if res_units is not None and len(res_units) > 0:
+                return res_scale, res_units
 
-        # Return the smallest scale factor
+        # 3. If the loop still can't fit the text, NEVER return None.
+        # Track best_typeset_units across iterations, expand paragraph.box.y to encompass
+        # the best-effort layout, and populate the composition at relief_floor/min_scale.
+        # The paragraph must always be formatted.
+        if best_typeset_units is not None and len(best_typeset_units) > 0:
+            min_unit_y = min((u.box.y for u in best_typeset_units if u.box and u.box.y is not None), default=box.y)
+            if min_unit_y < paragraph.box.y:
+                paragraph.box = Box(x=paragraph.box.x, y=min_unit_y - 2, x2=paragraph.box.x2, y2=paragraph.box.y2)
+            if apply_layout:
+                self._commit_layout_to_paragraph(paragraph, page, best_typeset_units, best_scale)
+                final_typeset_units = best_typeset_units
+            return best_scale, final_typeset_units
+
+        # Emergency layout at relief_floor with use_english_line_break=False
+        try:
+            typeset_units, _ = self._layout_typesetting_units(
+                typesetting_units,
+                box,
+                relief_floor,
+                line_skip,
+                paragraph,
+                use_english_line_break=False,
+            )
+            if typeset_units:
+                min_unit_y = min((u.box.y for u in typeset_units if u.box and u.box.y is not None), default=box.y)
+                if min_unit_y < paragraph.box.y:
+                    paragraph.box = Box(x=paragraph.box.x, y=min_unit_y - 2, x2=paragraph.box.x2, y2=paragraph.box.y2)
+                if apply_layout:
+                    self._commit_layout_to_paragraph(paragraph, page, typeset_units, relief_floor)
+                return relief_floor, typeset_units
+        except Exception:
+            pass
+
         return min_scale, final_typeset_units
 
     def _get_optimal_scale(
@@ -1290,9 +1379,47 @@ class Typesetting:
             logger.warning(
                 f"Failed to adjust paragraph positions on page {page.page_number}: {e}"
             )
+        # Balance table row widths before rendering
+        self._balance_table_row_widths(page, fonts)
+
+        # Mirror decorative header banners (colored rectangles) horizontally for RTL
+        self._mirror_header_decorations(page)
+
         # Start typesetting layout rendering
         for paragraph in page.pdf_paragraph:
             self.render_paragraph(paragraph, page, fonts)
+
+        # Synchronize row heights across all cells in each table row
+        self._synchronize_table_row_heights(page)
+
+    def _mirror_header_decorations(self, page: il_version_1.Page):
+        """Mirror decorative header vector rectangles horizontally when rendering RTL."""
+        if not self._is_arabic_output():
+            return
+        if not (page.cropbox and page.cropbox.box and hasattr(page, 'pdf_rectangle') and page.pdf_rectangle):
+            return
+
+        page_box = page.cropbox.box
+        page_w = page_box.x2 - page_box.x
+        page_h = page_box.y2 - page_box.y
+        top_threshold = page_box.y + page_h * 0.70  # Top 30% of page
+
+        for rect in page.pdf_rectangle:
+            if not rect.box or getattr(rect, "debug_info", False):
+                continue
+            r_box = rect.box
+            r_h = r_box.y2 - r_box.y
+            r_w = r_box.x2 - r_box.x
+            # Check if this is a header decorative badge/strip:
+            # - In the top 30% of page
+            # - Relatively small height (banner badge/accent, e.g. 4pt - 35pt)
+            # - Does not span the whole page width (< 45% of page width)
+            if r_box.y >= top_threshold and 4.0 <= r_h <= 35.0 and r_w < page_w * 0.45:
+                # Mirror horizontally: x_new = page_box.x2 - (r_box.x2 - page_box.x)
+                new_x = page_box.x2 - (r_box.x2 - page_box.x)
+                new_x2 = page_box.x2 - (r_box.x - page_box.x)
+                r_box.x = new_x
+                r_box.x2 = new_x2
 
     def add_watermark(self, page: il_version_1.Page):
         page_width = page.cropbox.box.x2 - page.cropbox.box.x
@@ -1790,6 +1917,135 @@ class Typesetting:
         
         return False
 
+    def _is_table_cell(self, paragraph: il_version_1.PdfParagraph, page: il_version_1.Page) -> bool:
+        """Check if paragraph is a table cell within a grid table."""
+        if paragraph.layout_label:
+            lbl = paragraph.layout_label.lower()
+            if any(marker in lbl for marker in ['table_cell', 'table_text', 'wired_table_cell', 'wireless_table_cell', 'fallback_line']):
+                if not any(marker in lbl for marker in ['table_caption', 'table_title', 'table_footnote']):
+                    return True
+        # Check if inside a table layout region
+        if paragraph.box and hasattr(page, 'page_layout') and page.page_layout:
+            for layout in page.page_layout:
+                if layout.box and (layout.class_name or "").lower() in ['table', 'wired_table', 'wireless_table']:
+                    overlap_x1 = max(paragraph.box.x, layout.box.x)
+                    overlap_x2 = min(paragraph.box.x2, layout.box.x2)
+                    overlap_y1 = max(paragraph.box.y, layout.box.y)
+                    overlap_y2 = min(paragraph.box.y2, layout.box.y2)
+                    if overlap_x1 < overlap_x2 and overlap_y1 < overlap_y2:
+                        para_area = (paragraph.box.x2 - paragraph.box.x) * (paragraph.box.y2 - paragraph.box.y)
+                        overlap_area = (overlap_x2 - overlap_x1) * (overlap_y2 - overlap_y1)
+                        if para_area > 0 and (overlap_area / para_area) > 0.5:
+                            return True
+        return False
+
+    def _cluster_table_cells_into_rows(self, page: il_version_1.Page) -> list[list[il_version_1.PdfParagraph]]:
+        """Cluster table cell paragraphs on a page into rows based on vertical overlap."""
+        table_cells = [
+            p for p in page.pdf_paragraph
+            if p.box and p.box.x is not None and p.box.y is not None
+            and p.box.x2 is not None and p.box.y2 is not None
+            and self._is_table_cell(p, page)
+        ]
+        if not table_cells:
+            return []
+
+        # Sort cells descending by top Y (y2), then by x
+        sorted_cells = sorted(table_cells, key=lambda c: (-c.box.y2, c.box.x))
+
+        rows: list[list[il_version_1.PdfParagraph]] = []
+        for cell in sorted_cells:
+            cell_y = cell.box.y
+            cell_y2 = cell.box.y2
+            cell_h = max(cell_y2 - cell_y, 1.0)
+
+            matched_row = None
+            for row in rows:
+                ref_cell = row[0]
+                ref_y = ref_cell.box.y
+                ref_y2 = ref_cell.box.y2
+                ref_h = max(ref_y2 - ref_y, 1.0)
+
+                v_overlap = min(cell_y2, ref_y2) - max(cell_y, ref_y)
+                # Overlap must be at least 40% of the smaller cell's height
+                if v_overlap > 0.40 * min(cell_h, ref_h):
+                    # Check horizontal overlap with existing cells in the row
+                    # (cells in the same row should be in separate columns)
+                    h_collision = any(
+                        not (cell.box.x2 <= other.box.x + 1.0 or cell.box.x >= other.box.x2 - 1.0)
+                        for other in row
+                    )
+                    if not h_collision:
+                        matched_row = row
+                        break
+
+            if matched_row is not None:
+                matched_row.append(cell)
+            else:
+                rows.append([cell])
+
+        # Sort each row horizontally left-to-right (increasing x)
+        for row in rows:
+            row.sort(key=lambda c: c.box.x)
+
+        return rows
+
+    def _balance_table_row_widths(self, page: il_version_1.Page, fonts: dict):
+        """Redistribute unused horizontal space from sibling columns in the same row to overflowing cells."""
+        rows = self._cluster_table_cells_into_rows(page)
+        for row in rows:
+            if len(row) < 2:
+                continue
+
+            # Check each adjacent pair of cells (left cell, right cell)
+            for i in range(len(row) - 1):
+                cell_left = row[i]
+                cell_right = row[i + 1]
+
+                units_left = self.create_typesetting_units(cell_left, fonts)
+                units_right = self.create_typesetting_units(cell_right, fonts)
+
+                w_left = cell_left.box.x2 - cell_left.box.x
+                w_right = cell_right.box.x2 - cell_right.box.x
+
+                req_left = sum(u.width for u in units_left)
+                req_right = sum(u.width for u in units_right)
+
+                right_is_passthrough = all(u.can_passthrough for u in units_right)
+                left_is_passthrough = all(u.can_passthrough for u in units_left)
+
+                # Case 1: Left cell overflows, and Right cell has surplus
+                if req_left > w_left and (right_is_passthrough or req_right + 15.0 < w_right):
+                    surplus_right = w_right - (req_right + 12.0)
+                    deficit_left = req_left - w_left + 6.0
+                    if surplus_right > 2.0:
+                        shift = min(deficit_left, surplus_right * 0.85)
+                        cell_left.box.x2 += shift
+                        cell_right.box.x += shift
+
+                # Case 2: Right cell overflows, and Left cell has surplus
+                elif req_right > w_right and (left_is_passthrough or req_left + 15.0 < w_left):
+                    surplus_left = w_left - (req_left + 12.0)
+                    deficit_right = req_right - w_right + 6.0
+                    if surplus_left > 2.0:
+                        shift = min(deficit_right, surplus_left * 0.85)
+                        cell_left.box.x2 -= shift
+                        cell_right.box.x -= shift
+
+    def _synchronize_table_row_heights(self, page: il_version_1.Page):
+        """Synchronize row height across all cells in each table row so the table does not look jagged."""
+        rows = self._cluster_table_cells_into_rows(page)
+        for row in rows:
+            if len(row) < 2:
+                continue
+
+            row_min_y = min(c.box.y for c in row if c.box and c.box.y is not None)
+            row_max_y2 = max(c.box.y2 for c in row if c.box and c.box.y2 is not None)
+
+            for cell in row:
+                cell.box.y = row_min_y
+                cell.box.y2 = row_max_y2
+
     def _would_overlap_page_decoration(self, paragraph: il_version_1.PdfParagraph, page: il_version_1.Page) -> bool:
         """Check if margin mirroring would cause the paragraph to overlap with page decorations.
         
@@ -2213,6 +2469,10 @@ class Typesetting:
                 # Calculate total line width
                 visual_line_w = sum(u.width * scale for u in visual_units)
 
+                # Check horizontal overflow within table cell
+                if is_table_content and visual_line_w > (box.x2 - box.x) + 0.5:
+                    all_units_fit = False
+
                 # Hanging indent on wrapped lines (line_idx >= 1) for bullets
                 if is_bullet_para and line_idx > 0:
                     current_indent = bullet_indent
@@ -2239,6 +2499,8 @@ class Typesetting:
                 for u in visual_units:
                     relocated = u.relocate(cur_x, current_y, scale)
                     relocated.line_id = line_idx
+                    if is_table_content and relocated.box and relocated.box.x2 > box.x2 + 0.5:
+                        all_units_fit = False
                     typeset_units.append(relocated)
                     cur_x = relocated.box.x2
                     if not u.is_space:
@@ -2704,7 +2966,7 @@ class Typesetting:
         # Check figures
         for figure in page.pdf_figure:
             if figure.box.y2 < current_box.y and not (
-                char.box.x >= current_box.x2 or char.box.x2 <= current_box.x
+                figure.box.x >= current_box.x2 or figure.box.x2 <= current_box.x
             ):
                 min_y = max(min_y, figure.box.y2)
 

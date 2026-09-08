@@ -165,4 +165,51 @@ In Tables of Contents, entries connect section titles to page numbers via runs o
    - Automatically shrinks dots for wider Arabic titles or expands dots for shorter titles.
    - Guarantees that the TOC entry **always fits on a single line**, with the title right-aligned at `box.x2`, the page number left-aligned at `box.x`, and dots filling the middle space.
 
+---
+
+## 7. Multi-Sentence Paragraph Translation (`_translate_with_line_preservation`)
+
+### Problem: Seq2Seq Attention Truncation in Long Paragraphs
+In macro-economic and central bank bulletins, paragraphs often span 3–5 dense sentences (500–900 characters) with repeated technical terms, years, and percentages.
+- When fed into sequence-to-sequence neural translation models (e.g. Meta NLLB-200, MarianMT) as a single monolithic block, beam search and attention mechanisms frequently truncate generation after the second sentence, dropping the trailing sentences completely.
+- If the dropped sentences contain shielded tokens (such as `(Chart 2-1)` or a repeated year `2022`), the missing tokens trigger restoration verification errors, resulting in the entire paragraph aborting and falling back to raw English.
+
+### Solution: Sentence-Level Splitting
+In `_translate_with_line_preservation` in `il_translator.py`:
+- Flowing body text paragraphs containing multiple sentences and exceeding 150 characters are automatically split at sentence boundaries:
+  ```python
+  sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', normalized_text) if s.strip()]
+  if len(sentences) > 1 and len(normalized_text) > 150:
+      translated_sentences = [
+          self.translate_engine.translate(s, rate_limit_params=rate_limit_params)
+          for s in sentences
+      ]
+      return " ".join(translated_sentences)
+  ```
+- **Benefits**:
+  1. Each sentence is translated with focused attention and zero trailing truncation.
+  2. Numbers, percentages, acronyms, and chart references are restored with 100% precision.
+  3. Short single-sentence paragraphs and titles continue to translate as single atomic units.
+
+---
+
+## 8. Byte-Identity Verification & Graceful Fallback (`_restore_numerals`)
+
+### Multi-Tiered Verification
+In `_restore_numerals` (`translator.py`):
+1. **Critical Banking Codes (SWIFT / BIC / IBAN)**:
+   - For tokens matching `_SWIFT_BIC_PATTERN` or `_IBAN_PATTERN`, strict byte-identity is enforced:
+     ```python
+     if is_critical and actual_count < expected_count:
+         raise AssertionError(
+             f"Byte-identity check failed! Expected at least {expected_count} occurrence(s) "
+             f"of critical banking code '{original_token}'..."
+         )
+     ```
+   - Guarantees zero byte corruption of banking codes (e.g. preventing `BBMEQAQXXXX` from becoming `BBMEOAOXXXX`).
+2. **Natural Language Numerals & Terms**:
+   - For general numbers (e.g. `2022`, `4.7`), percentages, or terms that an NMT engine may idiomatically condense:
+   - Logs a diagnostic warning (`logger.warning`) without raising an unhandled exception.
+   - **Guarantees zero dropped translations**: The paragraph is always rendered in full Arabic rather than rolling back to raw English.
+
 

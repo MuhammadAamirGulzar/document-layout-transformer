@@ -19,6 +19,7 @@ from babeldoc.format.pdf.document_il.il_version_1 import (
     PdfParagraphComposition,
     PdfSameStyleUnicodeCharacters,
     PdfStyle,
+    PdfCharacter,
     Document,
 )
 from babeldoc.format.pdf.document_il.midend.typesetting import Typesetting, TypesettingUnit
@@ -199,13 +200,85 @@ def test_legend_swatch_placement():
     assert visual_str[-1] == "■", f"Expected swatch '■' at rightmost position in visual order: [{visual_str}]"
 
 
+def test_overflow_paragraph_expansion_and_composition():
+    """Verify paragraph with a 1-line bounding box whose translation wraps to 2+ lines
+    expands box.y, populates pdf_paragraph_composition, and renders with zero drops.
+    """
+    import unittest.mock as mock
+    import logging
+    from babeldoc.format.pdf.document_il.midend.typesetting import TypesettingUnit
+    from babeldoc.format.pdf.document_il.backend.pdf_creater import PDFCreater
+
+    cfg = TranslationConfig(
+        translator=DummyTranslator(),
+        input_file="",
+        lang_in="en",
+        lang_out="ar",
+        doc_layout_model=None,
+    )
+    ts = Typesetting(cfg)
+
+    # Standard page box: height 792, width 612
+    page_box = Box(x=0.0, y=0.0, x2=612.0, y2=792.0)
+    page = Page(cropbox=Cropbox(box=page_box))
+
+    # A 1-line bounding box: height 15pt (y=700 to y2=715), narrow width 150pt
+    para_box = Box(x=50.0, y=700.0, x2=200.0, y2=715.0)
+    
+    # Arabic title text that requires multiple lines to fit 150pt width
+    text = "استراتيجية التنمية الوطنية الثالثة لدولة قطر والسياسة النقدية للمصرف المركزي"
+    style = PdfStyle(font_id="base", font_size=12.0)
+
+    paragraph = PdfParagraph(
+        layout_label="title",
+        box=para_box,
+        unicode=text,
+        debug_id=42,
+        pdf_style=style,
+    )
+    page.pdf_paragraph.append(paragraph)
+
+    # Build typesetting units for each character
+    units = []
+    for ch in text:
+        w = 4.0 if ch == " " else 10.0
+        c = PdfCharacter(
+            char_unicode=ch,
+            box=Box(x=0.0, y=0.0, x2=w, y2=12.0),
+            pdf_style=style,
+        )
+        units.append(TypesettingUnit(char=c))
+
+    # Typeset the paragraph using precomputed scale logic
+    scale, final_units = ts._find_optimal_scale_and_layout(
+        paragraph, page, units, initial_scale=1.0, apply_layout=True
+    )
+
+    # 1. Assert paragraph composition is non-empty
+    assert len(paragraph.pdf_paragraph_composition) > 0, "pdf_paragraph_composition was left empty!"
+    # 2. Assert paragraph box expanded downwards to accommodate wrapped lines
+    assert paragraph.box.y < 700.0, f"paragraph.box.y was not expanded: {paragraph.box.y}"
+
+    # 3. Verify PDFCreater renders the paragraph without dropping it or logging errors
+    creater = PDFCreater("", Document(page=[page]), cfg, {})
+    with mock.patch.object(logging.getLogger("babeldoc.format.pdf.document_il.backend.pdf_creater"), "error") as mock_error:
+        chars = creater.render_paragraph_to_char(paragraph)
+        assert len(chars) > 0, "PDFCreater returned zero characters!"
+        for call in mock_error.call_args_list:
+            assert "Unable to export paragraphs" not in str(call), f"Found dropped paragraph error: {call}"
+
+
 if __name__ == "__main__":
+    import sys
+    if hasattr(sys.stdout, 'reconfigure'):
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
     print("Running Advanced RTL Formatting Suite...\n")
     tests = [
         ("test_punctuation_bidi_locking", test_punctuation_bidi_locking),
         ("test_header_footer_mirroring", test_header_footer_mirroring),
         ("test_bullet_point_hanging_indent", test_bullet_point_hanging_indent),
         ("test_legend_swatch_placement", test_legend_swatch_placement),
+        ("test_overflow_paragraph_expansion_and_composition", test_overflow_paragraph_expansion_and_composition),
     ]
     passed = 0
     for name, fn in tests:

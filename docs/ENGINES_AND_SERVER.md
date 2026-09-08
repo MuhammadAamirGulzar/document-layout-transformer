@@ -21,13 +21,15 @@ TransDOC supports three distinct translation backends, catering to offline priva
 ```
 
 ### Engine 1: Meta NLLB-200 (`NLLBTranslator`) - Recommended Default
-- **Model**: `facebook/nllb-200-distilled-600M` (or `facebook/nllb-200-1.3B`).
+- **Model**: `facebook/nllb-200-distilled-600M` (or `facebook/nllb-200-1.3B`, `facebook/nllb-200-3.3B` with 8-bit quantization).
 - **Languages**: 200+ languages, using `eng_Latn` (source) and `arb_Arab` (target Modern Standard Arabic).
 - **Inference Optimization**:
   - Automatically checks `torch.cuda.is_available()`.
   - Uses `torch.float16` on CUDA for 3x speedup and minimal VRAM usage (~1.4 GB for 600M model).
   - Employs beam search (`num_beams=4`), `no_repeat_ngram_size=4`, and `repetition_penalty=1.1`.
   - Uses `forced_bos_token_id` to strictly guide target generation to Arabic.
+  - **Multi-Sentence Splitting**: Long flowing body paragraphs (`>150` chars) are automatically translated sentence-by-sentence via `_translate_with_line_preservation`, preventing encoder-decoder tail truncation.
+  - **Font Subsetting**: Requires `fonttools` (installed in `.venv`) for PyMuPDF CMap glyph subsetting.
 
 ### Engine 2: MarianMT (`MarianMTTranslator`)
 - **Model**: `HuggingFaceTranslator` / `marefa-nlp/marefa-mt-en-ar`.

@@ -1,11 +1,10 @@
 *.txt
 !requirements.txt
 outputs/
+scratch/
+*.pdf
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
-*.pdf
-.venv/
-.pytest_cache/
 

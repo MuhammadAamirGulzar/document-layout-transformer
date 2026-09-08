@@ -153,6 +153,13 @@ class FontMapper:
 
     def map(self, original_font: PdfFont, char_unicode: str):
         current_char = ord(char_unicode)
+        if 0xE000 <= current_char <= 0xF8FF:
+            # Map PUA bullet symbols to standard Unicode bullet (• U+2022)
+            has_pua = any(f.has_glyph(current_char) for f in self.fonts.values())
+            if not has_pua:
+                current_char = 0x2022
+                char_unicode = '•'
+
         if isinstance(original_font, pymupdf.Font):
             font_name_lower = (getattr(original_font, "name", "") or "").lower()
             bold = bool(original_font.is_bold) or any(

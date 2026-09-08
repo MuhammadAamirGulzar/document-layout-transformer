@@ -414,6 +414,24 @@ class ILTranslator:
         text = re.sub(r'\bFax\b(?:\s*[:：])?', 'الفاكس:', text, flags=re.I)
         text = re.sub(r'\bE-?Mail\b(?:\s*[:：])?', 'البريد الإلكتروني:', text, flags=re.I)
 
+        # Qatar Banking Institutions standardization (prevents fragmentation, stray commas, and phonetic mistranslations)
+        text = re.sub(r'\bINTERNATIONAL\s+BANK\s+OF\s+QATAR\b', 'بنك قطر الدولي', text, flags=re.I)
+        text = re.sub(r'\bQATAR\s+NATIONAL\s+BANK\b', 'بنك قطر الوطني', text, flags=re.I)
+        text = re.sub(r'\bCOMMERCIAL\s+BANK\s+OF\s+QATAR\b', 'البنك التجاري القطري', text, flags=re.I)
+        text = re.sub(r'\bDOHA\s+BANK\b', 'بنك الدوحة', text, flags=re.I)
+        text = re.sub(r'\bQATAR\s+ISLAMIC\s+BANK\b', 'مصرف قطر الإسلامي', text, flags=re.I)
+        text = re.sub(r'\bAHLI\s+BANK\s+OF\s+QATAR\b', 'البنك الأهلي القطري', text, flags=re.I)
+        text = re.sub(r'\bQATAR\s+INTL\s+ISLAMIC\s+BANK\b', 'بنك قطر الدولي الإسلامي', text, flags=re.I)
+        text = re.sub(r'\bARAB\s+BANK\b', 'البنك العربي', text, flags=re.I)
+        text = re.sub(r'\bMASHREQ\s+BANK\b', 'بنك المشرق', text, flags=re.I)
+        text = re.sub(r'\bSTANDARD\s+CHARTERED\s+BANK\b', 'بنك ستاندرد تشارترد', text, flags=re.I)
+        text = re.sub(r'\bUNITED\s+BANK\s+LTD\b', 'بنك يونايتد المحدود', text, flags=re.I)
+        text = re.sub(r'\bBNP\s+PARIBAS\b', 'بي إن بي باريبا', text, flags=re.I)
+        text = re.sub(r'\bRAYYAN\s+BANK\b', 'مصرف الريان', text, flags=re.I)
+        text = re.sub(r'\bAL\s+KHALIJ\s+COMMERCIAL\s+BANK\b', 'بنك الخليج التجاري', text, flags=re.I)
+        text = re.sub(r'\bBANK\s+BARWA\b', 'بنك بروة', text, flags=re.I)
+        text = re.sub(r'\bQATAR\s+DEVELOPMENT\s+BANK\b', 'بنك قطر للتنمية', text, flags=re.I)
+
         return text
 
     def _translate_with_line_preservation(self, text: str, rate_limit_params: dict) -> str:
@@ -466,6 +484,19 @@ class ILTranslator:
                 normalized_text = " ".join(line.strip() for line in lines if line.strip())
             else:
                 normalized_text = text
+
+            # Multi-sentence paragraph translation:
+            # When a flowing paragraph contains multiple sentences (e.g. > 150 chars),
+            # translate sentence-by-sentence to prevent Seq2Seq models (NLLB/Marian)
+            # from truncating sentences at the tail of long paragraphs.
+            sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', normalized_text) if s.strip()]
+            if len(sentences) > 1 and len(normalized_text) > 150:
+                translated_sentences = [
+                    self.translate_engine.translate(s, rate_limit_params=rate_limit_params)
+                    for s in sentences
+                ]
+                return " ".join(translated_sentences)
+
             return self.translate_engine.translate(normalized_text, rate_limit_params=rate_limit_params)
 
     def _normalize_arabic_output(self, text: str) -> str:
@@ -536,8 +567,14 @@ class ILTranslator:
         text = re.sub(r'\bTable\s+(\d+[-–—]\d+)', r'الجدول \1', text, flags=re.I)
         text = re.sub(r'\bChart\s+(\d+[-–—]\d+)', r'المخطط \1', text, flags=re.I)
 
-        # 9. Wrap Latin parenthetical acronyms with Left-to-Right Mark (\u200E) to preserve BiDi order
-        text = re.sub(r'\([A-Z0-9]{2,}\)', lambda m: f'\u200E{m.group(0)}\u200E', text)
+        # 9. Wrap Latin parenthetical acronyms and mixed English expressions with Left-to-Right Mark (\u200E) to preserve BiDi order
+        def _wrap_lrm(m):
+            matched = m.group(0)
+            if any(c.isalpha() and ord(c) < 0x0600 for c in matched):
+                return f"\u200E{matched}\u200E"
+            return matched
+
+        text = re.sub(r'\([A-Za-z0-9\s\-–—/._+:=#\$\€\£\¥\%\*]+\)', _wrap_lrm, text)
 
         # 10. Insert spaces at Arabic letters ↔ Latin/digit script boundaries (excluding Arabic percent sign \u066A)
         ar_letters = r'[\u0621-\u064A\u066E-\u06D3\u06D5\uFB50-\uFDFF\uFE70-\uFEFF]'
@@ -555,7 +592,11 @@ class ILTranslator:
         if text.strip() in ['التلفزيون :', 'التلفزيون:']:
             text = 'الهاتف:'
 
-        # 13. Collapse multiple spaces to single space
+        # 13. Clean up stray Western or Arabic commas inside bank and institutional names
+        text = re.sub(r'(\b(?:بنك|مصرف|الدولي|القطري|الوطني)[\u0600-\u06FF\s]*?)[,،](\s*[\u0600-\u06FF])', r'\1\2', text)
+        text = re.sub(r'(\b[\u0600-\u06FF]+)\s*,\s*([\u0600-\u06FF]+\b)', r'\1 \2', text)
+
+        # 14. Collapse multiple spaces to single space
         text = re.sub(r'  +', ' ', text).strip()
 
         return text

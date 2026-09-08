@@ -211,6 +211,11 @@ class LayoutParser:
             clusters = babeldoc.format.pdf.document_il.utils.extract_char.process_page_chars_to_lines(
                 char_boxes
             )
+            if not clusters:
+                return
+
+            # Compute bounding boxes for each cluster line
+            line_boxes = []
             for cluster in clusters:
                 boxes = [c[0] for c in cluster.chars]
                 min_x = min(b.x for b in boxes)
@@ -218,13 +223,43 @@ class LayoutParser:
                 min_y = min(b.y for b in boxes)
                 max_y = max(b.y2 for b in boxes)
                 cluster.chars = il_version_1.Box(min_x, min_y, max_x, max_y)
+                line_boxes.append(il_version_1.Box(min_x, min_y, max_x, max_y))
+
+            # Group vertically consecutive lines in the same column into paragraph blocks
+            # Sort lines top-to-bottom (PDF y2 descending)
+            line_boxes.sort(key=lambda b: -b.y2)
+            blocks: list[list[il_version_1.Box]] = []
+            current_block: list[il_version_1.Box] = []
+
+            for b in line_boxes:
+                if not current_block:
+                    current_block.append(b)
+                else:
+                    prev_b = current_block[-1]
+                    vert_gap = prev_b.y - b.y2
+                    horiz_diff = abs(prev_b.x - b.x)
+                    line_h = prev_b.y2 - prev_b.y
+                    # Consistent line spacing and left alignment in the same column
+                    if 0 <= vert_gap <= (line_h * 1.6) and horiz_diff < (line_h * 2.5):
+                        current_block.append(b)
+                    else:
+                        blocks.append(current_block)
+                        current_block = [b]
+            if current_block:
+                blocks.append(current_block)
+
+            for block in blocks:
+                b_min_x = min(b.x for b in block)
+                b_max_x = max(b.x2 for b in block)
+                b_min_y = min(b.y for b in block)
+                b_max_y = max(b.y2 for b in block)
                 page_layout = il_version_1.PageLayout(
                     id=len(exists_page_layouts) + 1,
                     box=il_version_1.Box(
-                        min_x,
-                        min_y,
-                        max_x,
-                        max_y,
+                        b_min_x,
+                        b_min_y,
+                        b_max_x,
+                        b_max_y,
                     ),
                     conf=1,
                     class_name="fallback_line",

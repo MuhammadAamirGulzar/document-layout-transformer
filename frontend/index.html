@@ -867,15 +867,26 @@
         <div class="model-selection">
             <label>Translation AI Engine:</label>
             <div class="model-toggle-group">
-                <div class="model-card active" data-model="nllb" onclick="selectModel('nllb')">
+                <div class="model-card active" data-model="nllb-3.3b" onclick="selectModel('nllb-3.3b')">
                     <div class="model-card-header">
                         <div class="model-card-left">
                             <div class="model-radio-custom"></div>
-                            <span class="model-title">Meta NLLB-200</span>
+                            <span class="model-title">Meta NLLB-200 (3.3B Quantized 8-Bit)</span>
                         </div>
-                        <span class="model-badge badge-recommended">⭐ Recommended Offline</span>
+                        <span class="model-badge badge-recommended">👑 SOTA Quality</span>
                     </div>
-                    <div class="model-desc">Meta's 200-language model with GPU acceleration. Rich vocabulary and superior sentence structure.</div>
+                    <div class="model-desc">Meta's flagship 3.3B parameter model with 8-bit GPU acceleration. Highest accuracy Arabic translation (~3.5 GB VRAM).</div>
+                </div>
+
+                <div class="model-card" data-model="nllb" onclick="selectModel('nllb')">
+                    <div class="model-card-header">
+                        <div class="model-card-left">
+                            <div class="model-radio-custom"></div>
+                            <span class="model-title">Meta NLLB-200 (600M Fast)</span>
+                        </div>
+                        <span class="model-badge badge-fast">⚡ Fast Offline</span>
+                    </div>
+                    <div class="model-desc">Lightweight 600M model for rapid drafting with minimal memory footprint (~1.4 GB VRAM).</div>
                 </div>
 
                 <div class="model-card" data-model="marianmt" onclick="selectModel('marianmt')">
@@ -900,7 +911,7 @@
                     <div class="model-desc">Deep document context & formatting preservation (requires OPENAI_API_KEY).</div>
                 </div>
             </div>
-            <input type="hidden" id="selectedModel" value="nllb">
+            <input type="hidden" id="selectedModel" value="nllb-3.3b">
         </div>
 
         <div class="layout-selection">

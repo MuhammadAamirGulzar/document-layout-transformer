@@ -4,6 +4,7 @@ import re
 import threading
 import time
 import unicodedata
+from collections import Counter
 from abc import ABC
 from abc import abstractmethod
 
@@ -53,21 +54,29 @@ _NUMERAL_PATTERN = re.compile(
     r'(\b\d+\s*=\s*\d+\b)|'
     # 4. Modulo and international standard references: MOD 97-10, MOD 97, ISO/IEC 7064, ISO 13616-1
     r'(\b(?:MOD\s*\d+(?:-\d+)?|ISO(?:/IEC)?\s*\d+(?:-\d+)?)\b)|'
-    # 5. Long alphanumeric account/IBAN strings (15-35 chars with at least one digit)
+    # 5. Full IBAN strings (with or without 4-character block spaces) and long account strings (15-35 chars)
+    r'(\b[A-Z]{2}\d{2}(?:\s+[A-Z0-9]{4}){2,7}(?:\s+[A-Z0-9]{1,4})?\b)|'
+    r'(\b[A-Z]{2}\d{2}[A-Z0-9]{11,30}\b)|'
     r'(\b(?=[A-Z0-9]{15,35}\b)(?=[A-Z0-9]*\d)[A-Z0-9]+\b)|'
-    # 6. SWIFT BIC codes embedded in text: ABQQQAQAXXX, BBMEQAQXXXX, SCBLQAQXXXX
+    # 6. SWIFT BIC codes embedded in text (8 or 11 uppercase chars): ABQQQAQAXXX, BBMEQAQXXXX, SCBLQAQXXXX
     r'(\b[A-Z]{4}[A-Z]{2}[A-Z0-9]{2}(?:[A-Z0-9]{3})?\b)|'
-    # 7. Compound numeric references: 2-1, Chart 4-4, 7-3, 5.1.1, 2.1.2
+    # 7. Bank Identifiers (4-letter routing codes): BBME, QNBA, CBQA, DOHB, IBOQ, etc.
+    r'(\b(?:QNBA|CBQA|DOHB|QISB|ABQQ|QIIB|ARAB|MSHQ|IBOQ|BBME|SCBL|UNIL|BNPA|MAFR|KLJI|BRWA|QIDB)\b)|'
+    # 8. All 54 ISO 2-letter Country Codes: AL, AD, AT, BE, BA, BG, HR, QA, etc.
+    r'(\b(?:AL|AD|AT|BE|BA|BG|HR|CY|CZ|DK|EE|FO|FI|FR|GE|DE|GI|GR|GL|HU|IS|IE|IL|IT|JO|KW|LV|LB|LI|LT|LU|MK|MT|MR|MU|MD|MC|ME|NL|NO|PK|PL|PT|QA|RO|SM|SA|RS|SK|SI|ES|SE|CH|TN|TR|AE|GB)\b)|'
+    # 9. Mixed alphanumeric codes containing both letters and numbers (3 to 35 chars): Q1, H2, MOD97, A01
+    r'(\b(?=[A-Z0-9]{3,35}\b)(?=[A-Z0-9]*\d)(?=[A-Z0-9]*[A-Z])[A-Z0-9]+\b)|'
+    # 10. Compound numeric references: 2-1, Chart 4-4, 7-3, 5.1.1, 2.1.2
     r'(\b\d+[-\u2013\u2014]\d+\b)|'
     r'(\b\d+(?:\.\d+){1,3}\b)|'
-    # 8. Known financial/statistical acronyms that must never be translated
-    r'(\b(?:QCB(?:RR|LR|DR)?|AOIR|QMR|NDS\d*|CPI|PPI|GDP|FISIM|BBAN|IBAN|BIC|SWIFT|Y-o-Y|Q-o-Q|RHS|LHS|USD|QR)\b)|'
-    # 9. International phone and fax numbers: +974 44456371, +974 44430382
+    # 11. Known financial/statistical acronyms that must never be translated
+    r'(\b(?:QCB(?:RR|LR|DR)?|AOIR|QMR|NDS\d*|CPI|PPI|GDP|GNP|IMF|OPEC|FISIM|BBAN|IBAN|BIC|SWIFT|STP|TERMS|QATCH|Y-o-Y|Q-o-Q|MoM|RHS|LHS|USD|EUR|GBP|SAR|AED|QR|BPS|bps)\b)|'
+    # 12. International phone and fax numbers: +974 44456371, +974 44430382
     r'(\+\d{1,4}\s*\d{3,4}\s*\d{3,4}(?:\s*\d{3,4})?)|'
-    # 10. Numbers: integers, comma-separated thousands, decimals, percentages
+    # 13. Numbers: integers, comma-separated thousands, decimals, percentages
     #    e.g. 75, 75.3, 75,432, 1,200,000.5, 8.6%, -3.2, +4.5
     r'([+-]?(?<!\w)\d{1,3}(?:,\d{3})*(?:\.\d+)?(?:\s*[%\u066A])?(?!\w))|'
-    # 11. Plain integers not already caught (catches standalone digits)
+    # 14. Plain integers not already caught (catches standalone digits)
     r'((?<!\w)\d+(?:\.\d+)?(?!\w))'
 )
 
@@ -85,9 +94,17 @@ def _protect_numerals(text: str) -> tuple[str, dict[str, str]]:
     mapping = {}
     counter = [0]
     
+    # Avoid re-protecting already existing placeholders like {0}, {1}
+    existing_placeholders = set(re.findall(r'\{\d+\}', text))
+
     def _replacer(match):
         original = match.group(0)
+        if original in existing_placeholders:
+            return original
         placeholder = f"{{{counter[0]}}}"
+        while placeholder in existing_placeholders:
+            counter[0] += 1
+            placeholder = f"{{{counter[0]}}}"
         mapping[placeholder] = original
         counter[0] += 1
         return placeholder
@@ -103,18 +120,54 @@ def _restore_numerals(text: str, mapping: dict[str, str]) -> str:
     - Add spaces inside brackets: { 0 } instead of {0}
     - Drop one bracket: {0 or 0}
     - Convert to angle brackets: <0> or <b0>
+    - Substitute digit 0 with letter O/o: {O} or {o}
+    - Convert digits to Arabic-Indic: {٠}
+    - Convert to square brackets or parentheses: [0], (0)
     """
+    # Deduplicate repeated identical parenthesized tokens before and during restoration:
+    # e.g. (BBAN) (BBAN) -> (BBAN)
+    text = re.sub(r'(\([A-Za-z0-9\-_]{2,15}\))(?:\s*\1)+', r'\1', text)
+
+    if not mapping:
+        return text
+
+    # Deduplicate repeated identical placeholder tags before substitution:
+    # e.g. ({0})({0}) -> ({0}), {0}{0} -> {0}
+    text = re.sub(r'(\(\s*\{\s*\d+\s*\}\s*\))(?:\s*\1)+', r'\1', text)
+    text = re.sub(r'(\{\s*\d+\s*\})(?:\s*\1)+', r'\1', text)
+
     for placeholder, original in mapping.items():
         tag_num = placeholder.strip("{}")
         # Primary: standard {0} or with internal whitespace { 0 }
         text = re.sub(r'\{\s*' + re.escape(tag_num) + r'\s*\}', original, text)
+        
+        # Fallback: model substituted digit 0 with uppercase/lowercase O (e.g. {O} or {o})
+        if tag_num == "0":
+            text = re.sub(r'\{\s*[Oo]\s*\}', original, text)
+            text = re.sub(r'<\s*(?:b\s*)?[Oo]\s*>', original, text)
+            text = re.sub(r'\[\s*[Oo]\s*\]', original, text)
+
+        # Fallback: model converted digits to Arabic-Indic (e.g. {٠}, {١})
+        arabic_indic_num = "".join(chr(0x0660 + int(c)) if c.isdigit() else c for c in tag_num)
+        if arabic_indic_num != tag_num:
+            text = re.sub(r'\{\s*' + re.escape(arabic_indic_num) + r'\s*\}', original, text)
+            text = re.sub(r'<\s*(?:b\s*)?' + re.escape(arabic_indic_num) + r'\s*>', original, text)
+
         # Fallback: bracket partially dropped — {0 or 0}
         text = re.sub(r'(?<!\d)\{' + re.escape(tag_num) + r'(?!\d)', original, text)
         text = re.sub(r'(?<!\d)' + re.escape(tag_num) + r'\}(?!\d)', original, text)
+
+        # Fallback: square brackets [0] or parentheses (0)
+        text = re.sub(r'\[\s*' + re.escape(tag_num) + r'\s*\]', original, text)
+        text = re.sub(r'\(\s*' + re.escape(tag_num) + r'\s*\)', original, text)
+
         # Fallback: model converted to XML-style — <0>, < 0 >, <b0>, <b 0>
         text = re.sub(r'<\s*(?:b\s*)?' + re.escape(tag_num) + r'\s*>', original, text)
 
     # Post-restore spacing cleanup:
+    # Deduplicate repeated identical parenthesized tokens: (BBAN)(BBAN) -> (BBAN)
+    text = re.sub(r'(\([A-Za-z0-9\-_]{2,15}\))(?:\s*\1)+', r'\1', text)
+
     # Insert space between digits and Arabic-script letters (NOT Latin letters,
     # to preserve codes like Q1, H2, P6, CHAPTER 03 from being split).
     text = re.sub(r'(\d)([\u0600-\u06FF])', r'\1 \2', text)
@@ -123,6 +176,28 @@ def _restore_numerals(text: str, mapping: dict[str, str]) -> str:
     text = re.sub(r'\s+([,.:;!?،؛])', r'\1', text)
     # Collapse any double spaces left by restoration
     text = re.sub(r'  +', ' ', text).strip()
+
+    # Byte-identity verification:
+    # For critical SWIFT/BIC codes and IBAN identifiers, assert the restored output exactly equals
+    # the original input byte-for-byte to prevent code corruption.
+    # For natural language numerals/words that Seq2Seq models might idiomatically rephrase or condense,
+    # log a diagnostic warning rather than crashing the pipeline and reverting the paragraph to English.
+    expected_counts = Counter(mapping.values())
+    for original_token, expected_count in expected_counts.items():
+        actual_count = text.count(original_token)
+        if actual_count < expected_count:
+            is_critical = bool(_SWIFT_BIC_PATTERN.match(original_token) or _IBAN_PATTERN.match(original_token))
+            if is_critical:
+                raise AssertionError(
+                    f"Byte-identity check failed! Expected at least {expected_count} occurrence(s) "
+                    f"of critical banking code '{original_token}', but found {actual_count} in restored text:\n  '{text}'"
+                )
+            else:
+                logger.warning(
+                    f"Shielded token '{original_token}' expected {expected_count} occurrence(s), "
+                    f"found {actual_count} in restored text. Preserving translated content."
+                )
+
     return text
 
 
@@ -334,7 +409,19 @@ class BaseTranslator(ABC):
             except Exception as e:
                 logger.debug(f"try get cache failed, ignore it: {e}")
         _translate_rate_limiter.wait()
-        translation = self.do_translate(text, rate_limit_params)
+
+        cleaned_text = remove_control_characters(str(text)) if text else text
+        if not cleaned_text or not str(cleaned_text).strip():
+            return text
+
+        if _is_pure_passthrough(cleaned_text):
+            return cleaned_text
+
+        # Shielding placeholder mechanism applied uniformly across all translation engines
+        protected_text, numeral_map = _protect_numerals(cleaned_text)
+        raw_translation = self.do_translate(protected_text, rate_limit_params)
+        translation = _restore_numerals(raw_translation, numeral_map)
+
         if not (self.ignore_cache or ignore_cache):
             self.cache.set(text, translation)
         return translation
@@ -462,8 +549,14 @@ class OpenAITranslator(BaseTranslator):
         if not text or not str(text).strip():
             return text
         cleaned_text = remove_control_characters(str(text))
-        if _is_pure_passthrough(cleaned_text):
+        if not cleaned_text.strip() or _is_pure_passthrough(cleaned_text):
             return cleaned_text
+
+        has_placeholders = bool(re.search(r'\{\d+\}', cleaned_text))
+        if not has_placeholders:
+            protected_text, numeral_map = _protect_numerals(cleaned_text)
+        else:
+            protected_text, numeral_map = cleaned_text, {}
 
         options = {}
         if self.send_temperature:
@@ -472,11 +565,14 @@ class OpenAITranslator(BaseTranslator):
         response = self.client.chat.completions.create(
             model=self.model,
             **options,
-            messages=self.prompt(text),
+            messages=self.prompt(protected_text),
             extra_body=self.extra_body,
         )
         self.update_token_count(response)
-        return response.choices[0].message.content.strip()
+        raw_content = response.choices[0].message.content.strip()
+        if numeral_map:
+            raw_content = _restore_numerals(raw_content, numeral_map)
+        return raw_content
 
     def prompt(self, text):
         return [
@@ -660,8 +756,12 @@ class MarianMTTranslator(BaseTranslator):
         self._load_model()
         import torch
 
-        # Protect numerals from translation
-        protected_text, numeral_map = _protect_numerals(cleaned_text)
+        # Protect numerals from translation (if not already shielded by translate())
+        has_placeholders = bool(re.search(r'\{\d+\}', cleaned_text))
+        if not has_placeholders:
+            protected_text, numeral_map = _protect_numerals(cleaned_text)
+        else:
+            protected_text, numeral_map = cleaned_text, {}
 
         device = self._get_device()
         try:
@@ -682,8 +782,9 @@ class MarianMTTranslator(BaseTranslator):
                 )
             
             translation = self._tokenizer.batch_decode(translated_tokens, skip_special_tokens=True)[0]
-            # Restore original numerals
-            translation = _restore_numerals(translation.strip(), numeral_map)
+            # Restore original numerals if shielded locally
+            if numeral_map:
+                translation = _restore_numerals(translation.strip(), numeral_map)
             return translation
         except Exception as e:
             logger.error(f"Error during MarianMT translation: {e}")
@@ -727,6 +828,7 @@ class NLLBTranslator(BaseTranslator):
         device: str = None,
         max_length: int = 512,
         ignore_cache: bool = False,
+        load_in_8bit: bool = None,
     ):
         super().__init__(lang_in, lang_out, ignore_cache)
 
@@ -736,19 +838,30 @@ class NLLBTranslator(BaseTranslator):
         self.src_nllb = self.NLLB_LANG_MAP.get(norm_in, "eng_Latn")
         self.tgt_nllb = self.NLLB_LANG_MAP.get(norm_out, "arb_Arab")
 
-        if model_name in (None, "nllb", "nllb-600m", "nllb-distilled", "nllb-200-600M", "default", "facebook/nllb-200-distilled-600M"):
+        raw_model = (model_name or "").lower().strip()
+        if raw_model in (None, "", "nllb", "nllb-600m", "nllb-distilled", "nllb-200-600m", "default", "facebook/nllb-200-distilled-600m"):
             model_name = "facebook/nllb-200-distilled-600M"
-        elif model_name in ("nllb-1.3b", "nllb-200", "nllb-200-1.3B", "1.3b", "facebook/nllb-200-1.3B"):
+            if load_in_8bit is None:
+                load_in_8bit = False
+        elif raw_model in ("nllb-1.3b", "nllb-200", "nllb-200-1.3b", "1.3b", "facebook/nllb-200-1.3b"):
             model_name = "facebook/nllb-200-1.3B"
+            if load_in_8bit is None:
+                load_in_8bit = False
+        elif raw_model in ("nllb-3.3b", "3.3b", "nllb-200-3.3b", "facebook/nllb-200-3.3b", "nllb-3.3b-8bit", "nllb-8bit"):
+            model_name = "facebook/nllb-200-3.3B"
+            if load_in_8bit is None:
+                load_in_8bit = True
 
         self.model_name = model_name
         self.model = model_name
         self.max_length = max_length
         self._device = device
+        self.load_in_8bit = bool(load_in_8bit)
         self._model = None
         self._tokenizer = None
         self._forced_bos_token_id = None
         self.add_cache_impact_parameters("model", self.model_name)
+        self.add_cache_impact_parameters("load_in_8bit", str(self.load_in_8bit))
 
     def _get_device(self):
         if self._device is not None:
@@ -764,18 +877,35 @@ class NLLBTranslator(BaseTranslator):
             from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
             
             device = self._get_device()
-            logger.info(f"Loading Meta NLLB-200 model: {self.model_name} on device: {device}")
+            logger.info(f"Loading Meta NLLB-200 model: {self.model_name} on device: {device} (8-bit: {self.load_in_8bit})")
             
             self._tokenizer = AutoTokenizer.from_pretrained(
                 self.model_name,
                 src_lang=self.src_nllb
             )
             
-            # Use float16 on CUDA for fast inference and low VRAM footprint
-            if device.startswith("cuda"):
+            # Use 8-bit quantization on CUDA if requested (e.g. 3.3B model)
+            if device.startswith("cuda") and self.load_in_8bit:
+                try:
+                    from transformers import BitsAndBytesConfig
+                    logger.info("Enabling BitsAndBytes 8-bit quantization for NLLB on CUDA")
+                    quant_config = BitsAndBytesConfig(load_in_8bit=True)
+                    self._model = AutoModelForSeq2SeqLM.from_pretrained(
+                        self.model_name,
+                        quantization_config=quant_config,
+                        device_map="auto"
+                    )
+                except Exception as e:
+                    logger.warning(f"Could not load 8-bit quantized model ({e}), falling back to float16")
+                    self._model = AutoModelForSeq2SeqLM.from_pretrained(
+                        self.model_name,
+                        dtype=torch.float16
+                    ).to(device)
+            elif device.startswith("cuda"):
+                # Use float16 on CUDA for fast inference and low VRAM footprint
                 self._model = AutoModelForSeq2SeqLM.from_pretrained(
                     self.model_name,
-                    torch_dtype=torch.float16
+                    dtype=torch.float16
                 ).to(device)
             else:
                 self._model = AutoModelForSeq2SeqLM.from_pretrained(
@@ -804,8 +934,12 @@ class NLLBTranslator(BaseTranslator):
         self._load_model()
         import torch
 
-        # Protect numerals from translation
-        protected_text, numeral_map = _protect_numerals(cleaned_text)
+        # Protect numerals from translation (if not already shielded by translate())
+        has_placeholders = bool(re.search(r'\{\d+\}', cleaned_text))
+        if not has_placeholders:
+            protected_text, numeral_map = _protect_numerals(cleaned_text)
+        else:
+            protected_text, numeral_map = cleaned_text, {}
 
         device = self._get_device()
         try:
@@ -820,7 +954,7 @@ class NLLBTranslator(BaseTranslator):
 
             gen_kwargs = {
                 "max_length": self.max_length,
-                "num_beams": 4,
+                "num_beams": 3 if self.load_in_8bit else 4,
                 "no_repeat_ngram_size": 4,
                 "repetition_penalty": 1.1,
             }
@@ -831,8 +965,9 @@ class NLLBTranslator(BaseTranslator):
                 translated_tokens = self._model.generate(**inputs, **gen_kwargs)
 
             translation = self._tokenizer.batch_decode(translated_tokens, skip_special_tokens=True)[0]
-            # Restore original numerals
-            translation = _restore_numerals(translation.strip(), numeral_map)
+            # Restore original numerals if shielded locally
+            if numeral_map:
+                translation = _restore_numerals(translation.strip(), numeral_map)
             return translation
         except Exception as e:
             logger.error(f"Error during NLLB translation: {e}")

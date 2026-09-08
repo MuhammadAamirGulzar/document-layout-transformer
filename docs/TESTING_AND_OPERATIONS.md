@@ -10,6 +10,7 @@ Validates structural and bidirectional rendering:
 - `test_header_footer_mirroring`: Running headers, footers, and page numbers mirror across the page vertical midline.
 - `test_bullet_point_hanging_indent`: Line 0 starts flush right; wrapped lines `1+` are indented inward by `bullet_indent`.
 - `test_legend_swatch_placement`: Legend swatch symbol `■` is placed at the correct visual side in RTL rendering.
+- `test_overflow_paragraph_expansion_and_composition`: Verifies that vertically overflowing paragraphs dynamically expand `box.y` downwards into available bottom space and populate non-empty paragraph composition with zero drops.
 
 ### Test Suite 2: Financial & Technical Regression (`tests/test_financial_regression.py`)
 Validates terminology preservation and numeral protection:
@@ -22,6 +23,7 @@ Validates terminology preservation and numeral protection:
 - `test_multi_line_classification`: Distinguishes short chart labels from flowing multi-line paragraphs.
 - `test_typesetting_rigid_body_shift`: Margin shift moves characters as a rigid body, preventing character stacking/overlap.
 - `test_chronological_axis_detection`: Detects multi-month time series (`Jan ... Dec`) and preserves LTR axis order.
+- `test_swift_bic_codes_byte_identity_roundtrip`: Verifies 100% byte-identical preservation of all 17 SWIFT BIC codes and 4-letter bank identifiers.
 
 ### Test Suite 3: Typography & Font Hierarchy (`tests/test_typography_regression.py`)
 Validates font family mapping and visual scaling:
@@ -41,6 +43,9 @@ Validates alphanumeric codes, dense tables, and formula integrity:
 - `test_contact_info_and_phone_standardization`: Contact metadata (`Tel : +974 44456371` -> `الهاتف: ...`) standardizes accurately without `التلفزيون` hallucinations.
 - `test_paragraph_pipeline_trace_diagnostics`: Paragraph execution tracing records layout labels and translation pathways.
 - `test_toc_leader_dots_preservation`: Table of Contents leader dots (`...`) are protected from collapsing, isolated from neural translation, and dynamically resized in typesetting to fit on a single line.
+- `test_qatar_banks_table_cell_no_overlap_and_synchronized_row_height`: Table cells across all 17 Qatar Bank rows never overlap horizontally, and row heights remain synchronized.
+- `test_bban_characteristics_zero_notdef_glyphs`: Verifies zero `.notdef` (glyph 0) characters across the full BBAN characteristics section with PUA bullet remapping.
+- `test_mixed_script_bidi_ordering_in_table_cell_and_bullets`: Verifies strict Left-to-Right character order inside Arabic bullet items and table cells for Latin parenthetical expressions (`(First 4 character of BIC)` and `(25 Characters for Qatar)`).
 
 ---
 
@@ -49,16 +54,16 @@ Validates alphanumeric codes, dense tables, and formula integrity:
 Execute all test suites from the `doc-translator-V2.1` directory using the virtual environment:
 
 ```powershell
-# 1. Advanced RTL formatting suite (4/4 tests)
+# 1. Advanced RTL formatting suite (5/5 tests)
 .venv\Scripts\python tests/test_formatting_enhancements.py
 
-# 2. Financial translation regression suite (9/9 tests)
+# 2. Financial translation regression suite (10/10 tests)
 .venv\Scripts\python tests/test_financial_regression.py
 
 # 3. Typography & font hierarchy suite (5/5 tests)
 .venv\Scripts\python tests/test_typography_regression.py
 
-# 4. Technical & banking standards suite (8/8 tests)
+# 4. Technical & banking standards suite (11/11 tests)
 .venv\Scripts\python tests/test_technical_document_regression.py
 ```
 
@@ -69,7 +74,7 @@ ALL REGRESSION TESTS PASSED SUCCESSFULLY!
 ALL TYPOGRAPHY TESTS PASSED SUCCESSFULLY!
 ALL TECHNICAL & BANKING DOCUMENT REGRESSION TESTS PASSED SUCCESSFULLY!
 ```
-(26 / 26 tests passing 100%)
+(31 / 31 tests passing 100%)
 
 ---
 

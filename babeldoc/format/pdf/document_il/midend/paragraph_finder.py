@@ -1,6 +1,7 @@
 import logging
 import random
 import re
+import statistics
 
 import numpy as np
 
@@ -48,6 +49,67 @@ BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 def generate_base58_id(length: int = 5) -> str:
     """Generate a random base58 ID of specified length."""
     return "".join(random.choice(BASE58_ALPHABET) for _ in range(length))
+
+
+def is_line_bold(line: PdfLine | None, font_dict: dict | None = None) -> bool:
+    """Check if a line is predominantly bold text."""
+    if not line or not line.pdf_character:
+        return False
+    bold_count = 0
+    total_count = 0
+    for char in line.pdf_character:
+        if not char.char_unicode or char.char_unicode.isspace():
+            continue
+        total_count += 1
+        font_id = getattr(char.pdf_style, "font_id", None) if char.pdf_style else None
+        if font_dict and font_id in font_dict:
+            f = font_dict[font_id]
+            f_name = (getattr(f, "name", "") or "").lower()
+            if getattr(f, "bold", False) or any(
+                b in f_name for b in ["bold", "black", "heavy", "semibold", "demibold"]
+            ):
+                bold_count += 1
+        elif char.pdf_style:
+            f_id_lower = (str(font_id) if font_id else "").lower()
+            if any(
+                b in f_id_lower
+                for b in ["bold", "black", "heavy", "semibold", "demibold"]
+            ):
+                bold_count += 1
+    return total_count > 0 and (bold_count / total_count) >= 0.45
+
+
+def get_line_dominant_font_size(line: PdfLine | None) -> float:
+    """Get the median or dominant font size of non-space characters in a line."""
+    if not line or not line.pdf_character:
+        return 0.0
+    sizes = [
+        char.pdf_style.font_size
+        for char in line.pdf_character
+        if char.pdf_style
+        and char.pdf_style.font_size
+        and char.char_unicode
+        and not char.char_unicode.isspace()
+    ]
+    if not sizes:
+        return 0.0
+    try:
+        return statistics.median(sizes)
+    except Exception:
+        return sum(sizes) / len(sizes)
+
+
+def is_para_bold(para: PdfParagraph, font_dict: dict | None = None) -> bool:
+    """Check if the first line of a paragraph is bold."""
+    if not para or not para.pdf_paragraph_composition:
+        return False
+    for comp in para.pdf_paragraph_composition:
+        if comp.pdf_line:
+            return is_line_bold(comp.pdf_line, font_dict)
+        elif comp.pdf_character:
+            dummy_line = PdfLine(pdf_character=[comp.pdf_character])
+            return is_line_bold(dummy_line, font_dict)
+    return False
 
 
 class ParagraphFinder:
@@ -306,11 +368,23 @@ class ParagraphFinder:
         median_width = self.calculate_median_line_width(paragraphs)
 
         # ç¬¬äº”æ­¥ï¼šå¤„ç†ç‹¬ç«‹æ®µè½
-        self.process_independent_paragraphs(paragraphs, median_width)
+        # Build font lookup dictionary for style inspection
+        font_dict = {}
+        if page.pdf_font:
+            font_dict.update({f.font_id: f for f in page.pdf_font if f.font_id})
+        if page.pdf_xobject:
+            for xobj in page.pdf_xobject:
+                if xobj.pdf_font:
+                    font_dict.update({f.font_id: f for f in xobj.pdf_font if f.font_id})
+
+        self.process_independent_paragraphs(paragraphs, median_width, font_dict=font_dict)
 
         # æ–°å¢žåŽå¤„ç†ï¼šåˆå¹¶å¸¦è¡Œå·äº¤æ›¿çš„æ­£æ–‡æ®µè½ï¼ˆa æ­£æ–‡ã€b è¡Œå·ã€c æ­£æ–‡ -> åˆå¹¶ a ä¸Ž cï¼Œä¿ç•™ bï¼‰
         if getattr(self.translation_config, "merge_alternating_line_numbers", True):
             self.merge_alternating_line_number_paragraphs(paragraphs)
+
+        # Merge hyphenated words across lines and multi-line continuation fragments
+        self.merge_hyphenated_and_continuation_paragraphs(paragraphs, font_dict=font_dict)
 
         for paragraph in paragraphs:
             self.update_paragraph_data(paragraph, update_unicode=True)
@@ -439,6 +513,127 @@ class ParagraphFinder:
                     continue
             i += 1
 
+    def _remove_trailing_hyphen(self, paragraph: PdfParagraph):
+        """Remove trailing hyphen or soft-hyphen from paragraph composition."""
+        for comp in reversed(paragraph.pdf_paragraph_composition or []):
+            if comp.pdf_line and comp.pdf_line.pdf_character:
+                chars = comp.pdf_line.pdf_character
+                for idx in range(len(chars) - 1, -1, -1):
+                    ch = chars[idx].char_unicode
+                    if ch in ("-", "\u2010", "\u00ad"):
+                        del chars[idx]
+                        return
+                    elif ch and not ch.isspace():
+                        return
+            elif comp.pdf_character:
+                ch = comp.pdf_character.char_unicode
+                if ch in ("-", "\u2010", "\u00ad"):
+                    comp.pdf_character.char_unicode = ""
+                    return
+                elif ch and not ch.isspace():
+                    return
+
+    def merge_hyphenated_and_continuation_paragraphs(
+        self,
+        paragraphs: list[PdfParagraph],
+        font_dict: dict | None = None,
+    ):
+        """
+        Merge paragraphs that were severed mid-word (hyphenated line breaks) or
+        split mid-sentence across fragmented lines.
+        """
+        if not paragraphs or len(paragraphs) < 2:
+            return
+
+        i = 0
+        while i < len(paragraphs) - 1:
+            a = paragraphs[i]
+            b = paragraphs[i + 1]
+
+            text_a = (a.unicode or "").rstrip()
+            text_b = (b.unicode or "").lstrip()
+
+            if not text_a or not text_b:
+                i += 1
+                continue
+
+            # Style guard: never merge bold headings with regular body text
+            is_a_bold = is_para_bold(a, font_dict)
+            is_b_bold = is_para_bold(b, font_dict)
+            if is_a_bold and not is_b_bold:
+                i += 1
+                continue
+
+            # Check if b is a bullet point or list marker — never merge bullets into previous text
+            first_chars_b = []
+            if b.pdf_paragraph_composition:
+                for comp in b.pdf_paragraph_composition:
+                    if comp.pdf_line:
+                        first_chars_b.extend(comp.pdf_line.pdf_character)
+                    elif comp.pdf_character:
+                        first_chars_b.append(comp.pdf_character)
+                    if first_chars_b:
+                        break
+            if first_chars_b and is_bullet_or_list_marker(first_chars_b):
+                i += 1
+                continue
+
+            box_a = a.box
+            box_b = b.box
+            if not box_a or not box_b:
+                i += 1
+                continue
+
+            # Vertical distance: a is above b, gap should be reasonable line spacing (< 25pt)
+            vert_gap = box_a.y - box_b.y2
+            # Horizontal alignment: left edges aligned or significant horizontal overlap
+            horiz_overlap = max(0.0, min(box_a.x2, box_b.x2) - max(box_a.x, box_b.x))
+            same_column = (
+                horiz_overlap > 0.25 * min(box_a.x2 - box_a.x, box_b.x2 - box_b.x)
+                or abs(box_a.x - box_b.x) < 45.0
+            )
+
+            is_hyphen_split = (
+                text_a.endswith(("-", "\u2010", "\u00ad"))
+                and text_b[0].isalpha()
+                and same_column
+                and -5.0 <= vert_gap <= 25.0
+            )
+
+            is_lowercase_continuation = (
+                text_b[0].islower()
+                and not text_a.endswith((".", ":", "!", "?", "؛", ";"))
+                and same_column
+                and -5.0 <= vert_gap <= 25.0
+            )
+
+            if is_hyphen_split or is_lowercase_continuation:
+                if is_hyphen_split:
+                    self._remove_trailing_hyphen(a)
+                elif is_lowercase_continuation and not text_a.endswith(" ") and not text_b.startswith(" "):
+                    from babeldoc.format.pdf.document_il.il_version_1 import VisualBbox
+                    space_box = Box(box_a.x2, box_b.y2, box_a.x2 + 3.0, box_b.y2 + 10.0)
+                    space_char = PdfCharacter(
+                        char_unicode=" ",
+                        box=space_box,
+                        visual_bbox=VisualBbox(box=space_box),
+                        vertical=False,
+                        xobj_id=getattr(a, "xobj_id", 0),
+                    )
+                    if b.pdf_paragraph_composition:
+                        comp0 = b.pdf_paragraph_composition[0]
+                        if comp0.pdf_line and comp0.pdf_line.pdf_character is not None:
+                            comp0.pdf_line.pdf_character.insert(0, space_char)
+                        elif comp0.pdf_character:
+                            b.pdf_paragraph_composition.insert(0, PdfParagraphComposition(pdf_character=space_char))
+
+                a.pdf_paragraph_composition.extend(b.pdf_paragraph_composition)
+                self.update_paragraph_data(a, update_unicode=True)
+                del paragraphs[i + 1]
+                continue
+
+            i += 1
+
     def _group_characters_into_paragraphs(
         self, page: Page, layout_index, layout_map
     ) -> list[PdfParagraph]:
@@ -495,7 +690,27 @@ class ParagraphFinder:
                 )
                 and char.char_unicode not in HEIGHT_NOT_USFUL_CHAR_IN_CHAR
             ):
-                if (
+                # Check if current character is directly touching or continuing the previous character (mid-word)
+                prev_comp = (
+                    current_paragraph.pdf_paragraph_composition[-1]
+                    if current_paragraph.pdf_paragraph_composition
+                    else None
+                )
+                prev_char = prev_comp.pdf_character if prev_comp else None
+                is_mid_word = False
+                if prev_char and prev_char.char_unicode and not SPACE_REGEX.match(prev_char.char_unicode):
+                    curr_u = char.char_unicode or ""
+                    if not SPACE_REGEX.match(curr_u):
+                        prev_b = prev_char.visual_bbox.box
+                        curr_b = char.visual_bbox.box
+                        y_diff = abs(prev_b.y - curr_b.y)
+                        avg_h = ((prev_b.y2 - prev_b.y) + (curr_b.y2 - curr_b.y)) / 2.0
+                        x_gap = curr_b.x - prev_b.x2
+                        # Same reading line and adjacent character in the same word
+                        if y_diff <= (avg_h * 0.45) and -4.0 <= x_gap <= max(avg_h * 0.45, 4.0):
+                            is_mid_word = True
+
+                if not is_mid_word and (
                     (
                         char_layout.id != current_layout.id
                         and not SPACE_REGEX.match(char.char_unicode)
@@ -864,6 +1079,7 @@ class ParagraphFinder:
         self,
         paragraphs: list[PdfParagraph],
         median_width: float,
+        font_dict: dict | None = None,
     ):
         i = 0
         while i < len(paragraphs):
@@ -903,25 +1119,67 @@ class ParagraphFinder:
                     )
 
                     # æ›´æ–°ä¸¤ä¸ªæ®µè½çš„æ•°æ®
-                    self.update_paragraph_data(paragraph)
-                    self.update_paragraph_data(new_paragraph)
+                    self.update_paragraph_data(paragraph, update_unicode=True)
+                    self.update_paragraph_data(new_paragraph, update_unicode=True)
 
                     # åœ¨åŽŸæ®µè½åŽæ’å…¥æ–°æ®µè½
                     paragraphs.insert(i + 1, new_paragraph)
                     break
 
                 # å¦‚æžœå‰ä¸€è¡Œå®½åº¦å°äºŽä¸­ä½æ•°çš„ä¸€åŠï¼Œå°†å½“å‰è¡ŒåŠåŽç»­è¡Œåˆ†å‰²æˆæ–°æ®µè½
+                # Check if previous line ends with a hyphen or current line continues with lowercase:
+                # NEVER split across hyphenated word or mid-sentence continuation
+                current_chars = []
                 if (
-                    self.translation_config.split_short_lines
-                    and prev_width
-                    < median_width * self.translation_config.short_line_split_factor
-                ) or (
                     paragraph.pdf_paragraph_composition
-                    and (current_line := paragraph.pdf_paragraph_composition[j])
-                    and (line := current_line.pdf_line)
-                    and (chars := line.pdf_character)
-                    and is_bullet_or_list_marker(chars)
+                    and j < len(paragraph.pdf_paragraph_composition)
+                    and (curr_comp := paragraph.pdf_paragraph_composition[j])
+                    and curr_comp.pdf_line
                 ):
+                    current_chars = curr_comp.pdf_line.pdf_character
+
+                first_char = next(
+                    (c.char_unicode for c in current_chars if not c.char_unicode.isspace()), ""
+                )
+                is_bullet = bool(current_chars and is_bullet_or_list_marker(current_chars))
+
+                curr_line = curr_comp.pdf_line if curr_comp and curr_comp.pdf_line else None
+                prev_is_bold = is_line_bold(prev_line, font_dict)
+                curr_is_bold = is_line_bold(curr_line, font_dict) if curr_line else False
+
+                prev_size = get_line_dominant_font_size(prev_line)
+                curr_size = get_line_dominant_font_size(curr_line) if curr_line else 0.0
+
+                is_style_boundary = (
+                    (prev_is_bold and not curr_is_bold)
+                    or (prev_size >= curr_size + 1.5 and curr_size > 0.0)
+                )
+
+                is_hyphen_or_continuation = (
+                    not is_style_boundary
+                    and (
+                        prev_text.rstrip().endswith(("-", "\u2010", "\u00ad"))
+                        or (first_char and first_char.isalpha() and first_char.islower() and not is_bullet)
+                    )
+                )
+
+                if is_hyphen_or_continuation:
+                    j += 1
+                    continue
+
+                should_split = (
+                    is_style_boundary
+                    or (
+                        self.translation_config.split_short_lines
+                        and prev_width
+                        < median_width * self.translation_config.short_line_split_factor
+                    )
+                    or is_bullet
+                )
+
+                if should_split:
+                    if is_style_boundary and prev_is_bold:
+                        paragraph.layout_label = "heading"
                     # åˆ›å»ºæ–°çš„æ®µè½
                     new_paragraph = PdfParagraph(
                         box=Box(0, 0, 0, 0),  # ä¸´æ—¶è¾¹ç•Œæ¡†
@@ -930,7 +1188,7 @@ class ParagraphFinder:
                         ),
                         unicode="",
                         debug_id=generate_base58_id(),
-                        layout_label=paragraph.layout_label,
+                        layout_label="paragraph" if is_style_boundary else paragraph.layout_label,
                         layout_id=paragraph.layout_id,
                     )
                     # æ›´æ–°åŽŸæ®µè½
@@ -939,8 +1197,8 @@ class ParagraphFinder:
                     )
 
                     # æ›´æ–°ä¸¤ä¸ªæ®µè½çš„æ•°æ®
-                    self.update_paragraph_data(paragraph)
-                    self.update_paragraph_data(new_paragraph)
+                    self.update_paragraph_data(paragraph, update_unicode=True)
+                    self.update_paragraph_data(new_paragraph, update_unicode=True)
 
                     # åœ¨åŽŸæ®µè½åŽæ’å…¥æ–°æ®µè½
                     paragraphs.insert(i + 1, new_paragraph)

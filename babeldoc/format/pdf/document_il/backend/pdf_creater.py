@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 
 SUBSET_FONT_STAGE_NAME = "Subset font"
 SAVE_PDF_STAGE_NAME = "Save PDF"
+EMERGENCY_FALLBACK_COUNT = 0
 
 
 class RenderUnit(ABC):
@@ -503,7 +504,7 @@ def _subset_fonts_process(pdf_path, output_path):
     """
     try:
         pdf = pymupdf.open(pdf_path)
-        pdf.subset_fonts(fallback=False)
+        pdf.subset_fonts(fallback=True)
         pdf.save(output_path)
         # è¿”å›ž 0 è¡¨ç¤ºæˆåŠŸ
         os._exit(0)
@@ -626,11 +627,33 @@ class PDFCreater:
                     f"Paragraph: {paragraph}. ",
                 )
                 continue
-        if not chars and paragraph.unicode and paragraph.debug_id:
-            logger.error(
-                f"Unable to export paragraphs that have "
-                f"not yet been formatted: {paragraph}",
+        if not chars and paragraph.unicode:
+            global EMERGENCY_FALLBACK_COUNT
+            EMERGENCY_FALLBACK_COUNT += 1
+            logger.warning(
+                f"[METRIC] Emergency fallback rendering triggered (count={EMERGENCY_FALLBACK_COUNT}) "
+                f"for unformatted paragraph {paragraph.debug_id} ('{paragraph.unicode[:40]}...')."
             )
+            box = paragraph.box or il_version_1.Box(x=50.0, y=50.0, x2=550.0, y2=64.0)
+            style = paragraph.pdf_style or il_version_1.PdfStyle(
+                font_id="base", font_size=9.0, graphic_state=il_version_1.GraphicState()
+            )
+            font_size = style.font_size if (style and style.font_size) else 9.0
+            char_w = max(font_size * 0.55, 4.0)
+            for i, ch in enumerate(paragraph.unicode):
+                char_box = il_version_1.Box(
+                    x=box.x + i * char_w,
+                    y=box.y,
+                    x2=box.x + (i + 1) * char_w,
+                    y2=box.y + font_size,
+                )
+                pdf_char = il_version_1.PdfCharacter(
+                    unicode=ch,
+                    box=char_box,
+                    pdf_style=style,
+                    xobj_id=paragraph.xobj_id if hasattr(paragraph, "xobj_id") else -1,
+                )
+                chars.append(pdf_char)
             return chars
         return chars
 
@@ -1076,8 +1099,24 @@ class PDFCreater:
             and Path(temp_output).exists()
             and Path(temp_output).stat().st_size > 0
         ):
+            # Pre-flight / Post-subset audit: Check for .notdef (glyph 0) in subsetted PDF
+            candidate_pdf = pymupdf.open(temp_output)
+            has_corrupted_glyphs = False
+            for pno in range(len(candidate_pdf)):
+                contents = candidate_pdf[pno].read_contents()
+                if re.search(rb'<0{2,4}>\s*Tj', contents):
+                    has_corrupted_glyphs = True
+                    break
+
+            if has_corrupted_glyphs:
+                logger.warning(
+                    "Font subsetting introduced .notdef (glyph 0) characters; falling back to unsubsetted full font PDF to eliminate tofu boxes."
+                )
+                candidate_pdf.close()
+                return original_pdf
+
             logger.info("Font subsetting completed successfully")
-            return pymupdf.open(temp_output)
+            return candidate_pdf
         else:
             logger.warning(
                 f"Font subsetting failed with exit code {exit_code} or produced empty file"

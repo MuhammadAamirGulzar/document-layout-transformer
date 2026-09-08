@@ -212,8 +212,78 @@ def test_chronological_axis_detection():
     assert len(matches) >= 3
 
 
+# 10. SWIFT BIC & Bank Identifier byte-identity round-trip regression test
+def test_swift_bic_codes_byte_identity_roundtrip():
+    qatar_banks = [
+        ("QATAR NATIONAL BANK", "QNBAQAQAXXX", "QNBA"),
+        ("COMMERCIAL BANK OF QATAR", "CBQAQAQAXXX", "CBQA"),
+        ("DOHA BANK", "DOHBQAQAXXX", "DOHB"),
+        ("QATAR ISLAMIC BANK", "QISBQAQAXXX", "QISB"),
+        ("AHLI BANK OF QATAR", "ABQQQAQAXXX", "ABQQ"),
+        ("QATAR INTL ISLAMIC BANK", "QIIBQAQAXXX", "QIIB"),
+        ("ARAB BANK", "ARABQAQAXXX", "ARAB"),
+        ("MASHREQ BANK", "MSHQQAQAXXX", "MSHQ"),
+        ("INTERNATIONAL BANK OF QATAR", "IBOQQAQAXXX", "IBOQ"),
+        ("HSBC", "BBMEQAQXXXX", "BBME"),
+        ("STANDARD CHARTERED BANK", "SCBLQAQXXXX", "SCBL"),
+        ("UNITED BANK LTD", "UNILQAQAXXX", "UNIL"),
+        ("BNP PARIBAS", "BNPAQAQAXXX", "BNPA"),
+        ("RAYYAN BANK", "MAFRQAQAXXX", "MAFR"),
+        ("AL KHALIJ COMMERCIAL BANK", "KLJIQAQAXXX", "KLJI"),
+        ("BANK BARWA", "BRWAQAQAXXX", "BRWA"),
+        ("QATAR DEVELOPMENT BANK", "QIDBQAQAXXX", "QIDB"),
+    ]
+
+    for bank_name, swift_code, bank_id in qatar_banks:
+        # A. Shielding and restoration within sentence context
+        sentence = f"Payments routed to {bank_name} via BIC {swift_code} using routing code {bank_id}."
+        protected, mapping = _protect_numerals(sentence)
+        assert swift_code in mapping.values(), f"SWIFT BIC {swift_code} was not shielded in mapping"
+        assert bank_id in mapping.values(), f"Bank ID {bank_id} was not shielded in mapping"
+
+        # Simulate neural model translation: words translated to Arabic while preserving all {N} placeholders
+        simulated_translation = re.sub(r'[A-Za-z]+', 'مصرف', protected)
+        restored = _restore_numerals(simulated_translation, mapping)
+        
+        # Byte-identity verification: exact match against source
+        assert swift_code in restored, f"SWIFT BIC {swift_code} missing from restored text: {restored}"
+        assert bank_id in restored, f"Bank ID {bank_id} missing from restored text: {restored}"
+        
+        # Specific anti-corruption check for HSBC BIC: Q must never become O
+        if swift_code == "BBMEQAQXXXX":
+            assert "BBMEOAOXXXX" not in restored, "HSBC BIC was corrupted to BBMEOAOXXXX (Q -> O)!"
+            assert "BBMEQAQXXXX" in restored, "HSBC BIC BBMEQAQXXXX not preserved byte-for-byte!"
+
+    # B. Test loud failure on byte corruption: if a shielded token is corrupted, _restore_numerals must raise AssertionError
+    corrupted_output = "المدفوعات المحولة إلى المصرف عبر سويفت BBMEOAOXXXX والرمز BBME."
+    test_mapping = {"{0}": "BBMEQAQXXXX", "{1}": "BBME"}
+    try:
+        _restore_numerals(corrupted_output, test_mapping)
+        assert False, "Should have failed loudly on corrupted token!"
+    except AssertionError as e:
+        assert "Byte-identity check failed" in str(e), f"Unexpected error message: {e}"
+
+    # C. Full translator round-trip with BaseTranslator
+    class SwiftMockTranslator(BaseTranslator):
+        def do_translate(self, text, rate_limit_params=None):
+            # Model translates words but preserves placeholders
+            return re.sub(r'[A-Za-z]+', 'كلمة', text)
+
+        def do_llm_translate(self, text, rate_limit_params=None):
+            return text
+
+    mock_tr = SwiftMockTranslator("en", "ar", ignore_cache=True)
+    for bank_name, swift_code, bank_id in qatar_banks:
+        input_text = f"Bank {bank_name} BIC: {swift_code}"
+        res = mock_tr.translate(input_text)
+        assert swift_code in res, f"Translator did not preserve BIC {swift_code}: {res}"
+
+
 if __name__ == "__main__":
     import inspect
+    import sys
+    if hasattr(sys.stdout, 'reconfigure'):
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
     print("Running Financial Translation & Typesetting Regression Suite...\n")
     helper = translator_helper()
     tests = [
@@ -226,6 +296,7 @@ if __name__ == "__main__":
         ("test_multi_line_classification", lambda: test_multi_line_classification()),
         ("test_typesetting_rigid_body_shift", lambda: test_typesetting_rigid_body_shift()),
         ("test_chronological_axis_detection", lambda: test_chronological_axis_detection()),
+        ("test_swift_bic_codes_byte_identity_roundtrip", lambda: test_swift_bic_codes_byte_identity_roundtrip()),
     ]
     passed = 0
     for name, fn in tests:
