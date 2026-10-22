@@ -379,15 +379,76 @@ class ParagraphFinder:
 
         self.process_independent_paragraphs(paragraphs, median_width, font_dict=font_dict)
 
+        # Fallback line detection intentionally favors small text regions. In a
+        # ruled table that can collapse several adjacent cells into one line.
+        # Recover the original cells from the table's vector grid before any
+        # translation or RTL positioning occurs.
+        self.reconstruct_wired_table_cells(page, paragraphs)
+
         # æ–°å¢žåŽå¤„ç†ï¼šåˆå¹¶å¸¦è¡Œå·äº¤æ›¿çš„æ­£æ–‡æ®µè½ï¼ˆa æ­£æ–‡ã€b è¡Œå·ã€c æ­£æ–‡ -> åˆå¹¶ a ä¸Ž cï¼Œä¿ç•™ bï¼‰
         if getattr(self.translation_config, "merge_alternating_line_numbers", True):
             self.merge_alternating_line_number_paragraphs(paragraphs)
 
         # Merge hyphenated words across lines and multi-line continuation fragments
         self.merge_hyphenated_and_continuation_paragraphs(paragraphs, font_dict=font_dict)
+        # Some legacy PDFs draw a leading word separately from the remainder of
+        # the same prose line (for example, ``All`` + ``banks are required``).
+        # Repair it before translation so it cannot become an orphan Arabic word.
+        self.merge_detached_leading_word_fragments(paragraphs)
+        self.merge_same_line_sentence_fragments(paragraphs)
+
+        # Some PDFs expose each visual line of a definition as an independent
+        # paragraph, but the extraction order is not necessarily top-to-bottom.
+        # Revisit aligned text fragments in geometric order before translation.
+        self.coalesce_stacked_text_fragments(paragraphs, font_dict=font_dict)
+
+        # Large source blocks sometimes contain several semantic records (for
+        # example ``Step 3`` ... ``Step 4`` or prose + ``3.2 Validation`` +
+        # prose).  Split those records on their original visual lines before
+        # translation so MT and reflow cannot fold independent rows together.
+        self.split_embedded_structured_lines(paragraphs)
+        # Run once more after structural splitting: the split pass can expose
+        # adjacent style runs that were previously hidden inside a larger
+        # paragraph object.
+        self.merge_same_line_sentence_fragments(paragraphs)
+
+        # Splitting and fallback layout detection can temporarily make two
+        # paragraphs reference the same PdfCharacter object. Rendering both is
+        # the direct cause of black overprinted text. Establish one owner for
+        # every extracted character before any paragraph is translated.
+        self.purge_duplicate_character_ownership(paragraphs)
+
+        # PDF content-stream order is not guaranteed to match visual reading
+        # order. For an LTR source, sort every reconstructed line by geometry
+        # before rebuilding paragraph Unicode. This repairs sequences such as
+        # "th29 - th ... from the 5" at their source rather than with a phrase-
+        # specific translation workaround.
+        if "AR" not in (self.translation_config.lang_in or "").upper():
+            for paragraph in paragraphs:
+                for composition in paragraph.pdf_paragraph_composition or []:
+                    if composition.pdf_line:
+                        composition.pdf_line.pdf_character.sort(
+                            key=self._get_char_sort_key
+                        )
+                        self.update_line_data(composition.pdf_line)
 
         for paragraph in paragraphs:
+            fixed_table_box = (
+                paragraph.box
+                if "table_cell_fixed" in (paragraph.layout_label or "")
+                else None
+            )
             self.update_paragraph_data(paragraph, update_unicode=True)
+            if fixed_table_box is not None:
+                paragraph.box = fixed_table_box
+
+        # Section labels in government and financial PDFs are not reliably
+        # bold.  Treat a short numbered label ("3.2 Validation", "2. Scope")
+        # as a heading even when font metadata is incomplete.  This gives the
+        # typesetter a protected lane instead of allowing the following body
+        # paragraph to reflow through the label.
+        self.classify_numbered_section_headings(paragraphs)
+        self.classify_structured_text_blocks(paragraphs)
 
         if self.translation_config.ocr_workaround:
             self.add_text_fill_background(page)
@@ -396,6 +457,12 @@ class ParagraphFinder:
             page.pdf_character = []
 
         self.fix_overlapping_paragraphs(page)
+
+        # Run the same-line repair once more after role classification and
+        # overlap normalization.  Those stages can expose fragments that were
+        # previously hidden behind a broad title/body box.
+        self.merge_detached_leading_word_fragments(paragraphs)
+        self.merge_same_line_sentence_fragments(paragraphs)
 
         # ç¬¬å…­æ­¥ï¼šå¯¹æ¯ä¸€è¡Œçš„å­—ç¬¦è¿›è¡ŒæŽ’åº
         # self._sort_characters_in_lines(page)
@@ -513,6 +580,457 @@ class ParagraphFinder:
                     continue
             i += 1
 
+    def coalesce_stacked_text_fragments(
+        self,
+        paragraphs: list[PdfParagraph],
+        font_dict: dict | None = None,
+    ) -> None:
+        """Merge unambiguously contiguous body-text lines despite list order.
+
+        This is intentionally narrower than generic paragraph reflow: tables,
+        headings, bullets, and completed sentences are excluded.  It primarily
+        repairs glossary/definition pages where every source line was emitted
+        as a separate paragraph and therefore translated and laid out on the
+        same target baseline.
+        """
+        if len(paragraphs) < 2:
+            return
+
+        self._coalesce_inline_text_fragments(paragraphs, font_dict)
+
+        body_labels = {"paragraph", "plain text", "text", "body_text"}
+        candidates = [
+            paragraph
+            for paragraph in paragraphs
+            if paragraph.box
+            and (paragraph.layout_label or "").lower() in body_labels
+            and not is_para_bold(paragraph, font_dict)
+        ]
+
+        # Align only fragments within the same xobject and text column.  The
+        # x bucket keeps unrelated left/right columns out of the same sequence.
+        candidates.sort(
+            key=lambda p: (
+                getattr(p, "xobj_id", 0),
+                round(p.box.x / 12.0),
+                -p.box.y2,
+            )
+        )
+        consumed: set[int] = set()
+        for index, upper in enumerate(candidates):
+            if id(upper) in consumed or upper not in paragraphs:
+                continue
+            for lower in candidates[index + 1 :]:
+                if id(lower) in consumed or lower not in paragraphs:
+                    continue
+                if getattr(upper, "xobj_id", 0) != getattr(lower, "xobj_id", 0):
+                    break
+                if abs(upper.box.x - lower.box.x) > 14.0:
+                    break
+
+                upper_text = (upper.unicode or "").rstrip()
+                lower_text = (lower.unicode or "").lstrip()
+                gap = upper.box.y - lower.box.y2
+                overlap = max(0.0, min(upper.box.x2, lower.box.x2) - max(upper.box.x, lower.box.x))
+                aligned = overlap >= 0.60 * min(upper.box.x2 - upper.box.x, lower.box.x2 - lower.box.x)
+                is_continuation = (
+                    upper_text
+                    and lower_text
+                    and lower_text[0].islower()
+                    and not upper_text.endswith((".", ":", "!", "?", "؛", ";"))
+                    and aligned
+                    and -5.0 <= gap <= 25.0
+                )
+                if not is_continuation:
+                    # The next candidate belongs to a later independent block.
+                    if gap > 25.0:
+                        break
+                    continue
+
+                if not upper_text.endswith(" ") and not lower_text.startswith(" "):
+                    from babeldoc.format.pdf.document_il.il_version_1 import VisualBbox
+                    adjacent_chars = (
+                        self._paragraph_source_characters(upper)
+                        + self._paragraph_source_characters(lower)
+                    )
+                    space_style = next(
+                        (char.pdf_style for char in adjacent_chars if char.pdf_style),
+                        upper.pdf_style,
+                    )
+                    space_box = Box(upper.box.x2, lower.box.y2, upper.box.x2 + 3.0, lower.box.y2 + 10.0)
+                    space_char = PdfCharacter(
+                        char_unicode=" ", box=space_box, visual_bbox=VisualBbox(box=space_box),
+                        vertical=False, xobj_id=getattr(upper, "xobj_id", 0),
+                        pdf_style=space_style,
+                    )
+                    lower.pdf_paragraph_composition.insert(
+                        0, PdfParagraphComposition(pdf_character=space_char)
+                    )
+                upper.pdf_paragraph_composition.extend(lower.pdf_paragraph_composition)
+                self.update_paragraph_data(upper, update_unicode=True)
+                paragraphs.remove(lower)
+                consumed.add(id(lower))
+
+    def _coalesce_inline_text_fragments(
+        self,
+        paragraphs: list[PdfParagraph],
+        font_dict: dict | None = None,
+    ) -> None:
+        """Join body fragments split by a style boundary on one source line."""
+        body_labels = {"paragraph", "plain text", "text", "body_text"}
+
+        def lines(paragraph: PdfParagraph) -> list[PdfLine]:
+            return [
+                composition.pdf_line
+                for composition in paragraph.pdf_paragraph_composition or []
+                if composition.pdf_line and composition.pdf_line.pdf_character
+            ]
+
+        changed = True
+        while changed:
+            changed = False
+            candidates = [
+                paragraph
+                for paragraph in paragraphs
+                if paragraph.box
+                and (paragraph.layout_label or "").lower() in body_labels
+                and not is_para_bold(paragraph, font_dict)
+                and lines(paragraph)
+            ]
+            for left in candidates:
+                left_lines = lines(left)
+                if not left_lines:
+                    continue
+                left_line = left_lines[-1]
+                for right in candidates:
+                    if right is left or right not in paragraphs:
+                        continue
+                    if getattr(left, "xobj_id", 0) != getattr(right, "xobj_id", 0):
+                        continue
+                    right_lines = lines(right)
+                    if not right_lines:
+                        continue
+                    right_line = right_lines[0]
+                    left_box = left_line.box
+                    right_box = right_line.box
+                    if not left_box or not right_box:
+                        continue
+                    vertical_overlap = max(
+                        0.0,
+                        min(left_box.y2, right_box.y2) - max(left_box.y, right_box.y),
+                    )
+                    min_height = max(
+                        min(left_box.y2 - left_box.y, right_box.y2 - right_box.y),
+                        1.0,
+                    )
+                    horizontal_gap = right_box.x - left_box.x2
+                    right_text = get_char_unicode_string(right_line.pdf_character).lstrip()
+                    if not (
+                        vertical_overlap >= 0.70 * min_height
+                        and -1.0 <= horizontal_gap <= 18.0
+                        and right_text
+                        and (right_text[0].islower() or right_text[0] in ",.;:)")
+                    ):
+                        continue
+
+                    # Merge the physically adjacent runs into one PdfLine so
+                    # translation sees one sentence and RTL layout gets one
+                    # right-aligned box instead of two colliding boxes.
+                    if (
+                        left_line.pdf_character
+                        and not get_char_unicode_string(left_line.pdf_character).endswith(" ")
+                    ) and not get_char_unicode_string(right_line.pdf_character).startswith(" "):
+                        from babeldoc.format.pdf.document_il.il_version_1 import VisualBbox
+
+                        space_box = Box(
+                            left_box.x2,
+                            left_box.y,
+                            max(left_box.x2, right_box.x),
+                            left_box.y2,
+                        )
+                        left_line.pdf_character.append(
+                            PdfCharacter(
+                                char_unicode=" ",
+                                box=space_box,
+                                visual_bbox=VisualBbox(box=space_box),
+                                vertical=False,
+                                xobj_id=getattr(left, "xobj_id", 0),
+                                pdf_style=left_line.pdf_character[-1].pdf_style,
+                            )
+                        )
+                    left_line.pdf_character.extend(right_line.pdf_character)
+                    self.update_line_data(left_line)
+
+                    remaining = [
+                        composition
+                        for composition in right.pdf_paragraph_composition
+                        if composition.pdf_line is not right_line
+                    ]
+                    if (
+                        remaining
+                        and right_line.pdf_character
+                        and not get_char_unicode_string(right_line.pdf_character).endswith(" ")
+                    ):
+                        from babeldoc.format.pdf.document_il.il_version_1 import VisualBbox
+
+                        separator_box = Box(
+                            right_box.x2,
+                            right_box.y,
+                            right_box.x2 + 3.0,
+                            right_box.y2,
+                        )
+                        left.pdf_paragraph_composition.append(
+                            PdfParagraphComposition(pdf_character=PdfCharacter(
+                                char_unicode=" ",
+                                box=separator_box,
+                                visual_bbox=VisualBbox(box=separator_box),
+                                vertical=False,
+                                xobj_id=getattr(left, "xobj_id", 0),
+                                pdf_style=right_line.pdf_character[-1].pdf_style,
+                            ))
+                        )
+                    left.pdf_paragraph_composition.extend(remaining)
+                    self.update_paragraph_data(left, update_unicode=True)
+                    paragraphs.remove(right)
+                    changed = True
+                    break
+                if changed:
+                    break
+
+    @staticmethod
+    def _paragraph_source_characters(paragraph: PdfParagraph) -> list[PdfCharacter]:
+        characters: list[PdfCharacter] = []
+        for composition in paragraph.pdf_paragraph_composition or []:
+            if composition.pdf_line:
+                characters.extend(composition.pdf_line.pdf_character or [])
+            elif composition.pdf_character:
+                characters.append(composition.pdf_character)
+        return characters
+
+    @staticmethod
+    def _cluster_coordinates(values: list[float], tolerance: float = 2.0) -> list[float]:
+        if not values:
+            return []
+        groups: list[list[float]] = []
+        for value in sorted(values):
+            if not groups or value - groups[-1][-1] > tolerance:
+                groups.append([value])
+            else:
+                groups[-1].append(value)
+        return [sum(group) / len(group) for group in groups]
+
+    def reconstruct_wired_table_cells(
+        self,
+        page: Page,
+        paragraphs: list[PdfParagraph],
+    ) -> None:
+        """Rebuild table cells from the vector grid retained by the source PDF.
+
+        A ruled table normally has *continuous* vertical rules and separate
+        horizontal rules for each row.  The old recovery path assumed every
+        vertical rule was clipped to one row.  That is true for a few PDFs but
+        makes a normal grid look like one giant row, so all translated cells
+        are rendered at the top of the table.  Prefer the complete two-axis
+        grid and retain that older vertical-only interpretation as a fallback
+        for irregular/exported tables.
+
+        The source vector grid remains in the PDF.  We only recover text cell
+        ownership; therefore the physical cell boxes must not be mirrored for
+        RTL output.
+        """
+        table_layouts = [
+            layout
+            for layout in page.page_layout or []
+            if layout.box and (layout.class_name or "").lower() in {
+                "table", "wired_table", "wireless_table"
+            }
+        ]
+        if not table_layouts:
+            return
+
+        is_arabic = "AR" in (self.translation_config.lang_out or "").upper()
+        for layout in table_layouts:
+            table_box = layout.box
+            vertical_rules: list[Box] = []
+            horizontal_rules: list[Box] = []
+            for curve in page.pdf_curve or []:
+                box = curve.box
+                if not box:
+                    continue
+                width = box.x2 - box.x
+                height = box.y2 - box.y
+                if (
+                    width <= 2.0
+                    and height >= 7.0
+                    and box.x >= table_box.x - 2.0
+                    and box.x2 <= table_box.x2 + 2.0
+                    and box.y >= table_box.y - 2.0
+                    and box.y2 <= table_box.y2 + 2.0
+                ):
+                    vertical_rules.append(box)
+                if (
+                    height <= 2.0
+                    and width >= max(12.0, (table_box.x2 - table_box.x) * 0.35)
+                    and box.x >= table_box.x - 2.0
+                    and box.x2 <= table_box.x2 + 2.0
+                    and box.y >= table_box.y - 2.0
+                    and box.y2 <= table_box.y2 + 2.0
+                ):
+                    horizontal_rules.append(box)
+            if len(vertical_rules) < 2:
+                continue
+
+            cell_rows: list[list[Box]] = []
+            # Build rows from horizontal rules when they are available.  At a
+            # row midpoint, only vertical rules crossing that midpoint are
+            # boundaries.  This preserves merged header cells where an inner
+            # vertical rule deliberately begins below the header.
+            ys = self._cluster_coordinates(
+                [(rule.y + rule.y2) / 2.0 for rule in horizontal_rules]
+            )
+            if len(ys) >= 2:
+                for y, y2 in zip(ys, ys[1:]):
+                    if y2 - y < 3.0:
+                        continue
+                    midpoint = (y + y2) / 2.0
+                    xs = [table_box.x, table_box.x2]
+                    for rule in vertical_rules:
+                        if rule.y - 1.5 <= midpoint <= rule.y2 + 1.5:
+                            xs.append((rule.x + rule.x2) / 2.0)
+                    xs = self._cluster_coordinates(xs)
+                    if len(xs) >= 2:
+                        cell_rows.append(
+                            [Box(xs[index], y, xs[index + 1], y2) for index in range(len(xs) - 1)]
+                        )
+
+            if not cell_rows:
+                # Legacy fallback: some generators emit one independently
+                # clipped set of vertical rules per row and no horizontal
+                # strokes.  Continue supporting those tables.
+                row_groups: list[list[Box]] = []
+                for rule in sorted(vertical_rules, key=lambda b: (-b.y2, b.x)):
+                    matched = next(
+                        (
+                            group
+                            for group in row_groups
+                            if abs(group[0].y - rule.y) <= 1.5
+                            and abs(group[0].y2 - rule.y2) <= 1.5
+                        ),
+                        None,
+                    )
+                    if matched is None:
+                        matched = []
+                        row_groups.append(matched)
+                    matched.append(rule)
+
+                for rules in row_groups:
+                    xs = self._cluster_coordinates(
+                        [(rule.x + rule.x2) / 2.0 for rule in rules]
+                    )
+                    if len(xs) < 2:
+                        continue
+                    y = sum(rule.y for rule in rules) / len(rules)
+                    y2 = sum(rule.y2 for rule in rules) / len(rules)
+                    cell_rows.append(
+                        [Box(xs[i], y, xs[i + 1], y2) for i in range(len(xs) - 1)]
+                    )
+            if not cell_rows:
+                continue
+
+            source_paragraphs = []
+            owned: dict[int, tuple[PdfCharacter, int, int]] = {}
+            for paragraph in list(paragraphs):
+                chars = self._paragraph_source_characters(paragraph)
+                if not chars:
+                    continue
+                assigned_count = 0
+                paragraph_owned: dict[int, tuple[PdfCharacter, int, int]] = {}
+                for char in chars:
+                    char_box = char.visual_bbox.box if char.visual_bbox and char.visual_bbox.box else char.box
+                    if not char_box:
+                        continue
+                    cx = (char_box.x + char_box.x2) / 2.0
+                    cy = (char_box.y + char_box.y2) / 2.0
+                    for row_index, cells in enumerate(cell_rows):
+                        if cells[0].y - 1.0 <= cy <= cells[0].y2 + 1.0:
+                            for cell_index, cell in enumerate(cells):
+                                if cell.x - 1.0 <= cx <= cell.x2 + 1.0:
+                                    paragraph_owned[id(char)] = (char, row_index, cell_index)
+                                    assigned_count += 1
+                                    break
+                            break
+                if assigned_count and assigned_count >= max(1, int(len(chars) * 0.8)):
+                    source_paragraphs.append(paragraph)
+                    owned.update(paragraph_owned)
+
+            if not source_paragraphs:
+                continue
+            paragraphs[:] = [p for p in paragraphs if p not in source_paragraphs]
+
+            for row_index, cells in enumerate(cell_rows):
+                for cell_index, source_cell in enumerate(cells):
+                    chars = [
+                        item[0]
+                        for item in owned.values()
+                        if item[1] == row_index and item[2] == cell_index
+                    ]
+                    if not chars:
+                        continue
+                    # The original grid is part of the preserved base PDF
+                    # operations. Keep its physical slots stable and apply RTL
+                    # only inside each recovered cell. Reversing text boxes
+                    # without also replacing the base vector grid creates width
+                    # mismatches (the 21-character account column would inherit
+                    # the narrow POSITION slot).
+                    destination = source_cell
+                    line_groups: list[list[PdfCharacter]] = []
+                    for char in sorted(
+                        chars,
+                        key=lambda c: (
+                            -(c.visual_bbox.box.y2 if c.visual_bbox and c.visual_bbox.box else c.box.y2),
+                            c.visual_bbox.box.x if c.visual_bbox and c.visual_bbox.box else c.box.x,
+                        ),
+                    ):
+                        char_box = char.visual_bbox.box if char.visual_bbox and char.visual_bbox.box else char.box
+                        group = next(
+                            (
+                                group
+                                for group in line_groups
+                                if abs(
+                                    (group[0].visual_bbox.box.y if group[0].visual_bbox and group[0].visual_bbox.box else group[0].box.y)
+                                    - char_box.y
+                                ) <= 2.0
+                            ),
+                            None,
+                        )
+                        if group is None:
+                            line_groups.append([char])
+                        else:
+                            group.append(char)
+                    compositions = []
+                    for group in line_groups:
+                        group.sort(key=lambda c: c.visual_bbox.box.x if c.visual_bbox and c.visual_bbox.box else c.box.x)
+                        compositions.append(self.create_line(group))
+                    destination_box = Box(
+                        destination.x + 2.0,
+                        destination.y + 1.0,
+                        destination.x2 - 2.0,
+                        destination.y2 - 1.0,
+                    )
+                    paragraph = PdfParagraph(
+                        box=destination_box,
+                        pdf_paragraph_composition=compositions,
+                        layout_label="wired_table_cell_fixed_rtl" if is_arabic else "wired_table_cell",
+                        xobj_id=getattr(source_paragraphs[0], "xobj_id", 0),
+                        debug_id=generate_base58_id(),
+                    )
+                    self.update_paragraph_data(paragraph, update_unicode=True)
+                    # update_paragraph_data derives a tight source-text box;
+                    # restore the actual destination cell so wrapping and RTL
+                    # alignment use the complete ruled cell.
+                    paragraph.box = destination_box
+                    paragraphs.append(paragraph)
+
     def _remove_trailing_hyphen(self, paragraph: PdfParagraph):
         """Remove trailing hyphen or soft-hyphen from paragraph composition."""
         for comp in reversed(paragraph.pdf_paragraph_composition or []):
@@ -554,6 +1072,14 @@ class ParagraphFinder:
             text_b = (b.unicode or "").lstrip()
 
             if not text_a or not text_b:
+                i += 1
+                continue
+
+            # A parenthesized alphabetic marker is a real list item even when
+            # its source font/extraction stream did not retain a distinct
+            # bullet glyph.  Never concatenate ``(a)`` / ``(b)`` into the
+            # preceding Arabic paragraph.
+            if re.match(r"^\s*\([A-Za-z]\)\s+", text_b):
                 i += 1
                 continue
 
@@ -612,6 +1138,14 @@ class ParagraphFinder:
                     self._remove_trailing_hyphen(a)
                 elif is_lowercase_continuation and not text_a.endswith(" ") and not text_b.startswith(" "):
                     from babeldoc.format.pdf.document_il.il_version_1 import VisualBbox
+                    adjacent_chars = (
+                        self._paragraph_source_characters(a)
+                        + self._paragraph_source_characters(b)
+                    )
+                    space_style = next(
+                        (char.pdf_style for char in adjacent_chars if char.pdf_style),
+                        a.pdf_style or b.pdf_style,
+                    )
                     space_box = Box(box_a.x2, box_b.y2, box_a.x2 + 3.0, box_b.y2 + 10.0)
                     space_char = PdfCharacter(
                         char_unicode=" ",
@@ -619,6 +1153,7 @@ class ParagraphFinder:
                         visual_bbox=VisualBbox(box=space_box),
                         vertical=False,
                         xobj_id=getattr(a, "xobj_id", 0),
+                        pdf_style=space_style,
                     )
                     if b.pdf_paragraph_composition:
                         comp0 = b.pdf_paragraph_composition[0]
@@ -1075,6 +1610,51 @@ class ParagraphFinder:
             return (line_widths[mid - 1] + line_widths[mid]) / 2
         return line_widths[mid]
 
+    def purge_duplicate_character_ownership(self, paragraphs: list[PdfParagraph]) -> None:
+        """Ensure each extracted character belongs to exactly one paragraph.
+
+        This is intentionally identity-based: repeated letters in the document
+        remain valid, while a ghost paragraph holding a second reference to the
+        *same* extracted PdfCharacter is removed before it can be typeset twice.
+        """
+        owned_character_ids: set[int] = set()
+        empty_paragraphs: list[PdfParagraph] = []
+
+        for paragraph in paragraphs:
+            retained_compositions: list[PdfParagraphComposition] = []
+            for composition in paragraph.pdf_paragraph_composition or []:
+                if composition.pdf_line:
+                    unique_chars = [
+                        char
+                        for char in composition.pdf_line.pdf_character
+                        if id(char) not in owned_character_ids
+                    ]
+                    owned_character_ids.update(id(char) for char in unique_chars)
+                    if unique_chars:
+                        if len(unique_chars) == len(composition.pdf_line.pdf_character):
+                            retained_compositions.append(composition)
+                        else:
+                            retained_compositions.append(self.create_line(unique_chars))
+                elif composition.pdf_character:
+                    if id(composition.pdf_character) not in owned_character_ids:
+                        owned_character_ids.add(id(composition.pdf_character))
+                        retained_compositions.append(composition)
+                else:
+                    # Formula and same-style compositions are not source
+                    # character ownership candidates at this pipeline stage.
+                    retained_compositions.append(composition)
+
+            paragraph.pdf_paragraph_composition = retained_compositions
+            if not retained_compositions:
+                empty_paragraphs.append(paragraph)
+
+        for paragraph in empty_paragraphs:
+            paragraphs.remove(paragraph)
+            logger.debug(
+                "Removed ghost paragraph %s after duplicate character ownership purge.",
+                paragraph.debug_id,
+            )
+
     def process_independent_paragraphs(
         self,
         paragraphs: list[PdfParagraph],
@@ -1245,6 +1825,20 @@ class ParagraphFinder:
                     if para1.xobj_id != para2.xobj_id:
                         continue
 
+                    labels = (
+                        (para1.layout_label or "").lower(),
+                        (para2.layout_label or "").lower(),
+                    )
+                    # Table grids have their own geometry and section labels
+                    # must retain a dedicated lane.  The old midpoint splitter
+                    # compressed either case back into adjacent body text.
+                    if any(
+                        marker in label
+                        for label in labels
+                        for marker in ("table", "heading", "title", "section")
+                    ):
+                        continue
+
                     # Check for overlap using the existing method
                     if self.bbox_overlap(para1.box, para2.box):
                         if self.is_bbox_contain_in_vertical(para1.box, para2.box):
@@ -1307,6 +1901,512 @@ class ParagraphFinder:
                 f" fix_overlapping_paragraphs for page {page.page_number}."
                 " Some overlaps might remain."
             )
+
+    @staticmethod
+    def classify_numbered_section_headings(paragraphs: list[PdfParagraph]) -> None:
+        """Mark short decimal/roman numbered labels as headings.
+
+        Style-based heading detection cannot be trusted for many older PDFs:
+        the visual heading and its body often share one embedded font.  The
+        conservative length cap avoids turning a numbered body sentence or a
+        table entry into a heading.
+        """
+        section_pattern = re.compile(
+            r"^\s*(?:\d+(?:\.\d+){0,4}|[IVXLCDM]+\.?)(?:\s+|\.)\S",
+            re.IGNORECASE,
+        )
+        for paragraph in paragraphs:
+            label = (paragraph.layout_label or "").lower()
+            if "table" in label or "heading" in label:
+                continue
+            text = " ".join((paragraph.unicode or "").split())
+            if text and len(text) <= 110 and section_pattern.match(text):
+                paragraph.layout_label = "heading"
+
+    def merge_same_line_sentence_fragments(
+        self, paragraphs: list[PdfParagraph]
+    ) -> None:
+        """Join adjacent source runs that form one visual sentence line.
+
+        Layout models sometimes assign a different role to each style run in
+        the same sentence (``All`` / ``banks are required`` / ``to validate``).
+        Geometry is authoritative here: only horizontally adjacent runs on the
+        same baseline are joined, and tables, lists and numbered headings are
+        excluded.
+        """
+        body_labels = {"paragraph", "plain text", "text", "body_text"}
+
+        def leading_line_box(paragraph: PdfParagraph) -> Box | None:
+            lines = [
+                composition.pdf_line
+                for composition in paragraph.pdf_paragraph_composition or []
+                if composition.pdf_line and composition.pdf_line.box
+            ]
+            if not lines:
+                return None
+            anchor = lines[0].box
+            anchor_center = (anchor.y + anchor.y2) / 2.0
+            same_baseline = [
+                line.box
+                for line in lines
+                if abs((line.box.y + line.box.y2) / 2.0 - anchor_center) <= 2.5
+            ]
+            return Box(
+                min(box.x for box in same_baseline),
+                min(box.y for box in same_baseline),
+                max(box.x2 for box in same_baseline),
+                max(box.y2 for box in same_baseline),
+            )
+
+        changed = True
+        while changed:
+            changed = False
+            candidates = [
+                paragraph
+                for paragraph in paragraphs
+                if paragraph.box
+                and leading_line_box(paragraph)
+                and not any(
+                    marker in (paragraph.layout_label or "").lower()
+                    for marker in ("table", "list")
+                )
+            ]
+            candidates.sort(
+                key=lambda paragraph: (
+                    paragraph.xobj_id or 0,
+                    round(leading_line_box(paragraph).y / 3.0),
+                    leading_line_box(paragraph).x,
+                )
+            )
+            for left_index, left in enumerate(candidates):
+                left_box = leading_line_box(left)
+                left_text = " ".join((left.unicode or "").split())
+                if not left_text:
+                    continue
+                if re.match(r"^\d+(?:\.\d+)+", left_text):
+                    continue
+                if left_text.endswith((".", ":", ";", "?", "!")):
+                    continue
+                for right in candidates[left_index + 1 :]:
+                    if left.xobj_id != right.xobj_id:
+                        continue
+                    right_box = leading_line_box(right)
+                    right_text = " ".join((right.unicode or "").split())
+                    if not right_text or not right_text[0].islower():
+                        continue
+                    left_height = max(1.0, left_box.y2 - left_box.y)
+                    right_height = max(1.0, right_box.y2 - right_box.y)
+                    center_delta = abs(
+                        (left_box.y + left_box.y2) / 2.0
+                        - (right_box.y + right_box.y2) / 2.0
+                    )
+                    horizontal_gap = right_box.x - left_box.x2
+                    if (
+                        center_delta > max(2.5, min(left_height, right_height) * 0.35)
+                        or not -2.0 <= horizontal_gap <= 18.0
+                    ):
+                        continue
+                    from babeldoc.format.pdf.document_il.il_version_1 import VisualBbox
+
+                    source_chars = (
+                        self._paragraph_source_characters(left)
+                        + self._paragraph_source_characters(right)
+                    )
+                    space_style = next(
+                        (char.pdf_style for char in source_chars if char.pdf_style),
+                        left.pdf_style or right.pdf_style,
+                    )
+                    space_x = left_box.x2
+                    space_width = max(
+                        1.5, min(4.0, max(horizontal_gap, 1.5))
+                    )
+                    space_box = Box(
+                        space_x,
+                        left_box.y,
+                        space_x + space_width,
+                        left_box.y2,
+                    )
+                    left.pdf_paragraph_composition.append(
+                        PdfParagraphComposition(
+                            pdf_character=PdfCharacter(
+                                char_unicode=" ",
+                                box=space_box,
+                                visual_bbox=VisualBbox(box=space_box),
+                                vertical=False,
+                                xobj_id=left.xobj_id,
+                                pdf_style=space_style,
+                            )
+                        )
+                    )
+                    left.pdf_paragraph_composition.extend(
+                        right.pdf_paragraph_composition or []
+                    )
+                    if (right.layout_label or "").lower() in body_labels:
+                        left.layout_label = right.layout_label
+                    elif (left.layout_label or "").lower() not in body_labels:
+                        left.layout_label = "paragraph"
+                    self.update_paragraph_data(left, update_unicode=True)
+                    paragraphs.remove(right)
+                    changed = True
+                    break
+                if changed:
+                    break
+
+    def split_embedded_structured_lines(
+        self, paragraphs: list[PdfParagraph]
+    ) -> None:
+        """Recover semantic records hidden inside one extracted text block.
+
+        The operation is deliberately content- and geometry-based.  It only
+        activates when a multi-line paragraph contains a procedure marker,
+        contact field, or an embedded decimal section heading.  Ordinary body
+        paragraphs retain their source grouping and diagrams are untouched.
+        """
+        procedure_pattern = re.compile(
+            r"^\s*(?:step\s*\d+|example\s*:|sample\s+iban\s*:|result\s+full\s+iban)",
+            re.IGNORECASE,
+        )
+        contact_pattern = re.compile(
+            r"\b(?:tel(?:ephone)?|fax|e[ -]?mail|email)\s*[:：]", re.IGNORECASE
+        )
+        section_pattern = re.compile(
+            r"^\s*\d+(?:\.\d+){1,4}(?:\s+|\.)\S", re.IGNORECASE
+        )
+
+        def line_text(composition: PdfParagraphComposition) -> str:
+            if not composition.pdf_line:
+                return ""
+            return get_char_unicode_string(
+                composition.pdf_line.pdf_character or []
+            ).strip()
+
+        def clone_with(
+            source: PdfParagraph,
+            compositions: list[PdfParagraphComposition],
+            label: str,
+        ) -> PdfParagraph:
+            clone = PdfParagraph(
+                pdf_style=source.pdf_style,
+                pdf_paragraph_composition=list(compositions),
+                xobj_id=source.xobj_id,
+                unicode="",
+                vertical=source.vertical,
+                first_line_indent=source.first_line_indent,
+                debug_id=generate_base58_id(),
+                layout_label=label,
+                layout_id=source.layout_id,
+                text_direction=source.text_direction,
+                text_align=source.text_align,
+            )
+            self.update_paragraph_data(clone, update_unicode=True)
+            return clone
+
+        for paragraph in list(paragraphs):
+            compositions = list(paragraph.pdf_paragraph_composition or [])
+            visual_lines = [
+                (index, line_text(composition))
+                for index, composition in enumerate(compositions)
+                if composition.pdf_line
+            ]
+            if len(visual_lines) < 2:
+                continue
+
+            texts = [text for _, text in visual_lines]
+            procedure_mode = any(procedure_pattern.match(text) for text in texts)
+            contact_mode = any(contact_pattern.search(text) for text in texts)
+            section_indices = [
+                index
+                for index, text in visual_lines
+                if len(text) <= 110 and section_pattern.match(text)
+            ]
+            if not (procedure_mode or contact_mode or section_indices):
+                continue
+
+            replacement: list[PdfParagraph] = []
+            if procedure_mode:
+                # Every painted row keeps its own source box.  This prevents a
+                # later label, formula, phone number, or e-mail address from
+                # being translated/reflowed on the preceding row.
+                for composition in compositions:
+                    text = line_text(composition)
+                    label = (
+                        "procedure_step"
+                        if procedure_pattern.match(text)
+                        else "procedure_step_body"
+                    )
+                    replacement.append(clone_with(paragraph, [composition], label))
+            elif contact_mode:
+                # Phone numbers are often tagged as formula runs immediately
+                # after the ``Tel:`` line composition. Keep non-line fragments
+                # with their preceding row so exact values survive.
+                contact_rows: list[list[PdfParagraphComposition]] = []
+                for composition in compositions:
+                    if composition.pdf_line or not contact_rows:
+                        contact_rows.append([composition])
+                    else:
+                        contact_rows[-1].append(composition)
+                replacement.extend(
+                    clone_with(paragraph, row, "contact_card")
+                    for row in contact_rows
+                )
+            else:
+                # Preserve body-line grouping on both sides of the embedded
+                # heading, isolating only the semantic boundary itself.
+                boundaries = sorted(set(section_indices))
+                cursor = 0
+                first_boundary = boundaries[0]
+                prefix_text = " ".join(
+                    line_text(composition)
+                    for composition in compositions[:first_boundary]
+                ).strip()
+                prefix_paragraph = (
+                    clone_with(
+                        paragraph,
+                        compositions[:first_boundary],
+                        "paragraph",
+                    )
+                    if first_boundary > 0
+                    else None
+                )
+                nearby_candidates = []
+                if prefix_paragraph and prefix_paragraph.box:
+                    for candidate in paragraphs:
+                        if candidate is paragraph or not candidate.box:
+                            continue
+                        if candidate.xobj_id != paragraph.xobj_id:
+                            continue
+                        if "table" in (candidate.layout_label or "").lower():
+                            continue
+                        horizontal_overlap = min(
+                            candidate.box.x2, prefix_paragraph.box.x2
+                        ) - max(candidate.box.x, prefix_paragraph.box.x)
+                        if horizontal_overlap <= 0:
+                            continue
+                        gap = min(
+                            abs(candidate.box.y - prefix_paragraph.box.y2),
+                            abs(prefix_paragraph.box.y - candidate.box.y2),
+                        )
+                        if gap <= 30.0:
+                            nearby_candidates.append((gap, candidate))
+                previous = (
+                    min(nearby_candidates, key=lambda item: item[0])[1]
+                    if nearby_candidates
+                    else None
+                )
+                prefix_is_continuation = bool(
+                    prefix_text
+                    and prefix_text[0].islower()
+                    and previous
+                    and previous.xobj_id == paragraph.xobj_id
+                    and "table" not in (previous.layout_label or "").lower()
+                )
+                if prefix_is_continuation:
+                    previous.pdf_paragraph_composition.extend(
+                        compositions[:first_boundary]
+                    )
+                    self.update_paragraph_data(previous, update_unicode=True)
+                    cursor = first_boundary
+                for boundary in boundaries:
+                    if boundary > cursor:
+                        replacement.append(
+                            clone_with(paragraph, compositions[cursor:boundary], "paragraph")
+                        )
+                    replacement.append(
+                        clone_with(paragraph, [compositions[boundary]], "heading")
+                    )
+                    cursor = boundary + 1
+                if cursor < len(compositions):
+                    replacement.append(
+                        clone_with(paragraph, compositions[cursor:], "paragraph")
+                    )
+
+            if len(replacement) <= 1:
+                continue
+            insert_at = paragraphs.index(paragraph)
+            paragraphs[insert_at : insert_at + 1] = replacement
+
+    @staticmethod
+    def classify_structured_text_blocks(paragraphs: list[PdfParagraph]) -> None:
+        """Classify procedural rows and contact cards before translation.
+
+        These regions look like ordinary prose to a layout model but their
+        source line breaks encode meaning.  Joining them into one MT prompt is
+        what made MOD-97 steps detach from their result lines and shrank the
+        final contact card into a single line.
+        """
+        contact_pattern = re.compile(
+            r"\b(?:tel(?:ephone)?|fax|e[ -]?mail|email)\s*[:：]", re.IGNORECASE
+        )
+        procedure_pattern = re.compile(
+            r"^\s*(?:step\s*\d+|example\s*:|sample\s+iban\s*:|result\s+full\s+iban)",
+            re.IGNORECASE,
+        )
+        contact_anchors: list[PdfParagraph] = []
+        procedure_anchors: list[PdfParagraph] = []
+        for paragraph in paragraphs:
+            label = (paragraph.layout_label or "").lower()
+            text = paragraph.unicode or ""
+            if contact_pattern.search(text):
+                # A bordered card is frequently classified as a one-cell table.
+                # Semantic contact fields take precedence over that visual label.
+                paragraph.layout_label = "contact_card"
+                source_lines = [
+                    get_char_unicode_string(composition.pdf_line.pdf_character).strip()
+                    for composition in paragraph.pdf_paragraph_composition or []
+                    if composition.pdf_line and composition.pdf_line.pdf_character
+                ]
+                source_lines = [line for line in source_lines if line]
+                if len(source_lines) > 1:
+                    paragraph.unicode = "\n".join(source_lines)
+                contact_anchors.append(paragraph)
+            elif procedure_pattern.match(text):
+                # Semantic procedure markers take precedence over a generic
+                # heading/title label.  In older PDFs, bold ``Step N`` rows
+                # are routinely detected as headings even when their source
+                # line compositions also contain the instruction and result.
+                paragraph.layout_label = "procedure_step"
+                source_lines = [
+                    get_char_unicode_string(composition.pdf_line.pdf_character).strip()
+                    for composition in paragraph.pdf_paragraph_composition or []
+                    if composition.pdf_line and composition.pdf_line.pdf_character
+                ]
+                source_lines = [line for line in source_lines if line]
+                if len(source_lines) > 1:
+                    paragraph.unicode = "\n".join(source_lines)
+                procedure_anchors.append(paragraph)
+            elif "table" in label or "heading" in label or "title" in label:
+                continue
+
+        # Contact cards are often emitted as individual name, role and contact
+        # paragraphs. Mark nearby sibling fields once a Tel/Fax/E-mail anchor
+        # identifies the card, giving every row the same protected layout path.
+        for anchor in contact_anchors:
+            if not anchor.box:
+                continue
+            for candidate in paragraphs:
+                if candidate is anchor or not candidate.box:
+                    continue
+                label = (candidate.layout_label or "").lower()
+                if any(marker in label for marker in ("heading", "title")):
+                    continue
+                if getattr(candidate, "xobj_id", None) != getattr(anchor, "xobj_id", None):
+                    continue
+                vertical_gap = max(
+                    anchor.box.y - candidate.box.y2,
+                    candidate.box.y - anchor.box.y2,
+                    0.0,
+                )
+                horizontal_overlap = min(anchor.box.x2, candidate.box.x2) - max(anchor.box.x, candidate.box.x)
+                if vertical_gap <= 95.0 and horizontal_overlap >= -12.0:
+                    candidate.layout_label = "contact_card"
+
+        # A procedure is commonly painted as three independent paragraphs:
+        # ``Step N``, its instruction, and a formula/result.  Propagate the
+        # structural label only to close, horizontally aligned followers and
+        # stop at the next step anchor.  This lets the typesetter reserve one
+        # ordered lane for the complete step without folding unrelated prose
+        # into it.
+        sorted_procedures = sorted(
+            (p for p in paragraphs if p.box), key=lambda p: -p.box.y2
+        )
+        for anchor in procedure_anchors:
+            if not anchor.box:
+                continue
+            anchor_index = sorted_procedures.index(anchor)
+            previous = anchor
+            for candidate in sorted_procedures[anchor_index + 1:]:
+                if not candidate.box:
+                    continue
+                candidate_text = " ".join((candidate.unicode or "").split())
+                if candidate is not anchor and procedure_pattern.match(candidate_text):
+                    break
+                label = (candidate.layout_label or "").lower()
+                if any(marker in label for marker in ("table", "heading", "title", "contact")):
+                    break
+                if getattr(candidate, "xobj_id", None) != getattr(anchor, "xobj_id", None):
+                    continue
+                vertical_gap = previous.box.y - candidate.box.y2
+                horizontal_overlap = min(anchor.box.x2, candidate.box.x2) - max(
+                    anchor.box.x, candidate.box.x
+                )
+                min_width = max(
+                    1.0,
+                    min(
+                        anchor.box.x2 - anchor.box.x,
+                        candidate.box.x2 - candidate.box.x,
+                    ),
+                )
+                if vertical_gap < -3.0 or vertical_gap > 34.0:
+                    break
+                if horizontal_overlap < min_width * 0.20:
+                    continue
+                candidate.layout_label = "procedure_step_body"
+                previous = candidate
+
+    @staticmethod
+    def merge_detached_leading_word_fragments(paragraphs: list[PdfParagraph]) -> None:
+        """Join an extraction-created first word with its same-line prose.
+
+        This is geometric and role-aware rather than language-specific, so it
+        does not merge headings, table cells or actual list labels.
+        """
+        word_pattern = re.compile(r"^[A-Za-z]{1,12}$")
+        index = 0
+        while index < len(paragraphs):
+            lead = paragraphs[index]
+            lead_text = " ".join((lead.unicode or "").split())
+            lead_label = (lead.layout_label or "").lower()
+            if (
+                not lead.box
+                or not word_pattern.fullmatch(lead_text)
+                or any(marker in lead_label for marker in ("table", "list"))
+            ):
+                index += 1
+                continue
+            merged = False
+            for candidate in paragraphs[index + 1:index + 5]:
+                if not candidate.box or getattr(candidate, "xobj_id", None) != getattr(lead, "xobj_id", None):
+                    continue
+                candidate_text = " ".join((candidate.unicode or "").split())
+                lead_height = max(1.0, lead.box.y2 - lead.box.y)
+                candidate_height = max(1.0, candidate.box.y2 - candidate.box.y)
+                center_delta = abs(
+                    (lead.box.y + lead.box.y2) / 2.0
+                    - (candidate.box.y + candidate.box.y2) / 2.0
+                )
+                vertical_overlap = max(
+                    0.0,
+                    min(lead.box.y2, candidate.box.y2)
+                    - max(lead.box.y, candidate.box.y),
+                )
+                horizontal_gap = candidate.box.x - lead.box.x2
+                same_visual_line = (
+                    center_delta <= max(2.5, min(lead_height, candidate_height) * 0.35)
+                    and vertical_overlap >= min(lead_height, candidate_height) * 0.55
+                )
+                if (
+                    not candidate_text
+                    or len(candidate_text) < 12
+                    or not same_visual_line
+                    or not -2.0 <= horizontal_gap <= 18.0
+                ):
+                    continue
+                candidate.unicode = f"{lead_text} {candidate_text}"
+                candidate.pdf_paragraph_composition = (
+                    list(lead.pdf_paragraph_composition or [])
+                    + list(candidate.pdf_paragraph_composition or [])
+                )
+                candidate.box = Box(
+                    min(lead.box.x, candidate.box.x),
+                    min(lead.box.y, candidate.box.y),
+                    max(lead.box.x2, candidate.box.x2),
+                    max(lead.box.y2, candidate.box.y2),
+                )
+                paragraphs.remove(lead)
+                merged = True
+                break
+            if not merged:
+                index += 1
 
     def _sort_characters_in_lines(self, page: Page):
         """Sort characters in each line from left to right, top to bottom."""

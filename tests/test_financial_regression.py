@@ -68,6 +68,44 @@ def test_equation_protection():
     assert re.match(pattern, "< b 1 >", re.IGNORECASE)
 
 
+def test_ordinal_range_protection():
+    """Ordinal suffixes must remain attached to their numerals in RTL output."""
+    text = "The BBAN occupies the 5th - 29th position."
+    protected, mapping = _protect_numerals(text)
+    assert "5th - 29th" in mapping.values()
+    assert "{0}th" not in protected
+    assert _restore_numerals(protected, mapping) == text
+
+
+def test_stray_english_quantifier_is_normalized_in_arabic_context(translator_helper):
+    """A residual NLLB quantifier must not create an LTR fragment in Arabic."""
+    assert translator_helper._normalize_arabic_output("All البنوك ملزمة بالتحقق") == "جميع البنوك ملزمة بالتحقق"
+    assert translator_helper._normalize_arabic_output("All banks") == "All banks"
+    assert translator_helper._normalize_arabic_output("All") == "جميع"
+
+
+def test_formula_runs_are_ltr_isolated_in_arabic_context(translator_helper):
+    """MOD-97 calculation strings must not be reordered by surrounding Arabic."""
+    normalized = translator_helper._normalize_arabic_output("احسب MOD 97 ثم 620000000/97 = 56")
+    assert "\u200eMOD 97\u200e" in normalized
+    assert "\u200e620000000/97 = 56\u200e" in normalized
+
+
+def test_structured_records_keep_newline_boundaries(translator_helper):
+    """Procedure/contact records must reach typesetting as separate lines."""
+    normalized = translator_helper._normalize_arabic_output("الخطوة 3:\n620000000/97 = 56\nالنتيجة")
+    assert normalized.count("\n") == 2
+
+
+def test_adjacent_critical_iban_duplication_is_removed():
+    """A decoder must not be able to publish a duplicated restored IBAN."""
+    iban = "QA64SCBL00000000000137502560"
+    protected, mapping = _protect_numerals(f"RESULT FULL IBAN={iban}")
+    placeholder = next(key for key, value in mapping.items() if value == iban)
+    restored = _restore_numerals(protected.replace(placeholder, placeholder + placeholder), mapping)
+    assert restored.count(iban) == 1
+
+
 # 2. Standalone and parenthesized acronym protection
 def test_acronym_protection(translator_helper):
     text = "Thus, the gap between the QCBLR and the QCBDR was narrowed down to 50 bps, while placing the QCBRR at the middle (Chart 7-1)."
@@ -288,6 +326,11 @@ if __name__ == "__main__":
     helper = translator_helper()
     tests = [
         ("test_equation_protection", lambda: test_equation_protection()),
+        ("test_ordinal_range_protection", lambda: test_ordinal_range_protection()),
+        ("test_stray_english_quantifier_is_normalized_in_arabic_context", lambda: test_stray_english_quantifier_is_normalized_in_arabic_context(helper)),
+        ("test_formula_runs_are_ltr_isolated_in_arabic_context", lambda: test_formula_runs_are_ltr_isolated_in_arabic_context(helper)),
+        ("test_structured_records_keep_newline_boundaries", lambda: test_structured_records_keep_newline_boundaries(helper)),
+        ("test_adjacent_critical_iban_duplication_is_removed", lambda: test_adjacent_critical_iban_duplication_is_removed()),
         ("test_acronym_protection", lambda: test_acronym_protection(helper)),
         ("test_nds3_protection", lambda: test_nds3_protection(helper)),
         ("test_currency_standardization", lambda: test_currency_standardization(helper)),

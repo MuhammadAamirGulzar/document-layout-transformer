@@ -67,6 +67,11 @@ _NUMERAL_PATTERN = re.compile(
     # 9. Mixed alphanumeric codes containing both letters and numbers (3 to 35 chars): Q1, H2, MOD97, A01
     r'(\b(?=[A-Z0-9]{3,35}\b)(?=[A-Z0-9]*\d)(?=[A-Z0-9]*[A-Z])[A-Z0-9]+\b)|'
     # 10. Compound numeric references: 2-1, Chart 4-4, 7-3, 5.1.1, 2.1.2
+    # Ordinals must precede the generic number alternatives below. Otherwise the
+    # word-boundary checks on the numeric alternatives leave the suffix behind
+    # (``5th`` becomes ``{0}th``), which lets MT and BiDi reorder it.
+    r'(\b\d+(?:st|nd|rd|th)\s*[-\u2013\u2014]\s*\d+(?:st|nd|rd|th)\b)|'
+    r'(\b\d+(?:st|nd|rd|th)\b)|'
     r'(\b\d+[-\u2013\u2014]\d+\b)|'
     r'(\b\d+(?:\.\d+){1,3}\b)|'
     # 11. Known financial/statistical acronyms that must never be translated
@@ -168,6 +173,17 @@ def _restore_numerals(text: str, mapping: dict[str, str]) -> str:
     # Deduplicate repeated identical parenthesized tokens: (BBAN)(BBAN) -> (BBAN)
     text = re.sub(r'(\([A-Za-z0-9\-_]{2,15}\))(?:\s*\1)+', r'\1', text)
 
+    # NLLB can occasionally repeat a restored critical token immediately
+    # after itself (with or without a space).  This is especially dangerous
+    # in the MOD-97 walkthrough because a duplicated IBAN looks plausible but
+    # is financially wrong.  Only collapse *adjacent* copies of a token that
+    # came from the source mapping; independent source occurrences remain.
+    for original in set(mapping.values()):
+        if not (_SWIFT_BIC_PATTERN.match(original) or _IBAN_PATTERN.match(original)):
+            continue
+        duplicate = re.compile(r'(' + re.escape(original) + r')(?:\s*\1)+')
+        text = duplicate.sub(original, text)
+
     # Insert space between digits and Arabic-script letters (NOT Latin letters,
     # to preserve codes like Q1, H2, P6, CHAPTER 03 from being split).
     text = re.sub(r'(\d)([\u0600-\u06FF])', r'\1 \2', text)
@@ -175,7 +191,7 @@ def _restore_numerals(text: str, mapping: dict[str, str]) -> str:
     # Remove stray spaces before punctuation
     text = re.sub(r'\s+([,.:;!?،؛])', r'\1', text)
     # Collapse any double spaces left by restoration
-    text = re.sub(r'  +', ' ', text).strip()
+    text = re.sub(r'[^\S\r\n]{2,}', ' ', text).strip()
 
     # Byte-identity verification:
     # For critical SWIFT/BIC codes and IBAN identifiers, assert the restored output exactly equals
@@ -197,6 +213,13 @@ def _restore_numerals(text: str, mapping: dict[str, str]) -> str:
                     f"Shielded token '{original_token}' expected {expected_count} occurrence(s), "
                     f"found {actual_count} in restored text. Preserving translated content."
                 )
+        elif actual_count > expected_count and (
+            _SWIFT_BIC_PATTERN.match(original_token) or _IBAN_PATTERN.match(original_token)
+        ):
+            raise AssertionError(
+                f"Byte-identity check failed! Expected exactly {expected_count} occurrence(s) "
+                f"of critical banking code '{original_token}', found {actual_count}:\n  '{text}'"
+            )
 
     return text
 
@@ -228,6 +251,11 @@ _KNOWN_CODES = frozenset({
     "YoY", "Y-o-Y", "QoQ", "Q-o-Q", "MoM",
     "bps", "Bps", "BPS",
     "BBAN", "IBAN", "BIC", "SWIFT", "STP", "TERMS", "QATCH",
+    # Qatar bank identifiers used as standalone table cells.  Keeping this
+    # explicit is safer than treating every 3-4 letter uppercase English word
+    # (for example JULY or TYPE) as an untranslatable code.
+    "QNBA", "CBQA", "DOHB", "QISB", "ABQQ", "QIIB", "ARAB", "MSHQ",
+    "IBOQ", "BBME", "SCBL", "UNIL", "BNPA", "MAFR", "KLJI", "BRWA", "QIDB",
 })
 
 
@@ -286,11 +314,18 @@ def _is_pure_passthrough(text: str) -> bool:
         # Is it a SWIFT BIC code or IBAN string?
         if _SWIFT_BIC_PATTERN.match(clean) or _IBAN_PATTERN.match(clean):
             continue
-        # Is it a 2-4 letter uppercase code (e.g. ISO country codes AL, BA, GB; bank IDs QNBA, CBQA)?
-        if re.fullmatch(r'[A-Z]{2,4}', clean):
+        # A standalone ISO alpha-2 code is structural data.  Longer uppercase
+        # words are not assumed to be codes; genuine acronyms and bank IDs are
+        # enumerated in _KNOWN_CODES above.
+        if len(tokens) == 1 and re.fullmatch(r'[A-Z]{2}', clean):
             continue
-        # Is it an alphanumeric code up to 12 chars (e.g. "BBMEQAQXXXX", "SCBLQAQXXXX", "Q1", "H2")?
-        if re.fullmatch(r'[A-Z][A-Z0-9]{0,11}', clean):
+        # Alphanumeric compact identifiers remain safe when they contain a
+        # digit; pure alphabetic words must go through translation.
+        if (
+            len(tokens) == 1
+            and re.fullmatch(r'[A-Z][A-Z0-9]{0,11}', clean)
+            and any(char.isdigit() for char in clean)
+        ):
             continue
         # Is it a compound reference like "2-1", "4-4", "2022–2023"?
         if re.fullmatch(r'\d+[-\u2013\u2014]\d+', clean):

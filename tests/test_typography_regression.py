@@ -166,6 +166,39 @@ def test_arabic_optical_compensation():
     assert compensated_size == 12.0 * 1.08
 
 
+def test_arabic_publication_type_scale_is_role_stable():
+    """Translated Arabic body text uses one stable size; headings step up modestly."""
+    cfg = TranslationConfig(
+        translator=None,
+        input_file="",
+        lang_in="en",
+        lang_out="ar",
+        doc_layout_model=None,
+    )
+    ts = Typesetting(cfg)
+    body = PdfParagraph(layout_label="plain text")
+    heading = PdfParagraph(layout_label="section_heading")
+    table = PdfParagraph(layout_label="table_cell")
+
+    # Different source font sizes must not create a ragged Arabic body page.
+    assert ts._arabic_publication_font_size(body, 8.0) == 11.5
+    assert ts._arabic_publication_font_size(body, 17.0) == 11.5
+    assert ts._arabic_publication_font_size(heading, 9.0) == 14.0
+    assert ts._arabic_publication_font_size(table, 18.0) == 9.5
+
+
+def test_arabic_translation_retains_source_bold_weight():
+    """Bold source text maps to the embedded Arabic bold face."""
+    cfg = TranslationConfig(
+        translator=None, input_file="", lang_in="en", lang_out="ar", doc_layout_model=None
+    )
+    mapper = FontMapper(cfg)
+    source = PdfFont(font_id="F-bold", name="Arial-BoldMT", bold=True)
+    target = mapper.map(source, "م")
+    assert target is not None
+    assert target.is_bold or "bold" in target.font_id.lower()
+
+
 if __name__ == "__main__":
     print("Running Typography & Font Hierarchy Regression Suite...\n")
     tests = [
@@ -174,6 +207,8 @@ if __name__ == "__main__":
         ("test_title_exempt_from_mode_scale", test_title_exempt_from_mode_scale),
         ("test_role_based_min_scale_floors", test_role_based_min_scale_floors),
         ("test_arabic_optical_compensation", test_arabic_optical_compensation),
+        ("test_arabic_publication_type_scale_is_role_stable", test_arabic_publication_type_scale_is_role_stable),
+        ("test_arabic_translation_retains_source_bold_weight", test_arabic_translation_retains_source_bold_weight),
     ]
     passed = 0
     for name, fn in tests:

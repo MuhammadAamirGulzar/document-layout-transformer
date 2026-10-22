@@ -24,6 +24,7 @@ from babeldoc.format.pdf.document_il.il_version_1 import (
 )
 from babeldoc.format.pdf.document_il.midend.typesetting import Typesetting, TypesettingUnit
 from babeldoc.format.pdf.document_il.midend.il_translator import ILTranslator
+from babeldoc.format.pdf.document_il.midend.paragraph_finder import ParagraphFinder
 
 
 class DummyTranslator:
@@ -64,6 +65,35 @@ def test_punctuation_bidi_locking():
     raw_3 = "المتوسط السنوي لعام 2022:"
     norm_3 = ilt._normalize_arabic_output(raw_3)
     assert norm_3.endswith(":\u200F"), f"Expected RLM after colon in [{norm_3}]"
+
+
+def test_detached_leading_word_is_merged_before_translation():
+    """A separately-painted first word must not become an orphan Arabic label."""
+    lead = PdfParagraph(
+        unicode="All",
+        box=Box(x=50, y=100, x2=65, y2=112),
+        layout_label="title",
+    )
+    body = PdfParagraph(
+        unicode="banks are required to validate incoming payments.",
+        box=Box(x=66, y=100, x2=300, y2=112),
+    )
+    paragraphs = [lead, body]
+    ParagraphFinder.merge_detached_leading_word_fragments(paragraphs)
+    assert paragraphs == [body]
+    assert body.unicode == "All banks are required to validate incoming payments."
+
+
+def test_detached_leading_word_does_not_merge_with_paragraph_below():
+    """A short definition label must not consume the next vertical paragraph."""
+    lead = PdfParagraph(unicode="The", box=Box(x=50, y=100, x2=65, y2=112))
+    body = PdfParagraph(
+        unicode="next definition starts on a lower visual line.",
+        box=Box(x=50, y=78, x2=300, y2=94),
+    )
+    paragraphs = [lead, body]
+    ParagraphFinder.merge_detached_leading_word_fragments(paragraphs)
+    assert paragraphs == [lead, body]
 
 
 def test_header_footer_mirroring():
@@ -268,6 +298,36 @@ def test_overflow_paragraph_expansion_and_composition():
             assert "Unable to export paragraphs" not in str(call), f"Found dropped paragraph error: {call}"
 
 
+def test_render_preflight_rejects_missing_glyphs_and_deduplicates_ownership():
+    """PDF export must fail closed for glyph 0 and draw a shared character once."""
+    from babeldoc.format.pdf.document_il.backend.pdf_creater import PDFCreater, CharacterRenderUnit
+
+    cfg = TranslationConfig(
+        translator=DummyTranslator(), input_file="", lang_in="en", lang_out="ar", doc_layout_model=None
+    )
+    style = PdfStyle(font_id="base", font_size=10.0)
+    shared = PdfCharacter(
+        char_unicode="A", pdf_character_id=11,
+        box=Box(x=20.0, y=20.0, x2=26.0, y2=30.0), pdf_style=style, xobj_id=-1,
+    )
+    page = Page(cropbox=Cropbox(box=Box(x=0.0, y=0.0, x2=100.0, y2=100.0)))
+    page.pdf_character.append(shared)
+    page.pdf_paragraph.append(PdfParagraph(
+        box=Box(x=20.0, y=20.0, x2=26.0, y2=30.0),
+        pdf_paragraph_composition=[PdfParagraphComposition(pdf_character=shared)],
+    ))
+    creator = PDFCreater("", Document(page=[page]), cfg, {})
+    units = creator.create_render_units_for_page(page, cfg)
+    assert len([unit for unit in units if isinstance(unit, CharacterRenderUnit)]) == 1
+
+    shared.pdf_character_id = 0
+    try:
+        creator.create_render_units_for_page(page, cfg)
+        raise AssertionError("glyph 0 must be rejected before PDF export")
+    except RuntimeError as error:
+        assert "glyph preflight failed" in str(error)
+
+
 if __name__ == "__main__":
     import sys
     if hasattr(sys.stdout, 'reconfigure'):
@@ -275,10 +335,13 @@ if __name__ == "__main__":
     print("Running Advanced RTL Formatting Suite...\n")
     tests = [
         ("test_punctuation_bidi_locking", test_punctuation_bidi_locking),
+        ("test_detached_leading_word_is_merged_before_translation", test_detached_leading_word_is_merged_before_translation),
+        ("test_detached_leading_word_does_not_merge_with_paragraph_below", test_detached_leading_word_does_not_merge_with_paragraph_below),
         ("test_header_footer_mirroring", test_header_footer_mirroring),
         ("test_bullet_point_hanging_indent", test_bullet_point_hanging_indent),
         ("test_legend_swatch_placement", test_legend_swatch_placement),
         ("test_overflow_paragraph_expansion_and_composition", test_overflow_paragraph_expansion_and_composition),
+        ("test_render_preflight_rejects_missing_glyphs_and_deduplicates_ownership", test_render_preflight_rejects_missing_glyphs_and_deduplicates_ownership),
     ]
     passed = 0
     for name, fn in tests:

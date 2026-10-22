@@ -41,8 +41,12 @@ from babeldoc.format.pdf.document_il.il_version_1 import (
     PdfStyle,
     PdfParagraphComposition,
     PdfSameStyleUnicodeCharacters,
+    PdfFont,
+    PdfFormula,
+    PdfCharacter,
 )
 from babeldoc.format.pdf.document_il.utils.layout_helper import BULLET_POINT_PATTERN
+from babeldoc.format.pdf.document_il.utils.arabic_shaper import shape_arabic_run
 
 
 # ==============================================================================
@@ -184,6 +188,14 @@ class TestTechnicalDocumentRegression(unittest.TestCase):
                     f"Restoration mismatch for {sentence}"
                 )
 
+    def test_uppercase_natural_language_headings_are_translated(self):
+        """Uppercase prose is not a code merely because every letter is capitalized."""
+        self.assertFalse(_is_pure_passthrough("QATAR CENTRAL BANK"))
+        self.assertFalse(_is_pure_passthrough("STANDARDS DOCUMENT"))
+        self.assertFalse(_is_pure_passthrough("JULY"))
+        self.assertTrue(_is_pure_passthrough("QNBA"))
+        self.assertTrue(_is_pure_passthrough("IBAN"))
+
     # --------------------------------------------------------------------------
     # Bug Group 2: Full 54-Country 2-Letter ISO Codes LTR Ordering
     # --------------------------------------------------------------------------
@@ -305,6 +317,162 @@ class TestTechnicalDocumentRegression(unittest.TestCase):
             delta=1.0,
             msg=f"PUA bullet must be positioned flush with right margin {box.x2}, found at {bullet_u.box.x2}"
         )
+
+    def test_arabic_presentation_forms_do_not_fall_back_to_source_font(self):
+        """Shaped Arabic must map to GoNoto even when the source face is serif."""
+        source_font = PdfFont(
+            font_id="source-serif",
+            name="SourceHanSerifCN-Regular",
+            serif=True,
+        )
+        for char in ("\ufe91", "\ufef3"):
+            with self.subTest(char=hex(ord(char))):
+                target_font = self.typesetting.font_mapper.map(source_font, char)
+                self.assertIsNotNone(target_font)
+                self.assertIn("gonotokurrent", target_font.font_id.lower())
+
+    def test_harfbuzz_arabic_run_preflight_preserves_clusters(self):
+        """HarfBuzz must shape a logical Arabic run without missing glyphs."""
+        target_font = self.typesetting.font_mapper.arabic_fonts[0]
+        shaped = shape_arabic_run("اللغة العربية", target_font.font_path)
+        self.assertIsNotNone(shaped)
+        self.assertFalse(shaped.has_missing_glyphs)
+        self.assertGreater(len(shaped.glyphs), 0)
+        # RTL shaping returns glyphs in visual order; clusters descend from the
+        # last logical character toward the first and must not be discarded.
+        clusters = [glyph.cluster for glyph in shaped.glyphs]
+        self.assertEqual(clusters, sorted(clusters, reverse=True))
+
+    def test_generated_arabic_never_inherits_source_han_font(self):
+        """Resolver ownership must be Arabic target font, not source PDF font."""
+        source_font = PdfFont(font_id="F1", name="SourceHanSerifCN-Regular")
+        typesetting = Typesetting(self.cfg)
+        paragraph = PdfParagraph(
+            box=Box(x=50.0, y=100.0, x2=300.0, y2=130.0),
+            xobj_id=-1,
+            pdf_paragraph_composition=[
+                PdfParagraphComposition(
+                    pdf_same_style_unicode_characters=PdfSameStyleUnicodeCharacters(
+                        unicode="إبان", pdf_style=PdfStyle(font_id="F1", font_size=10.0)
+                    )
+                )
+            ],
+        )
+        units = typesetting.create_typesetting_units(
+            paragraph, {"F1": source_font, **typesetting.font_mapper.fontid2font}
+        )
+        generated = units  # fixture contains Arabic only after shaping
+        self.assertTrue(generated)
+        self.assertTrue(all("gonotokurrent" in unit.font_id.lower() for unit in generated))
+
+    def test_final_font_audit_repairs_source_han_arabic_character(self):
+        """A preserved source character cannot bypass Arabic font ownership."""
+        from babeldoc.format.pdf.document_il import Cropbox, Page
+
+        source_char = PdfCharacter(
+            char_unicode="ﺍ",
+            pdf_character_id=0,
+            pdf_style=PdfStyle(font_id="SourceHanSerifCN-Regular.ttf", font_size=10.0),
+            box=Box(x=100.0, y=100.0, x2=108.0, y2=110.0),
+        )
+        page = Page(
+            page_number=7,
+            cropbox=Cropbox(box=Box(x=0.0, y=0.0, x2=595.0, y2=842.0)),
+            pdf_character=[source_char],
+        )
+        Typesetting(self.cfg)._audit_arabic_font_ownership(page)
+        self.assertIn("gonotokurrent", source_char.pdf_style.font_id.lower())
+        self.assertNotEqual(source_char.pdf_character_id, 0)
+
+    def test_render_boundary_recovers_source_han_presentation_form(self):
+        """The last renderer boundary must recover a leaked Arabic unit."""
+        typesetting = Typesetting(self.cfg)
+        source_font = typesetting.font_mapper.fonts["SourceHanSerifCN-Regular.ttf"]
+        target_font = typesetting.font_mapper.arabic_fonts[0]
+        unit = TypesettingUnit(
+            unicode="ﺍ",
+            font=source_font,
+            arabic_fallback_font=target_font,
+            font_size=10.0,
+            style=PdfStyle(font_id=source_font.font_id, font_size=10.0),
+            xobj_id=-1,
+        )
+        unit.x, unit.y, unit.scale = 100.0, 100.0, 1.0
+        characters, _, _ = unit.render()
+        self.assertEqual(len(characters), 1)
+        self.assertIn("gonotokurrent", characters[0].pdf_style.font_id.lower())
+        self.assertNotEqual(characters[0].pdf_character_id, 0)
+
+    def test_generated_arabic_uses_page_level_xobject_fallback(self):
+        """Page text without an XObject ID must still produce Arabic units."""
+        from babeldoc.format.pdf.document_il import Cropbox, Page
+
+        page = Page(
+            page_number=1,
+            cropbox=Cropbox(box=Box(x=0.0, y=0.0, x2=595.0, y2=842.0)),
+        )
+        page.pdf_font = [self.base_font]
+        page.pdf_font[0].font_id = self.style.font_id
+        paragraph = PdfParagraph(
+            layout_label="paragraph",
+            box=Box(x=56.0, y=100.0, x2=540.0, y2=130.0),
+            # Deliberately omit xobj_id: this is the normal page-level case
+            # that triggered the reported assertion during preprocessing.
+            pdf_paragraph_composition=[
+                PdfParagraphComposition(
+                    pdf_same_style_unicode_characters=PdfSameStyleUnicodeCharacters(
+                        unicode="تعريف",
+                        pdf_style=self.style,
+                    )
+                )
+            ],
+        )
+        page.pdf_paragraph = [paragraph]
+
+        self.typesetting.render_page(page)
+
+        self.assertTrue(paragraph.pdf_paragraph_composition)
+        rendered = [
+            composition.pdf_character
+            for composition in paragraph.pdf_paragraph_composition
+            if composition.pdf_character
+        ]
+        self.assertTrue(rendered)
+        self.assertTrue(all(character.xobj_id == -1 for character in rendered))
+
+    def test_formula_placeholders_drop_non_printing_source_controls(self):
+        """Formula preservation must not render C0/C1 controls as boxes."""
+        formula = PdfFormula(pdf_character=[
+            PdfCharacter(char_unicode="2"),
+            PdfCharacter(char_unicode="\x00"),
+            PdfCharacter(char_unicode="9"),
+            PdfCharacter(char_unicode="\x03"),
+            PdfCharacter(char_unicode="th"),
+        ])
+
+        class FormulaEngine:
+            @staticmethod
+            def get_formular_placeholder(index):
+                return f"<f{index}>"
+
+        previous_engine = self.ilt.translate_engine
+        self.ilt.translate_engine = FormulaEngine()
+        try:
+            self.ilt.create_formula_placeholder(
+                formula, 1, PdfParagraph(unicode="body text")
+            )
+        finally:
+            self.ilt.translate_engine = previous_engine
+
+        self.assertEqual(
+            [char.char_unicode for char in formula.pdf_character],
+            ["2", "9", "th"],
+        )
+
+    def test_arabic_normalization_removes_decoder_control_tokens(self):
+        """NLLB control tokens around protected terms must never reach PDF output."""
+        normalized = self.ilt._normalize_arabic_output("معروف\x00 باسم\x03 BBAN")
+        self.assertEqual(normalized, "معروف باسم BBAN")
 
     # --------------------------------------------------------------------------
     # Bug Group 5: Check Digit Generation Formulas and Equations

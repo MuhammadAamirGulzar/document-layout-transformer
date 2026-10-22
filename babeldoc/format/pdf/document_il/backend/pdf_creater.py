@@ -665,12 +665,50 @@ class PDFCreater:
         """Convert all renderable objects in a page to render units."""
         render_units = []
 
-        # Collect all characters (from page and paragraphs)
-        chars = []
-        if page.pdf_character:
-            chars.extend(page.pdf_character)
+        # Collect all characters. A paragraph composition can retain a reference
+        # to the same source character as page.pdf_character; emitting both was
+        # the root of several doubled definition lines. Paragraph ownership wins
+        # and exact duplicate page-level draw operations are discarded.
+        paragraph_chars = []
         for paragraph in page.pdf_paragraph:
-            chars.extend(self.render_paragraph_to_char(paragraph))
+            paragraph_chars.extend(self.render_paragraph_to_char(paragraph))
+
+        def character_signature(char: il_version_1.PdfCharacter):
+            box = char.box
+            style = char.pdf_style
+            return (
+                char.char_unicode,
+                char.pdf_character_id,
+                char.xobj_id,
+                getattr(style, "font_id", None),
+                round(box.x, 3) if box else None,
+                round(box.y, 3) if box else None,
+                round(box.x2, 3) if box else None,
+                round(box.y2, 3) if box else None,
+            )
+
+        paragraph_signatures = {character_signature(char) for char in paragraph_chars}
+        chars = [
+            char for char in page.pdf_character
+            if character_signature(char) not in paragraph_signatures
+        ]
+        chars.extend(paragraph_chars)
+
+        invalid = [
+            char for char in chars
+            if (
+                char.char_unicode not in (None, "\n")
+                and (
+                    char.pdf_character_id == 0
+                    or (len(char.char_unicode) == 1 and unicodedata.category(char.char_unicode) == "Cc")
+                )
+            )
+        ]
+        if invalid:
+            sample = ", ".join(repr(char.char_unicode) for char in invalid[:6])
+            raise RuntimeError(
+                f"PDF glyph preflight failed on page {page.page_number}: {len(invalid)} invalid glyph(s): {sample}"
+            )
 
         # Convert characters to render units
         for i, char in enumerate(chars):
@@ -699,13 +737,17 @@ class PDFCreater:
                     FormRenderUnit(form, render_order, sub_render_order)
                 )
 
-        # Convert rectangles to render units (only for OCR workaround or debug)
+        # Convert rectangles to render units.  ``translated_code_band`` is a
+        # production semantic component created by the RTL typesetter; normal
+        # source/debug rectangles remain governed by the existing safeguards.
         for i, rect in enumerate(page.pdf_rectangle):
             if (
                 translation_config.ocr_workaround
                 and not rect.debug_info
                 and rect.fill_background
-            ) or (translation_config.debug and rect.debug_info):
+            ) or (translation_config.debug and rect.debug_info) or (
+                rect.debug_info == "translated_code_band"
+            ):
                 render_order = getattr(
                     rect, "render_order", 10
                 )  # Rectangles render first

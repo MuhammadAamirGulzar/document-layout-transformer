@@ -5,6 +5,7 @@ import json
 import logging
 import re
 import threading
+import unicodedata
 from pathlib import Path
 
 import tiktoken
@@ -434,8 +435,10 @@ class ILTranslator:
 
         return text
 
-    def _translate_with_line_preservation(self, text: str, rate_limit_params: dict) -> str:
-        """Translate text while preserving newline structure for chart legends and tables."""
+    def _translate_with_line_preservation(
+        self, text: str, rate_limit_params: dict, force_preserve_lines: bool = False
+    ) -> str:
+        """Translate text while preserving semantic source line structure."""
         if not text:
             return text
 
@@ -452,7 +455,11 @@ class ILTranslator:
 
         # Only preserve lines for short labels/legends/table cells or TOC entries
         is_toc_block = any(toc_leader_pattern.match(l.strip()) for l in non_empty)
-        is_short_labels = (len(non_empty) > 1 and max(len(l.split()) for l in non_empty) <= 6) or is_toc_block
+        is_short_labels = (
+            force_preserve_lines
+            or (len(non_empty) > 1 and max(len(l.split()) for l in non_empty) <= 6)
+            or is_toc_block
+        )
 
         if is_short_labels:
             translated_lines = []
@@ -499,6 +506,28 @@ class ILTranslator:
 
             return self.translate_engine.translate(normalized_text, rate_limit_params=rate_limit_params)
 
+    @staticmethod
+    def _structured_source_lines(paragraph: PdfParagraph) -> str | None:
+        """Recover visual source lines for structured one-paragraph blocks.
+
+        ``get_paragraph_unicode`` intentionally flattens PDF line boundaries.
+        That is correct for prose, but destructive for contact cards where each
+        visual row is an independent field.  Rebuild only from real PdfLine
+        compositions and leave mixed formula/rich-text paragraphs untouched.
+        """
+        lines: list[tuple[float, float, str]] = []
+        for composition in paragraph.pdf_paragraph_composition or []:
+            line = composition.pdf_line
+            if not line or not line.box or not line.pdf_character:
+                continue
+            value = get_char_unicode_string(line.pdf_character).strip()
+            if value:
+                lines.append((line.box.y2, line.box.x, value))
+        if len(lines) < 2:
+            return None
+        lines.sort(key=lambda item: (-item[0], item[1]))
+        return "\n".join(value for _, _, value in lines)
+
     def _normalize_arabic_output(self, text: str) -> str:
         """Post-translation normalization for Arabic text.
 
@@ -521,6 +550,25 @@ class ILTranslator:
         is_arabic = any(marker in lang_out for marker in ["ar", "arabic", "ara"])
         if not is_arabic:
             return text
+
+        # Extraction can isolate the quantifier from the rest of its sentence
+        # as a one-word paragraph.  In Arabic output this is unambiguously the
+        # quantifier "all", never a financial identifier.
+        if text.strip().lower() == "all":
+            return "جميع"
+
+        # Some seq2seq decoders occasionally emit C0 control tokens around
+        # protected ordinal / acronym placeholders. Unlike source controls,
+        # these are not layout spaces: PDF writers render them as .notdef
+        # boxes. Remove them before rich-text parsing and font selection.
+        # Newlines encode records in procedures and contact cards.  They are
+        # deliberately retained as layout metadata; all other control bytes
+        # are decoder noise and would render as .notdef glyphs.
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+        text = "".join(
+            char for char in text
+            if char in {"\n", "\t"} or unicodedata.category(char) != "Cc"
+        )
 
         # 1. Normalize percent signs: replace Western % with Arabic ٪
         text = text.replace('%', '\u066A')  # U+066A = Arabic percent sign ٪
@@ -578,6 +626,24 @@ class ILTranslator:
 
         # 10. Insert spaces at Arabic letters ↔ Latin/digit script boundaries (excluding Arabic percent sign \u066A)
         ar_letters = r'[\u0621-\u064A\u066E-\u06D3\u06D5\uFB50-\uFDFF\uFE70-\uFEFF]'
+        # NLLB occasionally leaves a standalone English quantifier at the
+        # beginning of an otherwise Arabic sentence (for example, "All البنوك").
+        # It is neither a protected financial identifier nor useful LTR
+        # content, and it destabilizes the line BiDi run. Normalize only this
+        # Arabic-context form; do not touch genuine English-only content.
+        text = re.sub(
+            r'\bAll(?=(?:[\s\u200e\u200f])+' + ar_letters + r')',
+            'جميع', text, flags=re.IGNORECASE,
+        )
+        # Isolate banking formulas and code chains as LTR runs inside Arabic.
+        # This protects the visual order of "MOD 97", division signs and
+        # equals signs without translating or reordering their operands.
+        ltr_formula = re.compile(
+            r'(?<![A-Za-z0-9])(?:[A-Z]{2}\d{2}[A-Z0-9]{11,30}|[A-Z]{2}\d{2}|'
+            r'[A-Z0-9]{12,35}|(?:\d+\s*[/÷+*×]\s*\d+|\d{2,}\s*-\s*\d+)(?:\s*=\s*\d+)?|'
+            r'MOD\s*\d+(?:-\d+)?)(?![A-Za-z0-9])'
+        )
+        text = ltr_formula.sub(lambda match: f"\u200E{match.group(0)}\u200E", text)
         text = re.sub(rf'({ar_letters})([A-Za-z0-9])', r'\1 \2', text)
         text = re.sub(rf'([A-Za-z0-9])({ar_letters})', r'\1 \2', text)
 
@@ -596,8 +662,9 @@ class ILTranslator:
         text = re.sub(r'(\b(?:بنك|مصرف|الدولي|القطري|الوطني)[\u0600-\u06FF\s]*?)[,،](\s*[\u0600-\u06FF])', r'\1\2', text)
         text = re.sub(r'(\b[\u0600-\u06FF]+)\s*,\s*([\u0600-\u06FF]+\b)', r'\1 \2', text)
 
-        # 14. Collapse multiple spaces to single space
-        text = re.sub(r'  +', ' ', text).strip()
+        # 14. Collapse horizontal whitespace only.  Do not flatten line
+        # records that were intentionally preserved above.
+        text = re.sub(r'[^\S\r\n]{2,}', ' ', text).strip()
 
         return text
 
@@ -732,6 +799,17 @@ class ILTranslator:
         formula_id: int,
         paragraph: PdfParagraph,
     ):
+        # Formula regions are preserved byte-for-byte, so control characters
+        # from a damaged source text stream bypass normal translation cleanup
+        # and become visible .notdef squares in the PDF. They have no semantic
+        # value in a mathematical formula; discard only C0/C1 controls while
+        # retaining every printable symbol, number, and layout coordinate.
+        formula.pdf_character[:] = [
+            char
+            for char in formula.pdf_character
+            if not char.char_unicode
+            or unicodedata.category(char.char_unicode[0]) != "Cc"
+        ]
         placeholder = self.translate_engine.get_formular_placeholder(formula_id)
         if isinstance(placeholder, tuple):
             placeholder, regex_pattern = placeholder
@@ -1076,29 +1154,26 @@ class ILTranslator:
                     re.IGNORECASE,
                 ).group(1)
 
-                if isinstance(
-                    placeholder.composition,
-                    PdfSameStyleCharacters,
-                ) and text.replace(" ", "") == "".join(
-                    x.char_unicode for x in placeholder.composition.pdf_character
-                ).replace(
-                    " ",
-                    "",
-                ):
-                    comp = PdfParagraphComposition(
-                        pdf_same_style_characters=placeholder.composition,
-                    )
-                else:
-                    comp = PdfParagraphComposition()
-                    comp.pdf_same_style_unicode_characters = (
-                        PdfSameStyleUnicodeCharacters()
-                    )
-                    comp.pdf_same_style_unicode_characters.pdf_style = (
-                        placeholder.composition.pdf_style
-                    )
-                    comp.pdf_same_style_unicode_characters.unicode = remove_placeholder(
-                        text,
-                    )
+                # A rich-text placeholder may be returned byte-for-byte (IBAN,
+                # BIC, acronyms, or an untranslated English fragment).  It must
+                # still be emitted as Unicode, rather than reusing the source
+                # PdfCharacter objects.  Reusing them bypasses FontMapper and
+                # TypesettingUnit's line layout, leaving Arabic presentation
+                # forms, LRM/RLM, and text at their original source coordinates
+                # in fonts such as SourceHan that have no Arabic glyphs.
+                #
+                # Keep the source style metadata, but always let the target
+                # typesetter select and subset the Arabic-capable target font.
+                comp = PdfParagraphComposition()
+                comp.pdf_same_style_unicode_characters = (
+                    PdfSameStyleUnicodeCharacters()
+                )
+                comp.pdf_same_style_unicode_characters.pdf_style = (
+                    placeholder.composition.pdf_style
+                )
+                comp.pdf_same_style_unicode_characters.unicode = remove_placeholder(
+                    text,
+                )
                 result.append(comp)
 
             last_end = match.end()
@@ -1135,21 +1210,61 @@ class ILTranslator:
         )
         if not self.support_llm_translate:
             disable_rich_text_translate = True
+        layout_label = (paragraph.layout_label or "").lower()
+        if any(
+            marker in layout_label
+            for marker in ("contact_card", "procedure_step", "heading")
+        ):
+            # Structure already carries the hierarchy for these records.
+            # Rich-text placeholders can make a two-word heading or one-line
+            # field behave like several forced fragments after translation.
+            disable_rich_text_translate = True
 
         translate_input = self.get_translate_input(
             paragraph, page_font_map, disable_rich_text_translate
         )
         if not translate_input:
             return None, None
+        if any(
+            marker in layout_label
+            for marker in ("procedure_step", "heading")
+        ):
+            structured_text = self._structured_source_lines(paragraph)
+            if structured_text:
+                translate_input.unicode = structured_text
         tracker.set_input(translate_input.unicode)
         tracker.set_placeholders(translate_input.placeholders)
         text = translate_input.unicode
-        if len(text) < self.translation_config.min_text_length:
+        if (
+            len(text) < self.translation_config.min_text_length
+            and _is_pure_passthrough(text)
+        ):
             logger.debug(
                 f"Text too short to translate, skip. Text: {text}. Paragraph id: {paragraph.debug_id}."
             )
             return None, None
         return text, translate_input
+
+    def _translate_contact_field_directly(self, text: str) -> str | None:
+        """Translate a contact-field label while preserving its value exactly."""
+        if not (self.translation_config.lang_out or "").upper().startswith("AR"):
+            return None
+        match = re.match(
+            r"^\s*(tel(?:ephone)?|fax|e[ -]?mail|email)\s*[:：]\s*(.*?)\s*$",
+            text,
+            re.IGNORECASE | re.DOTALL,
+        )
+        if not match:
+            return None
+        key = re.sub(r"[ -]", "", match.group(1).lower())
+        label = {
+            "tel": "الهاتف",
+            "telephone": "الهاتف",
+            "fax": "الفاكس",
+            "email": "البريد الإلكتروني",
+        }[key]
+        value = match.group(2)
+        return f"{label}: {value}" if value else f"{label}:"
 
     def post_translate_paragraph(
         self,
@@ -1171,6 +1286,19 @@ class ILTranslator:
             tracker.last_llm_translate_tracker(),
         )
         for composition in paragraph.pdf_paragraph_composition:
+            if composition.pdf_same_style_unicode_characters:
+                value = composition.pdf_same_style_unicode_characters.unicode or ""
+                composition.pdf_same_style_unicode_characters.unicode = "".join(
+                    char for char in value
+                    if char in {"\n", "\t"} or unicodedata.category(char) != "Cc"
+                )
+            elif composition.pdf_formula:
+                composition.pdf_formula.pdf_character[:] = [
+                    char
+                    for char in composition.pdf_formula.pdf_character
+                    if not char.char_unicode
+                    or unicodedata.category(char.char_unicode[0]) != "Cc"
+                ]
             if (
                 composition.pdf_same_style_unicode_characters
                 and composition.pdf_same_style_unicode_characters.pdf_style is None
@@ -1367,6 +1495,7 @@ Now, please carefully read the following text to be translated and directly outp
                 if self.use_as_fallback:
                     # il translator llm only modifies unicode in some situations
                     paragraph.unicode = get_paragraph_unicode(paragraph)
+                source_unicode = paragraph.unicode
                 # Pre-translation processing
                 text, translate_input = self.pre_translate_paragraph(
                     paragraph, tracker, page_font_map, xobj_font_map
@@ -1377,7 +1506,16 @@ Now, please carefully read the following text to be translated and directly outp
                 logger.info(f"[{lbl}] Translating paragraph {paragraph.debug_id}: {text[:80] if text else ''}")
                 llm_translate_tracker = tracker.new_llm_translate_tracker()
                 # Perform translation
-                if self.support_llm_translate:
+                direct_contact_translation = (
+                    self._translate_contact_field_directly(
+                        source_unicode or text
+                    )
+                    if "contact_card" in lbl.lower()
+                    else None
+                )
+                if direct_contact_translation is not None:
+                    translated_text = direct_contact_translation
+                elif self.support_llm_translate:
                     llm_prompt = self.generate_prompt_for_llm(
                         text,
                         title_paragraph,
@@ -1399,6 +1537,10 @@ Now, please carefully read the following text to be translated and directly outp
                         rate_limit_params={
                             "paragraph_token_count": paragraph_token_count
                         },
+                        force_preserve_lines=any(
+                            marker in lbl.lower()
+                            for marker in ("procedure_step", "contact_card")
+                        ),
                     )
                 translated_text = self._normalize_arabic_output(translated_text)
                 translated_text = self.shape_arabic_text(translated_text)

@@ -19,8 +19,10 @@ from babeldoc.format.pdf.document_il import PdfParagraphComposition
 from babeldoc.format.pdf.document_il import PdfStyle
 from babeldoc.format.pdf.document_il import il_version_1
 from babeldoc.format.pdf.document_il.utils.fontmap import FontMapper
+from babeldoc.format.pdf.document_il.utils.arabic_shaper import shape_arabic_run
 from babeldoc.format.pdf.document_il.utils.formular_helper import update_formula_data
 from babeldoc.format.pdf.document_il.utils.layout_helper import box_to_tuple
+from babeldoc.format.pdf.document_il.utils.style_helper import GRAY80
 from babeldoc.format.pdf.translation_config import TranslationConfig
 from babeldoc.format.pdf.translation_config import WatermarkOutputMode
 from arabic_reshaper import reshape
@@ -28,6 +30,7 @@ import bidi.algorithm as ba
 
 
 logger = logging.getLogger(__name__)
+
 
 LINE_BREAK_REGEX = regex.compile(
     r"^["
@@ -100,15 +103,17 @@ class TypesettingUnit:
         formular: PdfFormula | None = None,
         unicode: str | None = None,
         font: pymupdf.Font | None = None,
+        arabic_fallback_font: pymupdf.Font | None = None,
         original_font: il_version_1.PdfFont | None = None,
         font_size: float | None = None,
         style: PdfStyle | None = None,
         xobj_id: int | None = None,
         debug_info: bool = False,
+        forced_line_break: bool = False,
     ):
-        assert (char is not None) + (formular is not None) + (
-            unicode is not None
-        ) == 1, "Only one of chars and formular can be not None"
+        assert forced_line_break or (
+            (char is not None) + (formular is not None) + (unicode is not None) == 1
+        ), "Only one of chars and formular can be not None"
         self.char = char
         self.formular = formular
         self.unicode = unicode
@@ -116,6 +121,11 @@ class TypesettingUnit:
         self.y = None
         self.scale = None
         self.debug_info = debug_info
+        # A newline is layout metadata, never a printable glyph.  Keeping it
+        # as an explicit unit lets structured procedures and contact cards
+        # retain their source records all the way to final typesetting.
+        self.forced_line_break = forced_line_break
+        self.arabic_fallback_font = arabic_fallback_font
 
         # Cache variables
         self.box_cache: Box | None = None
@@ -421,19 +431,54 @@ class TypesettingUnit:
 
     def calculate_box(self):
         if self.char:
-            box = copy.deepcopy(self.char.box)
+            # Some legacy producers omit the logical character box while
+            # retaining a visual box.  Prefer whichever geometry exists and
+            # keep a zero-area fallback so one malformed glyph cannot abort
+            # the complete document.
+            source_box = self.char.box
+            if source_box is None and self.char.visual_bbox:
+                source_box = self.char.visual_bbox.box
+            box = copy.deepcopy(source_box)
+            if box is None:
+                return Box(0, 0, 0, 0)
             if self.char.visual_bbox and self.char.visual_bbox.box:
                 box.y = self.char.visual_bbox.box.y
                 box.y2 = self.char.visual_bbox.box.y2
 
             return box
         elif self.formular:
-            return self.formular.box
+            if self.formular.box is not None:
+                return self.formular.box
+            # Broken formula annotations are common in generated forms and
+            # contact cards.  Recover their bounds from the actual painted
+            # children instead of dereferencing a missing formula box.
+            child_boxes = []
+            for char in self.formular.pdf_character or []:
+                child_box = char.box
+                if child_box is None and char.visual_bbox:
+                    child_box = char.visual_bbox.box
+                if child_box is not None:
+                    child_boxes.append(child_box)
+            for graphic in [
+                *(self.formular.pdf_curve or []),
+                *(self.formular.pdf_form or []),
+            ]:
+                if graphic.box is not None:
+                    child_boxes.append(graphic.box)
+            if child_boxes:
+                return Box(
+                    min(box.x for box in child_boxes),
+                    min(box.y for box in child_boxes),
+                    max(box.x2 for box in child_boxes),
+                    max(box.y2 for box in child_boxes),
+                )
+            return Box(0, 0, 0, 0)
         elif self.unicode:
             char_width = self.font.char_lengths(self.unicode, self.font_size)[0]
             if self.x is None or self.y is None or self.scale is None:
                 return Box(0, 0, char_width, self.font_size)
             return Box(self.x, self.y, self.x + char_width, self.y + self.font_size)
+        return Box(0, 0, 0, 0)
 
     @property
     def box(self):
@@ -619,6 +664,7 @@ class TypesettingUnit:
             new_unit = TypesettingUnit(
                 unicode=self.unicode,
                 font=self.font,
+                arabic_fallback_font=self.arabic_fallback_font,
                 original_font=self.original_font,
                 font_size=self.font_size * scale,
                 style=self.style,
@@ -767,27 +813,43 @@ class TypesettingUnit:
             # Calculate character width
             char_width = self.width
 
-            # Handle case when font is None or character lacks glyph
+            # A generated target character must never be emitted as glyph 0.
+            # A .notdef glyph corrupts both the visual PDF and its text layer;
+            # the resolver must choose a valid font before this point.
             ch_code = ord(self.unicode) if self.unicode else 0
-            if (0xE000 <= ch_code <= 0xF8FF) and (self.font is None or self.font.has_glyph(ch_code) == 0):
-                # Map PUA bullet to standard Unicode bullet (• U+2022)
+            if 0xE000 <= ch_code <= 0xF8FF:
+                # PUA codepoints are defined by the source font, not Unicode.
+                # Never emit one into the Arabic target font: map it to the
+                # portable standard bullet even when a source font happened to
+                # advertise a glyph for the PUA codepoint.
                 self.unicode = '•'
                 ch_code = 0x2022
 
-            if self.font is None:
-                logger.warning(
-                    f"No font available for character '{self.unicode}' (U+{ch_code:04X}), "
-                    f"using font_id='{self.font_id}' with glyph_id=0"
-                )
-                glyph_id = 0  # Use glyph 0 as fallback (usually .notdef)
-            else:
-                glyph_id = self.font.has_glyph(ch_code)
-                if glyph_id == 0 or glyph_id is None:
+            glyph_id = self.font.has_glyph(ch_code) if self.font is not None else 0
+            if (glyph_id == 0 or glyph_id is None) and self.arabic_fallback_font is not None:
+                fallback_glyph_id = self.arabic_fallback_font.has_glyph(ch_code)
+                if fallback_glyph_id:
                     logger.warning(
-                        f"Font '{self.font_id}' doesn't have glyph for character '{self.unicode}' (U+{ch_code:04X}), "
-                        f"using glyph_id=0"
+                        "Recovered target glyph %r (U+%04X) from %s using Arabic fallback %s",
+                        self.unicode,
+                        ch_code,
+                        self.font_id,
+                        self.arabic_fallback_font.font_id,
                     )
-                    glyph_id = 0
+                    self.font = self.arabic_fallback_font
+                    self.font_id = self.arabic_fallback_font.font_id
+                    glyph_id = fallback_glyph_id
+
+            if self.font is None:
+                logger.error("Target glyph resolver returned no font for %r (U+%04X)", self.unicode, ch_code)
+                raise RuntimeError(
+                    f"No target font for '{self.unicode}' (U+{ch_code:04X}); refusing .notdef output"
+                )
+            elif glyph_id == 0 or glyph_id is None:
+                logger.error("Target font %s lacks %r (U+%04X)", self.font_id, self.unicode, ch_code)
+                raise RuntimeError(
+                    f"Font '{self.font_id}' lacks '{self.unicode}' (U+{ch_code:04X}); refusing .notdef output"
+                )
 
             new_char = PdfCharacter(
                 pdf_character_id=glyph_id,
@@ -842,6 +904,122 @@ class Typesetting:
             or ("ARABIC" in self.lang_code)
             or ("ARA" in self.lang_code)
         )
+        # A page is traversed twice (preprocessing and rendering). Table geometry
+        # must be mirrored exactly once, before scale computation.
+        self._rtl_mirrored_table_pages: set[int] = set()
+        # ``Page`` is a slots dataclass, so per-page idempotency state belongs
+        # on the typesetter rather than being attached to the IL object.
+        self._vertical_collision_resolved_pages: set[int] = set()
+        self._rendered_collision_resolved_pages: set[int] = set()
+        self._heading_clearance_resolved_pages: set[int] = set()
+        self._translated_code_band_keys: set[tuple[int, int]] = set()
+
+    def _arabic_publication_font_size(
+        self,
+        paragraph: il_version_1.PdfParagraph,
+        source_size: float,
+    ) -> float:
+        """Return a stable, readable Arabic type scale for translated text.
+
+        Source PDFs often use several nearly-identical Latin sizes (and, on
+        presentation PDFs, individual words can inherit very large or very
+        small sizes).  Mirroring that noise into Arabic is the main reason a
+        translated page looks uneven.  Arabic publication typography instead
+        uses a small role-based scale: one body size, a modest heading step,
+        and intentionally smaller table/note text.  Layout still expands a
+        box before it reduces this size, so this normalisation cannot trade
+        visual consistency for clipped text.
+        """
+        if not self.is_arabic:
+            return source_size
+
+        label = (paragraph.layout_label or "").lower()
+        # Preserve the source hierarchy, but keep it narrow and predictable.
+        if any(marker in label for marker in ("title", "heading", "section")):
+            target_size = 14.0
+        elif any(marker in label for marker in ("caption", "footnote", "table_footnote")):
+            target_size = 9.5
+        elif "table" in label:
+            target_size = 9.5
+        else:
+            target_size = 11.5
+
+        # Noto Kurrent's Arabic has a smaller optical footprint than common
+        # Latin source fonts.  This is the final rendered target size, not a
+        # multiplier of a noisy source style, so every body paragraph matches.
+        return target_size
+
+    def _expand_structured_text_boxes(self, page: il_version_1.Page) -> None:
+        """Provide full-width lanes for structured records and short headings.
+
+        Structured blocks are identified from their content, not from a
+        document-specific page number.  Their English labels are frequently
+        painted in narrow fragments even though the surrounding section is a
+        full-width instruction area.  Expanding only these labelled records
+        prevents Arabic labels from shrinking and gives wrapped descriptions
+        a stable alignment while leaving tables and diagrams untouched.
+        """
+        if not page.cropbox or not page.cropbox.box:
+            return
+        page_box = page.cropbox.box
+        page_width = page_box.x2 - page_box.x
+        content_left = page_box.x + page_width * 0.055
+        content_right = page_box.x2 - page_width * 0.055
+        for paragraph in page.pdf_paragraph or []:
+            if not paragraph.box:
+                continue
+            label = (paragraph.layout_label or "").lower()
+            is_structured = any(
+                marker in label for marker in ("procedure_step", "contact_card")
+            )
+            is_narrow_heading = (
+                "heading" in label
+                and paragraph.box.x2 - paragraph.box.x < page_width * 0.60
+            )
+            if not (is_structured or is_narrow_heading):
+                continue
+            if self._is_fixed_table_paragraph(paragraph) and "table" in label:
+                continue
+            paragraph.box = Box(
+                min(paragraph.box.x, content_left),
+                paragraph.box.y,
+                max(paragraph.box.x2, content_right),
+                paragraph.box.y2,
+            )
+
+    def _reserve_formula_lane(self, page: il_version_1.Page) -> None:
+        """Keep Arabic prose out of a left-side equation/value lane.
+
+        Technical PDFs often paint calculations in a narrow LTR strip while
+        the explanatory text occupies the remaining RTL column.  Treating the
+        strip as ordinary text makes later reflow cross an implicit gutter.
+        This derives the gutter from isolated numeric/formula records instead
+        of relying on a page number or hard-coded coordinates.
+        """
+        if not self._is_arabic_output() or not page.cropbox or not page.cropbox.box:
+            return
+        page_box = page.cropbox.box
+        width = page_box.x2 - page_box.x
+        candidates = []
+        for paragraph in page.pdf_paragraph or []:
+            if not paragraph.box or self._is_paragraph_inside_table(paragraph, page):
+                continue
+            text = (paragraph.unicode or "").strip()
+            label = (paragraph.layout_label or "").lower()
+            is_ltr_value = bool(re.fullmatch(r"[A-Za-z0-9\s./=+\-()]+", text)) and any(c.isdigit() for c in text)
+            if ("formula" in label or is_ltr_value) and paragraph.box.x2 <= page_box.x + width * 0.48:
+                candidates.append(paragraph.box.x2)
+        if len(candidates) < 2:
+            return
+        lane_right = max(candidates) + width * 0.035
+        for paragraph in page.pdf_paragraph or []:
+            if not paragraph.box or self._is_paragraph_inside_table(paragraph, page):
+                continue
+            text = (paragraph.unicode or "").strip()
+            label = (paragraph.layout_label or "").lower()
+            is_formula = "formula" in label or (bool(re.fullmatch(r"[A-Za-z0-9\s./=+\-()]+", text)) and any(c.isdigit() for c in text))
+            if not is_formula and paragraph.box.x < lane_right:
+                paragraph.box.x = min(lane_right, paragraph.box.x2 - width * 0.12)
 
     def preprocess_document(self, document: il_version_1.Document, pbar):
         """Preprocess document - calculate optimal scale for each paragraph and cache the result"""
@@ -850,6 +1028,7 @@ class Typesetting:
 
         for page in document.page:
             pbar.advance()
+            self._mirror_table_grids_for_rtl(page)
             # Build font dictionary for current page rendering logic
             fonts: dict[
                 str | int,
@@ -869,15 +1048,34 @@ class Typesetting:
                         ):
                             fonts[xobj.xobj_id][font.font_id] = font
 
+            # Finalize table geometry before measuring text. Adjusting cell
+            # heights after text placement creates the jagged/overlapping rows
+            # seen in the Qatar IBAN sample.
+            self._synchronize_table_row_heights(page)
             # Balance table row widths before optimal scale calculation
             self._balance_table_row_widths(page, fonts)
+            self._reserve_formula_lane(page)
+            # Labels such as ``Step 11`` are often extracted into a box only
+            # wide enough for the short English source.  Give every structured
+            # record the full text lane before Arabic measurement; otherwise
+            # the label is needlessly reduced to a microscopic scale.
+            self._expand_structured_text_boxes(page)
+            # A malformed source frequently gives a section label and its
+            # following body text intersecting fallback boxes.  Reserve the
+            # label's own vertical lane before either paragraph is measured;
+            # otherwise body expansion begins inside the label and the two
+            # Arabic runs are committed on the same baseline.
+            self._reserve_heading_clearance_from_tables(page)
+            self._resolve_vertical_paragraph_collisions(page)
 
             # Preprocess each paragraph
             for paragraph in page.pdf_paragraph:
                 all_paragraphs.append(paragraph)
                 unit_count = 0
                 try:
-                    typesetting_units = self.create_typesetting_units(paragraph, fonts)
+                    typesetting_units = self._deduplicate_artificial_header_units(
+                        paragraph, page, self.create_typesetting_units(paragraph, fonts)
+                    )
                     unit_count = len(typesetting_units)
                     for unit in typesetting_units:
                         if unit.formular:
@@ -979,6 +1177,44 @@ class Typesetting:
 
         return text
 
+    def _preflight_arabic_run(self, text: str, font: pymupdf.Font) -> None:
+        """Validate contextual shaping against the actual embedded target font.
+
+        HarfBuzz produces glyphs in visual order, while this engine performs
+        visual ordering only after line breaking.  The glyph plan is therefore
+        used as a validation/diagnostic pass here, not emitted directly.
+        """
+        if not self.is_arabic or not text or not getattr(font, "font_path", None):
+            return
+        # PUA symbols have source-font-specific semantics. They are canonicalized
+        # to U+2022 later by FontMapper; HarfBuzz must see the same portable text.
+        # Directional controls affect the renderer's later per-line BiDi pass and
+        # are intentionally excluded from this glyph-coverage-only check.
+        preflight_text = "".join(
+            "•" if 0xE000 <= ord(char) <= 0xF8FF else char
+            for char in text
+            if unicodedata.category(char) not in {"Cc", "Cf"}
+        )
+        if not preflight_text:
+            return
+        try:
+            shaped = shape_arabic_run(preflight_text, font.font_path)
+        except OSError as error:
+            logger.warning("HarfBuzz font preflight skipped for %s: %s", font.font_id, error)
+            return
+        if shaped is None:
+            return
+        if shaped.has_missing_glyphs:
+            raise RuntimeError(
+                f"HarfBuzz found missing glyphs in Arabic run for target font {font.font_id}: {text!r}"
+            )
+        logger.debug(
+            "HarfBuzz shaped Arabic run: font=%s glyphs=%d clusters=%d",
+            font.font_id,
+            len(shaped.glyphs),
+            len({glyph.cluster for glyph in shaped.glyphs}),
+        )
+
     def _commit_layout_to_paragraph(
         self,
         paragraph: il_version_1.PdfParagraph,
@@ -989,7 +1225,10 @@ class Typesetting:
         """Helper to write laid-out units into paragraph composition, curves, and forms."""
         paragraph.scale = scale
         paragraph.pdf_paragraph_composition = []
+        code_line_boxes: dict[int, list[Box]] = {}
         for unit in typeset_units:
+            if getattr(unit, "presentation_role", None) == "procedure_code" and unit.box:
+                code_line_boxes.setdefault(getattr(unit, "line_id", -1), []).append(unit.box)
             chars, curves, forms = unit.render()
             for char in chars:
                 paragraph.pdf_paragraph_composition.append(
@@ -999,6 +1238,51 @@ class Typesetting:
                 page.pdf_curve.append(curve)
             for form in forms:
                 page.pdf_form.append(form)
+
+        # Code/result rows are semantic content, not decorative leftovers.
+        # Draw a controlled neutral band behind the final Arabic glyph bounds
+        # so samples, IBANs and MOD-97 results read as one LTR unit.
+        for line_id, boxes in code_line_boxes.items():
+            key = (id(paragraph), line_id)
+            if key in self._translated_code_band_keys:
+                continue
+            self._translated_code_band_keys.add(key)
+            x1 = max(paragraph.box.x, min(box.x for box in boxes) - 5.0)
+            x2 = min(paragraph.box.x2, max(box.x2 for box in boxes) + 5.0)
+            y1 = min(box.y for box in boxes) - 2.0
+            y2 = max(box.y2 for box in boxes) + 2.0
+            if x2 > x1 and y2 > y1:
+                page.pdf_rectangle.append(
+                    il_version_1.PdfRectangle(
+                        box=Box(x1, y1, x2, y2),
+                        graphic_state=GRAY80,
+                        fill_background=True,
+                        # This sentinel is deliberately rendered in normal
+                        # production output by PDFCreator, unlike debug boxes.
+                        debug_info="translated_code_band",
+                        xobj_id=paragraph.xobj_id,
+                        render_order=15,
+                    )
+                )
+
+    @staticmethod
+    def _shift_laid_out_units_vertically(
+        units: list[TypesettingUnit], delta: float
+    ) -> list[TypesettingUnit]:
+        """Move a completed candidate layout without changing its scale."""
+        if delta <= 0.0:
+            return units
+        shifted: list[TypesettingUnit] = []
+        for unit in units:
+            if not unit.box:
+                shifted.append(unit)
+                continue
+            relocated = unit.relocate(unit.box.x, unit.box.y + delta, 1.0)
+            for attribute in ("line_id", "presentation_role"):
+                if hasattr(unit, attribute):
+                    setattr(relocated, attribute, getattr(unit, attribute))
+            shifted.append(relocated)
+        return shifted
 
     def _find_optimal_scale_and_layout(
         self,
@@ -1040,8 +1324,17 @@ class Typesetting:
         # Role-based minimum scale floors and relief floors to preserve typographic hierarchy
         layout_label = (paragraph.layout_label or "").lower()
         if "title" in layout_label or "heading" in layout_label:
-            min_scale = 0.88  # Headings normal floor
-            relief_floor = 0.78  # Relief floor if expansion is blocked
+            min_scale = 0.90  # Headings normal floor
+            relief_floor = 0.82  # Relief floor if expansion is blocked
+        elif "contact_card" in layout_label:
+            # A contact rectangle is a structured field block, not a footnote.
+            # It must remain readable even when its source box is oversized.
+            min_scale = 0.86
+            relief_floor = 0.76
+        elif "procedure_step" in layout_label:
+            # Keep a numbered instruction and its protected formula legible.
+            min_scale = 0.80
+            relief_floor = 0.70
         elif "caption" in layout_label:
             min_scale = 0.82
             relief_floor = 0.75  # Relief floor if expansion is blocked
@@ -1052,8 +1345,10 @@ class Typesetting:
             min_scale = 0.65
             relief_floor = 0.58
         else:
-            min_scale = 0.72  # Body text floor
-            relief_floor = 0.65
+            # Text is expanded/reflowed before reaching this relief floor.
+            # A readable body should never become a microscopic last resort.
+            min_scale = 0.82
+            relief_floor = 0.76
 
         best_typeset_units = None
         best_scale = scale
@@ -1188,8 +1483,20 @@ class Typesetting:
         # The paragraph must always be formatted.
         if best_typeset_units is not None and len(best_typeset_units) > 0:
             min_unit_y = min((u.box.y for u in best_typeset_units if u.box and u.box.y is not None), default=box.y)
+            safe_bottom = self.get_max_bottom_space(box, page) + safety_margin
+            if min_unit_y < safe_bottom:
+                delta = safe_bottom - min_unit_y
+                best_typeset_units = self._shift_laid_out_units_vertically(
+                    best_typeset_units, delta
+                )
+                min_unit_y = safe_bottom
             if min_unit_y < paragraph.box.y:
-                paragraph.box = Box(x=paragraph.box.x, y=min_unit_y - 2, x2=paragraph.box.x2, y2=paragraph.box.y2)
+                paragraph.box = Box(
+                    x=paragraph.box.x,
+                    y=max(min_unit_y, safe_bottom),
+                    x2=paragraph.box.x2,
+                    y2=paragraph.box.y2,
+                )
             if apply_layout:
                 self._commit_layout_to_paragraph(paragraph, page, best_typeset_units, best_scale)
                 final_typeset_units = best_typeset_units
@@ -1207,8 +1514,20 @@ class Typesetting:
             )
             if typeset_units:
                 min_unit_y = min((u.box.y for u in typeset_units if u.box and u.box.y is not None), default=box.y)
+                safe_bottom = self.get_max_bottom_space(box, page) + safety_margin
+                if min_unit_y < safe_bottom:
+                    delta = safe_bottom - min_unit_y
+                    typeset_units = self._shift_laid_out_units_vertically(
+                        typeset_units, delta
+                    )
+                    min_unit_y = safe_bottom
                 if min_unit_y < paragraph.box.y:
-                    paragraph.box = Box(x=paragraph.box.x, y=min_unit_y - 2, x2=paragraph.box.x2, y2=paragraph.box.y2)
+                    paragraph.box = Box(
+                        x=paragraph.box.x,
+                        y=max(min_unit_y, safe_bottom),
+                        x2=paragraph.box.x2,
+                        y2=paragraph.box.y2,
+                    )
                 if apply_layout:
                     self._commit_layout_to_paragraph(paragraph, page, typeset_units, relief_floor)
                 return relief_floor, typeset_units
@@ -1358,9 +1677,7 @@ class Typesetting:
                         continue
                     p_lower = para_map[para_id]
                     if not (
-                        p_lower.box
-                        and p_upper.box
-                        and p_lower.box.x2 < p_upper.box.x
+                        p_lower.box.x2 < p_upper.box.x
                         or p_lower.box.x > p_upper.box.x2
                     ):
                         conflicting_paras.append(p_lower)
@@ -1379,8 +1696,13 @@ class Typesetting:
             logger.warning(
                 f"Failed to adjust paragraph positions on page {page.page_number}: {e}"
             )
+        # A direct render_page() call (used by tests and API retries) may not
+        # have passed through preprocessing, so finalize table geometry here too.
+        self._synchronize_table_row_heights(page)
         # Balance table row widths before rendering
         self._balance_table_row_widths(page, fonts)
+        self._reserve_heading_clearance_from_tables(page)
+        self._resolve_vertical_paragraph_collisions(page)
 
         # Mirror decorative header banners (colored rectangles) horizontally for RTL
         self._mirror_header_decorations(page)
@@ -1388,9 +1710,473 @@ class Typesetting:
         # Start typesetting layout rendering
         for paragraph in page.pdf_paragraph:
             self.render_paragraph(paragraph, page, fonts)
+        self._audit_arabic_font_ownership(page)
+        self._resolve_rendered_text_collisions(page)
 
-        # Synchronize row heights across all cells in each table row
-        self._synchronize_table_row_heights(page)
+    @staticmethod
+    def _is_fixed_table_paragraph(paragraph: il_version_1.PdfParagraph) -> bool:
+        """Whether a paragraph owns a physical cell in a preserved table grid."""
+        return "table" in (paragraph.layout_label or "").lower()
+
+    @staticmethod
+    def _is_heading_paragraph(paragraph: il_version_1.PdfParagraph) -> bool:
+        label = (paragraph.layout_label or "").lower()
+        return any(marker in label for marker in ("title", "heading", "section", "label"))
+
+    def _reserve_heading_clearance_from_tables(self, page: il_version_1.Page) -> None:
+        """Keep headings outside ruled table grids.
+
+        A table is immutable once its ruled-cell geometry has been recovered.
+        If a source heading slightly intrudes into the grid, move the heading
+        upward before body collision handling rather than moving table cells or
+        permitting the Arabic baseline to touch the top border.
+        """
+        page_key = id(page)
+        if page_key in self._heading_clearance_resolved_pages:
+            return
+
+        headings = [p for p in page.pdf_paragraph or [] if p.box and self._is_heading_paragraph(p)]
+        cells = [
+            p for p in page.pdf_paragraph or []
+            if p.box and self._is_fixed_table_paragraph(p)
+        ]
+        if not headings or not cells:
+            self._heading_clearance_resolved_pages.add(page_key)
+            return
+
+        page_top = page.cropbox.box.y2 if page.cropbox and page.cropbox.box else None
+        for heading in headings:
+            candidates = []
+            for cell in cells:
+                horizontal_overlap = max(
+                    0.0, min(heading.box.x2, cell.box.x2) - max(heading.box.x, cell.box.x)
+                )
+                if horizontal_overlap < min(heading.box.x2 - heading.box.x, cell.box.x2 - cell.box.x) * 0.20:
+                    continue
+                # The top row of a table is below the heading in PDF reading
+                # order (smaller y), or may just touch its lower bound.
+                if cell.box.y2 <= heading.box.y2 + 8.0:
+                    candidates.append(cell.box.y2)
+            if not candidates:
+                continue
+            table_top = max(candidates)
+            required_bottom = table_top + 5.0
+            if heading.box.y >= required_bottom:
+                continue
+            shift_up = required_bottom - heading.box.y
+            if page_top is not None:
+                shift_up = min(shift_up, max(0.0, page_top - heading.box.y2 - 2.0))
+            if shift_up > 0.01:
+                heading.box = Box(
+                    heading.box.x, heading.box.y + shift_up,
+                    heading.box.x2, heading.box.y2 + shift_up,
+                )
+                logger.info(
+                    "Raised heading %s by %.1fpt to clear ruled table on page %s.",
+                    getattr(heading, "debug_id", "?"), shift_up, page.page_number,
+                )
+        self._heading_clearance_resolved_pages.add(page_key)
+
+    def _deduplicate_artificial_header_units(
+        self,
+        paragraph: il_version_1.PdfParagraph,
+        page: il_version_1.Page,
+        units: list[TypesettingUnit],
+    ) -> list[TypesettingUnit]:
+        """Collapse extraction-created doubled glyphs in a running header.
+
+        Some PDFs paint the header text twice.  The source looks acceptable in
+        its original font but the two independent glyph streams become visibly
+        doubled after font substitution.  This deliberately acts only on a
+        header/footer when the majority of ASCII letters are paired; ordinary
+        words such as ``All`` or legitimate double letters are untouched.
+        """
+        printable = [u for u in units if not u.forced_line_break and u.try_get_unicode()]
+        if len(printable) < 6:
+            return units
+        chars = [u.try_get_unicode() or "" for u in printable]
+        raw_text = "".join(chars)
+        # Some legacy PDFs do not label their running header and place it just
+        # outside the generic top-band threshold.  A strongly doubled IBAN
+        # banner is still unambiguously a header, never body prose.
+        compact_probe = re.sub(r'([A-Za-z])\1', r'\1', raw_text)
+        looks_like_iban_banner = bool(re.search(r'IBAN\s*Standards|IBAN.*Ver', compact_probe, re.I))
+        if not self._is_header_or_footer(paragraph, page) and not looks_like_iban_banner:
+            return units
+        # The IBAN banner sometimes duplicates only punctuation and digits
+        # (``Ver.. 22.. 00 --``), which does not meet the paired-letter ratio
+        # below.  Those repeats are never meaningful in this fixed banner.
+        if looks_like_iban_banner:
+            collapsed_banner: list[TypesettingUnit] = []
+            for unit in units:
+                value = unit.try_get_unicode() or ""
+                if (
+                    collapsed_banner
+                    and value
+                    and value == (collapsed_banner[-1].try_get_unicode() or "")
+                    and not value.isalpha()
+                ):
+                    continue
+                collapsed_banner.append(unit)
+            units = collapsed_banner
+            # Broken duplicate streams also leave synthetic spaces around the
+            # decimal point (``Ver. 2. 0``).  Remove only whitespace whose
+            # nearest printable neighbours form digit-dot or dot-digit; normal
+            # word spacing in the banner is preserved.
+            compact_banner: list[TypesettingUnit] = []
+            for unit_index, unit in enumerate(units):
+                value = unit.try_get_unicode() or ""
+                if value.isspace():
+                    previous = next(
+                        (
+                            units[i].try_get_unicode() or ""
+                            for i in range(unit_index - 1, -1, -1)
+                            if (units[i].try_get_unicode() or "").strip()
+                        ),
+                        "",
+                    )
+                    following = next(
+                        (
+                            units[i].try_get_unicode() or ""
+                            for i in range(unit_index + 1, len(units))
+                            if (units[i].try_get_unicode() or "").strip()
+                        ),
+                        "",
+                    )
+                    if (previous.isdigit() and following == ".") or (
+                        previous == "." and following.isdigit()
+                    ):
+                        continue
+                compact_banner.append(unit)
+            units = compact_banner
+            printable = [u for u in units if not u.forced_line_break and u.try_get_unicode()]
+            chars = [u.try_get_unicode() or "" for u in printable]
+        latin_count = sum(char.isascii() and char.isalpha() for char in chars)
+        if not latin_count:
+            return units
+
+        paired = 0
+        index = 0
+        while index < len(chars):
+            end = index + 1
+            while end < len(chars) and chars[end] == chars[index]:
+                end += 1
+            run_length = end - index
+            if chars[index].isascii() and chars[index].isalpha() and run_length >= 2 and run_length % 2 == 0:
+                paired += run_length
+            index = end
+        if paired / latin_count < 0.70:
+            return units
+
+        result: list[TypesettingUnit] = []
+        index = 0
+        while index < len(units):
+            unit = units[index]
+            char = unit.try_get_unicode() or ""
+            if not (char.isascii() and char.isalpha()):
+                result.append(unit)
+                index += 1
+                continue
+            end = index + 1
+            while end < len(units) and (units[end].try_get_unicode() or "") == char:
+                end += 1
+            run_length = end - index
+            if run_length >= 2 and run_length % 2 == 0:
+                result.extend(units[index:end:2])
+            else:
+                result.extend(units[index:end])
+            index = end
+        logger.info("Collapsed doubled running-header glyph stream for paragraph %s.", getattr(paragraph, "debug_id", "?"))
+        return result
+
+    def _resolve_vertical_paragraph_collisions(self, page: il_version_1.Page) -> None:
+        """Reserve vertical lanes for overlapping non-table text regions.
+
+        PDF extraction boxes are hints, not a reliable reading-order contract.
+        In particular, a numbered heading may overlap the first fallback body
+        line.  Arabic reflow makes the error conspicuous because both runs are
+        right aligned.  Process regions from top to bottom, treating headings
+        and ruled-table cells as fixed obstacles, and move only movable prose
+        below the nearest occupied lane.
+
+        The operation is intentionally idempotent.  ``render_page`` invokes it
+        as a safe direct-call path after ``preprocess_document`` has already
+        applied it during normal translation.
+        """
+        page_key = id(page)
+        if page_key in self._vertical_collision_resolved_pages:
+            return
+
+        valid = [
+            paragraph
+            for paragraph in page.pdf_paragraph or []
+            if paragraph.box
+            and all(value is not None for value in (
+                paragraph.box.x, paragraph.box.y, paragraph.box.x2, paragraph.box.y2
+            ))
+        ]
+        if len(valid) < 2:
+            self._vertical_collision_resolved_pages.add(page_key)
+            return
+
+        def order_key(paragraph: il_version_1.PdfParagraph) -> tuple[float, int]:
+            # PDF y increases upward, therefore greatest y2 appears first.
+            # A heading wins a same-baseline tie over its body paragraph.
+            return (-paragraph.box.y2, 0 if self._is_heading_paragraph(paragraph) else 1)
+
+        occupied: list[il_version_1.PdfParagraph] = []
+        moved = 0
+        for paragraph in sorted(valid, key=order_key):
+            # Physical table cells already have a ruled grid and synchronized
+            # row heights.  They must act as obstacles but never be shifted.
+            if not self._is_fixed_table_paragraph(paragraph):
+                required_shift = 0.0
+                for blocker in occupied:
+                    if not blocker.box:
+                        continue
+                    horizontal_overlap = max(
+                        0.0,
+                        min(paragraph.box.x2, blocker.box.x2) - max(paragraph.box.x, blocker.box.x),
+                    )
+                    min_width = max(1.0, min(
+                        paragraph.box.x2 - paragraph.box.x,
+                        blocker.box.x2 - blocker.box.x,
+                    ))
+                    # Independent columns can share vertical space.  A modest
+                    # overlap threshold still catches a narrow section number
+                    # placed beside a wide body box.
+                    if horizontal_overlap < min_width * 0.25:
+                        continue
+                    gap = 5.0 if (
+                        self._is_heading_paragraph(paragraph)
+                        or self._is_heading_paragraph(blocker)
+                    ) else 3.0
+                    allowed_top = blocker.box.y - gap
+                    if paragraph.box.y2 > allowed_top:
+                        required_shift = max(required_shift, paragraph.box.y2 - allowed_top)
+
+                if required_shift > 0.01:
+                    paragraph.box = Box(
+                        paragraph.box.x,
+                        paragraph.box.y - required_shift,
+                        paragraph.box.x2,
+                        paragraph.box.y2 - required_shift,
+                    )
+                    moved += 1
+                    logger.info(
+                        "Reserved vertical lane for paragraph %s on page %s (shift %.1fpt).",
+                        getattr(paragraph, "debug_id", "?"), page.page_number, required_shift,
+                    )
+            occupied.append(paragraph)
+
+        self._vertical_collision_resolved_pages.add(page_key)
+        if moved:
+            logger.info("Resolved %d overlapping paragraph lane(s) on page %s.", moved, page.page_number)
+
+    @staticmethod
+    def _rendered_text_box(paragraph: il_version_1.PdfParagraph) -> Box | None:
+        """Return the real glyph bounds, independent of the source paragraph box."""
+        boxes: list[Box] = []
+        for composition in paragraph.pdf_paragraph_composition or []:
+            if composition.pdf_character and composition.pdf_character.box:
+                boxes.append(composition.pdf_character.box)
+            elif composition.pdf_formula:
+                for char in composition.pdf_formula.pdf_character or []:
+                    if char.box:
+                        boxes.append(char.box)
+        if not boxes:
+            return None
+        return Box(
+            min(box.x for box in boxes), min(box.y for box in boxes),
+            max(box.x2 for box in boxes), max(box.y2 for box in boxes),
+        )
+
+    @staticmethod
+    def _shift_rendered_paragraph_vertically(
+        paragraph: il_version_1.PdfParagraph, shift: float
+    ) -> None:
+        """Move already-rendered glyphs (and formula decorations) down together."""
+        def shift_box(box: Box | None) -> None:
+            if box:
+                box.y -= shift
+                box.y2 -= shift
+
+        shift_box(paragraph.box)
+        for composition in paragraph.pdf_paragraph_composition or []:
+            if composition.pdf_character:
+                char = composition.pdf_character
+                shift_box(char.box)
+                if char.visual_bbox:
+                    shift_box(char.visual_bbox.box)
+            elif composition.pdf_formula:
+                formula = composition.pdf_formula
+                for char in formula.pdf_character or []:
+                    shift_box(char.box)
+                    if char.visual_bbox:
+                        shift_box(char.visual_bbox.box)
+                for curve in formula.pdf_curve or []:
+                    shift_box(curve.box)
+
+    def _resolve_rendered_text_collisions(self, page: il_version_1.Page) -> None:
+        """Final export firewall for collisions caused by glyphs escaping source boxes.
+
+        Translation can expand text beyond the extraction box, so a box-only
+        preflight cannot prove visual safety.  Inspect the actual generated
+        glyphs and, for non-table prose, push the lower-priority block below
+        the collision.  Headings always win; tables remain immutable.
+        """
+        page_key = id(page)
+        if page_key in self._rendered_collision_resolved_pages:
+            return
+
+        paragraphs = [
+            paragraph for paragraph in page.pdf_paragraph or []
+            if not self._is_fixed_table_paragraph(paragraph)
+            and self._rendered_text_box(paragraph) is not None
+        ]
+        moved = 0
+        for _ in range(max(1, len(paragraphs))):
+            changed = False
+            rendered = {id(paragraph): self._rendered_text_box(paragraph) for paragraph in paragraphs}
+            for index, first in enumerate(paragraphs):
+                first_box = rendered[id(first)]
+                if first_box is None:
+                    continue
+                for second in paragraphs[index + 1:]:
+                    second_box = rendered[id(second)]
+                    if second_box is None:
+                        continue
+                    horizontal_overlap = max(
+                        0.0, min(first_box.x2, second_box.x2) - max(first_box.x, second_box.x)
+                    )
+                    vertical_overlap = max(
+                        0.0, min(first_box.y2, second_box.y2) - max(first_box.y, second_box.y)
+                    )
+                    min_width = max(1.0, min(first_box.x2 - first_box.x, second_box.x2 - second_box.x))
+                    if horizontal_overlap < min_width * 0.25 or vertical_overlap <= 0.25:
+                        continue
+
+                    if self._is_heading_paragraph(first):
+                        blocker, mover = first, second
+                    elif self._is_heading_paragraph(second):
+                        blocker, mover = second, first
+                    elif first_box.y2 >= second_box.y2:
+                        blocker, mover = first, second
+                    else:
+                        blocker, mover = second, first
+                    blocker_box = rendered[id(blocker)]
+                    mover_box = rendered[id(mover)]
+                    gap = 5.0 if self._is_heading_paragraph(blocker) else 3.0
+                    shift = max(0.0, mover_box.y2 - (blocker_box.y - gap))
+                    if shift <= 0.01:
+                        # The geometric order is inverted, but there is still
+                        # a collision: separate by the measured overlap.
+                        shift = vertical_overlap + gap
+                    self._shift_rendered_paragraph_vertically(mover, shift)
+                    moved += 1
+                    changed = True
+                    break
+                if changed:
+                    break
+            if not changed:
+                break
+
+        self._rendered_collision_resolved_pages.add(page_key)
+        if moved:
+            logger.warning(
+                "Resolved %d rendered glyph collision(s) on page %s.", moved, page.page_number
+            )
+
+    @staticmethod
+    def _is_arabic_output_character(value: str | None) -> bool:
+        if not value or len(value) != 1:
+            return False
+        codepoint = ord(value)
+        return (
+            0x0600 <= codepoint <= 0x06FF
+            or 0x0750 <= codepoint <= 0x077F
+            or 0x08A0 <= codepoint <= 0x08FF
+            or 0xFB50 <= codepoint <= 0xFDFF
+            or 0xFE70 <= codepoint <= 0xFEFF
+        )
+
+    def _audit_arabic_font_ownership(self, page: il_version_1.Page) -> None:
+        """Repair and verify Arabic glyph ownership immediately before export.
+
+        Some formula and layout branches preserve source ``PdfCharacter``
+        objects. This final IL audit is intentionally independent of those
+        branches: an Arabic glyph can only leave the typesetter in an embedded
+        Arabic target font, never in the Source Han font inherited from English.
+        """
+        if not self.is_arabic:
+            return
+
+        characters = list(page.pdf_character or [])
+        for paragraph in page.pdf_paragraph or []:
+            for composition in paragraph.pdf_paragraph_composition or []:
+                if composition.pdf_character:
+                    characters.append(composition.pdf_character)
+                elif composition.pdf_formula:
+                    characters.extend(composition.pdf_formula.pdf_character or [])
+
+        source_fonts = {
+            font.font_id: font
+            for font in page.pdf_font or []
+            if font.font_id
+        }
+        repaired = 0
+        for char in characters:
+            if not self._is_arabic_output_character(char.char_unicode):
+                continue
+            if not char.pdf_style:
+                raise RuntimeError(
+                    f"Arabic glyph {char.char_unicode!r} has no PDF style on page {page.page_number}"
+                )
+            current_font_id = char.pdf_style.font_id or ""
+            if "gonotokurrent" in current_font_id.lower():
+                continue
+            source_font = source_fonts.get(current_font_id)
+            target_font = (
+                self.font_mapper.map(source_font, char.char_unicode)
+                if source_font is not None
+                else None
+            )
+            if target_font is None:
+                target_font = next(
+                    (
+                        font for font in self.font_mapper.arabic_fonts
+                        if font.has_glyph(ord(char.char_unicode))
+                    ),
+                    None,
+                )
+            if target_font is None:
+                normalized = unicodedata.normalize("NFKC", char.char_unicode)
+                target_font = next(
+                    (
+                        font for font in self.font_mapper.arabic_fonts
+                        if len(normalized) == 1 and font.has_glyph(ord(normalized))
+                    ),
+                    None,
+                )
+                if target_font is not None:
+                    char.char_unicode = normalized
+            if target_font is None:
+                raise RuntimeError(
+                    f"No Arabic target-font coverage for {char.char_unicode!r} on page {page.page_number}"
+                )
+            style = copy.copy(char.pdf_style)
+            style.font_id = target_font.font_id
+            char.pdf_style = style
+            char.pdf_character_id = target_font.has_glyph(ord(char.char_unicode))
+            repaired += 1
+
+        if repaired:
+            logger.warning(
+                "Repaired %d Arabic glyph(s) that retained a source-font style on page %d",
+                repaired,
+                page.page_number,
+            )
+
 
     def _mirror_header_decorations(self, page: il_version_1.Page):
         """Mirror decorative header vector rectangles horizontally when rendering RTL."""
@@ -1990,10 +2776,151 @@ class Typesetting:
 
         return rows
 
+    @staticmethod
+    def _boxes_overlap_horizontally(left: Box, right: Box) -> bool:
+        return left.x < right.x2 and left.x2 > right.x
+
+    def _table_cell_groups(
+        self, page: il_version_1.Page
+    ) -> list[tuple[list[il_version_1.PdfParagraph], Box]]:
+        """Return table-cell groups with stable table bounds.
+
+        Prefer the layout parser's table region when it is available. The
+        fallback groups visually adjacent rows, which keeps independent tables
+        on the same page from being mirrored as one large table.
+        """
+        cells = [
+            p for p in page.pdf_paragraph
+            if p.box and self._is_table_cell(p, page)
+        ]
+        if not cells:
+            return []
+
+        groups: list[tuple[list[il_version_1.PdfParagraph], Box]] = []
+        assigned: set[int] = set()
+        for layout in getattr(page, "page_layout", []) or []:
+            layout_box = getattr(layout, "box", None)
+            if not layout_box or (getattr(layout, "class_name", "") or "").lower() not in {
+                "table", "wired_table", "wireless_table"
+            }:
+                continue
+            members = []
+            for cell in cells:
+                overlap_x = max(0.0, min(cell.box.x2, layout_box.x2) - max(cell.box.x, layout_box.x))
+                overlap_y = max(0.0, min(cell.box.y2, layout_box.y2) - max(cell.box.y, layout_box.y))
+                cell_area = max((cell.box.x2 - cell.box.x) * (cell.box.y2 - cell.box.y), 1.0)
+                if (overlap_x * overlap_y) / cell_area > 0.5:
+                    members.append(cell)
+                    assigned.add(id(cell))
+            if members:
+                groups.append((members, copy.deepcopy(layout_box)))
+
+        remaining_rows = []
+        for row in self._cluster_table_cells_into_rows(page):
+            row = [cell for cell in row if id(cell) not in assigned]
+            if row:
+                remaining_rows.append(row)
+
+        # Link rows only while their vertical gap is small and their horizontal
+        # ranges overlap. This accommodates colspan headers without joining a
+        # later, unrelated table.
+        for row in remaining_rows:
+            row_box = Box(
+                min(cell.box.x for cell in row),
+                min(cell.box.y for cell in row),
+                max(cell.box.x2 for cell in row),
+                max(cell.box.y2 for cell in row),
+            )
+            if groups:
+                members, group_box = groups[-1]
+                vertical_gap = max(0.0, group_box.y - row_box.y2)
+                row_height = max(row_box.y2 - row_box.y, 1.0)
+                group_height = max(group_box.y2 - group_box.y, 1.0)
+                if (
+                    vertical_gap <= max(18.0, min(row_height, group_height) * 1.5)
+                    and self._boxes_overlap_horizontally(group_box, row_box)
+                ):
+                    members.extend(row)
+                    groups[-1] = (
+                        members,
+                        Box(
+                            min(group_box.x, row_box.x),
+                            min(group_box.y, row_box.y),
+                            max(group_box.x2, row_box.x2),
+                            max(group_box.y2, row_box.y2),
+                        ),
+                    )
+                    continue
+            groups.append((list(row), row_box))
+
+        return groups
+
+    @staticmethod
+    def _mirror_box_within_table(box: Box, table_box: Box) -> None:
+        old_x, old_x2 = box.x, box.x2
+        box.x = table_box.x2 - (old_x2 - table_box.x)
+        box.x2 = table_box.x2 - (old_x - table_box.x)
+
+    def _mirror_table_grids_for_rtl(self, page: il_version_1.Page) -> None:
+        """Mirror cell geometry and table-local vector geometry for Arabic RTL.
+
+        Per-cell right alignment cannot reverse an LTR table. This pass reflects
+        every cell about its table bounds before layout, preserving column widths
+        and moving merged headers with their child columns.
+        """
+        if not self._is_arabic_output() or id(page) in self._rtl_mirrored_table_pages:
+            return
+
+        table_groups = self._table_cell_groups(page)
+        if not table_groups:
+            self._rtl_mirrored_table_pages.add(id(page))
+            return
+
+        for cells, table_box in table_groups:
+            # ParagraphFinder reconstructed these cells from the ruled grid.
+            # Their physical slots must stay aligned with the grid retained in
+            # the page base operations; only text inside each slot becomes RTL.
+            if cells and all(
+                "fixed_rtl" in (cell.layout_label or "").lower()
+                for cell in cells
+            ):
+                continue
+            for cell in cells:
+                self._mirror_box_within_table(cell.box, table_box)
+
+            # Tables may be represented by colored cell rectangles or by vector
+            # rules. Mirror only elements wholly contained in this table, leaving
+            # page decorations and charts untouched.
+            for rect in getattr(page, "pdf_rectangle", []) or []:
+                if rect.box and (
+                    rect.box.x >= table_box.x - 0.5
+                    and rect.box.x2 <= table_box.x2 + 0.5
+                    and rect.box.y >= table_box.y - 0.5
+                    and rect.box.y2 <= table_box.y2 + 0.5
+                ):
+                    self._mirror_box_within_table(rect.box, table_box)
+
+            for curve in getattr(page, "pdf_curve", []) or []:
+                if not curve.box or not (
+                    curve.box.x >= table_box.x - 0.5
+                    and curve.box.x2 <= table_box.x2 + 0.5
+                    and curve.box.y >= table_box.y - 0.5
+                    and curve.box.y2 <= table_box.y2 + 0.5
+                ):
+                    continue
+                self._mirror_box_within_table(curve.box, table_box)
+                for path in curve.pdf_path:
+                    if path.x is not None:
+                        path.x = table_box.x + table_box.x2 - path.x
+
+        self._rtl_mirrored_table_pages.add(id(page))
+
     def _balance_table_row_widths(self, page: il_version_1.Page, fonts: dict):
         """Redistribute unused horizontal space from sibling columns in the same row to overflowing cells."""
         rows = self._cluster_table_cells_into_rows(page)
         for row in rows:
+            if any("fixed_rtl" in (cell.layout_label or "").lower() for cell in row):
+                continue
             if len(row) < 2:
                 continue
 
@@ -2036,6 +2963,8 @@ class Typesetting:
         """Synchronize row height across all cells in each table row so the table does not look jagged."""
         rows = self._cluster_table_cells_into_rows(page)
         for row in rows:
+            if any("fixed_rtl" in (cell.layout_label or "").lower() for cell in row):
+                continue
             if len(row) < 2:
                 continue
 
@@ -2134,7 +3063,9 @@ class Typesetting:
             il_version_1.PdfFont | dict[str, il_version_1.PdfFont],
         ],
     ):
-        typesetting_units = self.create_typesetting_units(paragraph, fonts)
+        typesetting_units = self._deduplicate_artificial_header_units(
+            paragraph, page, self.create_typesetting_units(paragraph, fonts)
+        )
         
         # Check if Arabic output for RTL margin mirroring
         is_arabic_output = self._is_arabic_output()
@@ -2318,6 +3249,10 @@ class Typesetting:
             n = len(typesetting_units)
             while idx < n:
                 u = typesetting_units[idx]
+                if u.forced_line_break:
+                    tokens.append([u])
+                    idx += 1
+                    continue
                 u_str = u.try_get_unicode() or ""
                 if u.is_space:
                     tokens.append([u])
@@ -2331,6 +3266,8 @@ class Typesetting:
                     idx += 1
                     while idx < n:
                         next_u = typesetting_units[idx]
+                        if next_u.forced_line_break:
+                            break
                         next_str = next_u.try_get_unicode() or ""
                         if next_u.is_space or BULLET_POINT_PATTERN.match(next_str) or (next_str and 0xE000 <= ord(next_str[0]) <= 0xF8FF):
                             break
@@ -2363,6 +3300,17 @@ class Typesetting:
             current_line_w = 0.0
 
             for token_idx, token in enumerate(tokens):
+                # Explicit line boundaries originate from structured source
+                # records (Step N, calculation/result, contact fields).  They
+                # are semantic boundaries, so width-based wrapping must never
+                # collapse two records onto the same visual line.
+                if token[0].forced_line_break:
+                    while current_line_tokens and current_line_tokens[-1].is_space:
+                        current_line_tokens.pop()
+                    lines_tokens.append(current_line_tokens)
+                    current_line_tokens = []
+                    current_line_w = 0.0
+                    continue
                 # Dynamic Table of Contents leader dot adjustment:
                 # If this token is a run of leader dots (4+ dots) followed by a page number,
                 # dynamically resize the dot count so title + dots + page_number fills avail on a single line!
@@ -2450,6 +3398,11 @@ class Typesetting:
                 is_isolated_latin = (not has_arabic_chars) and bool(
                     re.match(r'^[A-Za-z0-9\s\-–—/._\(\)+:=#\$\€\£\¥\%\*]+$', line_str.strip())
                 )
+                is_procedure_code = (
+                    "procedure_step" in (paragraph.layout_label or "").lower()
+                    and is_isolated_latin
+                    and bool(re.search(r'\d|[A-Z]{4,}', line_str))
+                )
 
                 if is_chronological_axis or is_isolated_latin:
                     # Keep native LTR character order matching original code, formula, or timeline
@@ -2457,12 +3410,41 @@ class Typesetting:
                 elif line_str.strip():
                     bidi_map = get_bidi_indices_and_chars(line_str, base_dir='R')
                     visual_units = []
+                    visual_indices = []
                     for orig_idx, mirrored_char in bidi_map:
                         if orig_idx < len(line):
                             unit = copy.copy(line[orig_idx])
                             if mirrored_char and unit.unicode and unit.unicode != mirrored_char:
                                 unit.unicode = mirrored_char
                             visual_units.append(unit)
+                            visual_indices.append(orig_idx)
+
+                    # LRM-delimited formulas/codes are semantic LTR islands.
+                    # Unicode BiDi correctly places the island in an Arabic
+                    # line, but some extracted PDF runs still have their
+                    # operators reversed afterwards. Restore each island's
+                    # *logical* unit sequence without moving the island.
+                    marker = "\u200e"
+                    start = 0
+                    while True:
+                        left = line_str.find(marker, start)
+                        if left < 0:
+                            break
+                        right = line_str.find(marker, left + 1)
+                        if right < 0:
+                            break
+                        positions = [
+                            pos for pos, source_index in enumerate(visual_indices)
+                            if left < source_index < right
+                        ]
+                        if len(positions) > 1:
+                            ordered = sorted(
+                                (visual_indices[pos], visual_units[pos]) for pos in positions
+                            )
+                            for pos, (source_index, unit) in zip(positions, ordered):
+                                visual_indices[pos] = source_index
+                                visual_units[pos] = unit
+                        start = right + 1
                 else:
                     visual_units = line
 
@@ -2482,13 +3464,17 @@ class Typesetting:
                     current_indent = 0.0
 
                 # Determine starting X position
-                if is_chronological_axis or is_isolated_latin:
+                if is_chronological_axis:
                     line_start_x = box.x
                 elif is_table_content:
                     line_start_x = box.x2 - visual_line_w
                     if line_start_x < box.x:
                         line_start_x = box.x
                 else:
+                    # Codes, equations and section identifiers retain their
+                    # native LTR character order, but they are content of an
+                    # RTL paragraph.  Anchoring them at ``box.x`` placed them
+                    # on the English-side margin after mirroring.
                     line_start_x = (box.x2 - current_indent) - visual_line_w
                     if line_start_x < box.x:
                         line_start_x = box.x
@@ -2499,6 +3485,8 @@ class Typesetting:
                 for u in visual_units:
                     relocated = u.relocate(cur_x, current_y, scale)
                     relocated.line_id = line_idx
+                    if is_procedure_code:
+                        relocated.presentation_role = "procedure_code"
                     if is_table_content and relocated.box and relocated.box.x2 > box.x2 + 0.5:
                         all_units_fit = False
                     typeset_units.append(relocated)
@@ -2781,6 +3769,57 @@ class Typesetting:
         if not paragraph.pdf_paragraph_composition:
             return []
         result = []
+        # Page-level paragraphs are not inside an XObject.  The rest of the
+        # pipeline represents that case with -1 (rather than None), while a
+        # TypesettingUnit requires a concrete ownership ID for generated text.
+        paragraph_xobj_id = (
+            paragraph.xobj_id
+            if getattr(paragraph, "xobj_id", None) is not None
+            else -1
+        )
+        def resolve_unicode(source_font, value: str):
+            """Resolve a target character without ever accepting glyph 0.
+
+            Arabic reshaping can generate contextual presentation forms absent
+            from a target cmap. Only in that case, use its NFKC base letter;
+            supported presentation forms are retained for correct joining.
+            """
+            if len(value) != 1:
+                raise ValueError(f"Expected a single output character, got {value!r}")
+            if unicodedata.category(value) == "Cc":
+                return None, None
+            is_arabic_target = len(value) == 1 and (
+                0x0600 <= ord(value) <= 0x06FF
+                or 0x0750 <= ord(value) <= 0x077F
+                or 0x08A0 <= ord(value) <= 0x08FF
+                or 0xFB50 <= ord(value) <= 0xFDFF
+                or 0xFE70 <= ord(value) <= 0xFEFF
+            )
+            # A translated paragraph can inherit Source Han's style ID from
+            # the English PDF; that face must never become the output owner of
+            # Arabic glyphs. The source style is still a weight hint: a bold
+            # English heading must use GoNotoKurrent-Bold in Arabic.
+            if self.is_arabic and is_arabic_target:
+                weighted_target = self.font_mapper.map(source_font, value)
+                if weighted_target is not None:
+                    return value, weighted_target
+                for arabic_font in self.font_mapper.arabic_fonts:
+                    if arabic_font.has_glyph(ord(value)):
+                        return value, arabic_font
+            target_font = self.font_mapper.map(source_font, value)
+            if target_font is not None:
+                return value, target_font
+            normalized = unicodedata.normalize("NFKC", value)
+            if len(normalized) == 1 and normalized != value:
+                target_font = self.font_mapper.map(source_font, normalized)
+                if target_font is not None:
+                    return normalized, target_font
+            message = (
+                f"No target-font coverage for {value!r} in paragraph "
+                f"{getattr(paragraph, 'debug_id', None) or '<unknown>'}"
+            )
+            logger.error(message)
+            raise RuntimeError(message)
 
         @cache
         def get_font(font_id: str, xobj_id: int | None):
@@ -2790,27 +3829,63 @@ class Typesetting:
                 font = fonts[font_id]
             return font
 
+        def unit_from_source_char(char: il_version_1.PdfCharacter) -> TypesettingUnit:
+            """Retype portable bullets and Arabic glyphs in the target font."""
+            value = char.char_unicode or ""
+            is_pua_bullet = len(value) == 1 and 0xE000 <= ord(value) <= 0xF8FF
+            is_arabic_glyph = len(value) == 1 and (
+                0x0600 <= ord(value) <= 0x06FF
+                or 0x0750 <= ord(value) <= 0x077F
+                or 0x08A0 <= ord(value) <= 0x08FF
+                or 0xFB50 <= ord(value) <= 0xFDFF
+                or 0xFE70 <= ord(value) <= 0xFEFF
+            )
+            if (is_pua_bullet or (self.is_arabic and is_arabic_glyph)) and char.pdf_style:
+                style = char.pdf_style
+                char_xobj = (
+                    char.xobj_id
+                    if getattr(char, "xobj_id", None) is not None
+                    else (
+                        paragraph_xobj_id
+                    )
+                )
+                source_font = get_font(style.font_id, char_xobj)
+                target_value, target_font = resolve_unicode(
+                    source_font, "•" if is_pua_bullet else value
+                )
+                if target_value is None:
+                    return TypesettingUnit(char=char)
+                return TypesettingUnit(
+                    unicode=target_value,
+                    font=target_font,
+                    arabic_fallback_font=(self.font_mapper.arabic_fonts[0] if self.is_arabic else None),
+                    original_font=source_font,
+                    font_size=style.font_size,
+                    style=style,
+                    xobj_id=char_xobj,
+                    debug_info=getattr(paragraph, "debug_info", False) or False,
+                )
+            return TypesettingUnit(
+                char=char,
+                debug_info=getattr(paragraph, "debug_info", False) or False,
+            )
+
         for composition in paragraph.pdf_paragraph_composition:
             if composition is None:
                 continue
             if composition.pdf_line:
                 result.extend(
                     [
-                        TypesettingUnit(char=char)
+                        unit_from_source_char(char)
                         for char in composition.pdf_line.pdf_character
                     ],
                 )
             elif composition.pdf_character:
-                result.append(
-                    TypesettingUnit(
-                        char=composition.pdf_character,
-                        debug_info=paragraph.debug_info,
-                    ),
-                )
+                result.append(unit_from_source_char(composition.pdf_character))
             elif composition.pdf_same_style_characters:
                 result.extend(
                     [
-                        TypesettingUnit(char=char)
+                        unit_from_source_char(char)
                         for char in composition.pdf_same_style_characters.pdf_character
                     ],
                 )
@@ -2831,32 +3906,115 @@ class Typesetting:
                         f"Paragraph: {paragraph}. ",
                     )
                     continue
-                font = get_font(font_id, paragraph.xobj_id)
+                font = get_font(font_id, paragraph_xobj_id)
                 if composition.pdf_same_style_unicode_characters.unicode:
                     unicode_text = composition.pdf_same_style_unicode_characters.unicode
+                    self._preflight_arabic_run(unicode_text, self.font_mapper.arabic_fonts[0] if self.is_arabic else font)
                     shaped_text = self.shape_arabic_text(unicode_text)
                     optical_factor = 1.08 if self.is_arabic else 1.0
-                    result.extend(
-                        [
-                            TypesettingUnit(
-                                unicode=char_unicode,
-                                font=self.font_mapper.map(
-                                    font,
-                                    char_unicode,
-                                ),
-                                original_font=font,
-                                font_size=style.font_size * optical_factor,
-                                style=style,
-                                xobj_id=paragraph.xobj_id,
-                                debug_info=composition.pdf_same_style_unicode_characters.debug_info
-                                or False,
-                            )
-                            for char_unicode in shaped_text  # Use shaped_text instead of original
-                            if char_unicode not in ("\n",)
-                        ],
+                    target_font_size = self._arabic_publication_font_size(
+                        paragraph,
+                        style.font_size * optical_factor,
                     )
+                    for char_unicode in shaped_text:
+                        if char_unicode in "\r\n":
+                            if char_unicode == "\n":
+                                result.append(TypesettingUnit(forced_line_break=True))
+                            continue
+                        target_value, target_font = resolve_unicode(font, char_unicode)
+                        if target_value is None:
+                            continue
+                        result.append(
+                            TypesettingUnit(
+                                unicode=target_value,
+                                font=target_font,
+                                arabic_fallback_font=(self.font_mapper.arabic_fonts[0] if self.is_arabic else None),
+                                original_font=font,
+                                # Contact rectangles in older PDFs commonly
+                                # inherit a tiny label font.  A translated card
+                                # is a field block and must remain readable.
+                                font_size=max(
+                                    target_font_size,
+                                    11.5 if "contact_card" in (paragraph.layout_label or "").lower() else 0.0,
+                                ),
+                                style=style,
+                                xobj_id=paragraph_xobj_id,
+                                debug_info=composition.pdf_same_style_unicode_characters.debug_info or False,
+                            )
+                        )
             elif composition.pdf_formula:
-                result.extend([TypesettingUnit(formular=composition.pdf_formula)])
+                formula_chars = composition.pdf_formula.pdf_character or []
+                has_pua_bullet = any(
+                    char.char_unicode
+                    and len(char.char_unicode) == 1
+                    and 0xE000 <= ord(char.char_unicode) <= 0xF8FF
+                    for char in formula_chars
+                )
+                has_arabic_glyph = any(
+                    char.char_unicode
+                    and len(char.char_unicode) == 1
+                    and (
+                        0x0600 <= ord(char.char_unicode) <= 0x06FF
+                        or 0x0750 <= ord(char.char_unicode) <= 0x077F
+                        or 0x08A0 <= ord(char.char_unicode) <= 0x08FF
+                        or 0xFB50 <= ord(char.char_unicode) <= 0xFDFF
+                        or 0xFE70 <= ord(char.char_unicode) <= 0xFEFF
+                    )
+                    for char in formula_chars
+                )
+                formula_has_graphics = bool(
+                    composition.pdf_formula.pdf_curve or composition.pdf_formula.pdf_form
+                )
+                if has_pua_bullet and all(
+                    not char.char_unicode
+                    or char.char_unicode.isspace()
+                    or (
+                        len(char.char_unicode) == 1
+                        and 0xE000 <= ord(char.char_unicode) <= 0xF8FF
+                    )
+                    for char in formula_chars
+                ):
+                    result.extend(unit_from_source_char(char) for char in formula_chars)
+                elif has_arabic_glyph and not formula_has_graphics:
+                    # Text-only formulas are layout-parser false positives.
+                    # Retype them so shaped Arabic never falls back to Source Han.
+                    result.extend(unit_from_source_char(char) for char in formula_chars)
+                else:
+                    # A genuine formula may also contain Arabic labels and
+                    # presentation forms alongside its preserved graphics.
+                    # Keep its geometry, but remap those characters to the
+                    # embedded Arabic font instead of rendering .notdef from
+                    # the source serif font.
+                    if has_arabic_glyph:
+                        for char in formula_chars:
+                            value = char.char_unicode or ""
+                            if not (
+                                len(value) == 1
+                                and (
+                                    0x0600 <= ord(value) <= 0x06FF
+                                    or 0x0750 <= ord(value) <= 0x077F
+                                    or 0x08A0 <= ord(value) <= 0x08FF
+                                    or 0xFB50 <= ord(value) <= 0xFDFF
+                                    or 0xFE70 <= ord(value) <= 0xFEFF
+                                )
+                                and char.pdf_style
+                            ):
+                                continue
+                            char_xobj = (
+                                char.xobj_id
+                                if char.xobj_id is not None
+                                else paragraph_xobj_id
+                            )
+                            source_font = get_font(char.pdf_style.font_id, char_xobj)
+                            target_value, target_font = resolve_unicode(source_font, value)
+                            if target_value is None:
+                                continue
+                            style = copy.copy(char.pdf_style)
+                            style.font_id = target_font.font_id
+                            char.pdf_style = style
+                            char.char_unicode = target_value
+                            char.pdf_character_id = target_font.has_glyph(ord(target_value))
+                    result.extend([TypesettingUnit(formular=composition.pdf_formula)])
             else:
                 logger.error(
                     f"Unknown composition type. "
@@ -2864,12 +4022,14 @@ class Typesetting:
                     f"Paragraph: {paragraph}. ",
                 )
                 continue
-        result = list(
-            filter(
-                lambda x: x.unicode is None or x.font is not None,
-                result,
-            ),
-        )
+        unresolved = [unit for unit in result if unit.unicode is not None and unit.font is None]
+        if unresolved:
+            message = (
+                f"Unresolved target glyphs in paragraph {getattr(paragraph, 'debug_id', None) or '<unknown>'}: "
+                + ", ".join(repr(unit.unicode) for unit in unresolved[:8])
+            )
+            logger.error(message)
+            raise RuntimeError(message)
 
         if any(x.width < 0 for x in result):
             logger.warning("Typesetting unit width is less than 0, please check if positioning is incorrect or if text is being drawn in reverse")
