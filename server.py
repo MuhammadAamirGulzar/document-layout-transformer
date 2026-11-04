@@ -76,18 +76,18 @@ LANGUAGE_CODES = {
 
 # Human-readable stage names
 STAGE_DISPLAY_NAMES = {
-    'Create IL': '📄 Parsing PDF Structure',
-    'Detect Scanned File': '🔍 Detecting Scanned Content',
-    'Layout': '📐 Analyzing Page Layout',
-    'Table': '📊 Processing Tables',
-    'Paragraph': '📝 Finding Paragraphs',
-    'Styles And Formulas': '🔢 Processing Formulas & Styles',
-    'AutomaticTermExtractor': '📚 Extracting Terms',
-    'Translate': '🌐 Translating Content',
+    'Parse PDF and Create Intermediate Representation': '📄 Parsing PDF Structure',
+    'DetectScannedFile': '🔍 Detecting Scanned Content',
+    'Parse Page Layout': '📐 Analyzing Page Layout',
+    'Parse Table': '📊 Processing Tables',
+    'Parse Paragraphs': '📝 Finding Paragraphs',
+    'Parse Formulas and Styles': '🔢 Processing Formulas & Styles',
+    'Automatic Term Extraction': '📚 Extracting Terms',
+    'Translate Paragraphs': '🌐 Translating Content',
     'Typesetting': '✍️ Typesetting Document',
-    'Font Mapper': '🔤 Mapping Fonts',
-    'PDF Creater': '📑 Generating PDF',
-    'Subset Font': '⚙️ Subsetting Fonts',
+    'Add Fonts': '🔤 Mapping Fonts',
+    'Generate drawing instructions': '📑 Generating PDF',
+    'Subset font': '⚙️ Subsetting Fonts',
     'Save PDF': '💾 Saving Document',
 }
 
@@ -99,7 +99,7 @@ def get_display_stage_name(stage: str) -> str:
         return STAGE_DISPLAY_NAMES[stage]
     
     # Check if stage contains any known key
-    for key, value in STAGE_DISPLAY_NAMES.items():
+    for key, value in sorted(STAGE_DISPLAY_NAMES.items(), key=lambda kv: len(kv[0]), reverse=True):
         if key.lower() in stage.lower():
             return value
     
