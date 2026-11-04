@@ -59,10 +59,10 @@ The server exposes an asynchronous, event-driven REST and Server-Sent Events (SS
 ### Real-Time SSE Event Flow:
 When the client connects to `/translate/progress/{session_id}`, the server yields:
 1. `init`: Initial connection acknowledgement.
-2. `stage_summary`: Complete breakdown of all 14 pipeline stages with their assigned weights.
-3. `stage_begin`: Notification that a specific stage has begun (e.g. `Typesetting`).
-4. `stage_progress`: Percentage progress within the active stage.
-5. `stage_finish`: Stage completion.
+2. `stage_summary`: Complete breakdown of the 13 pipeline stages with their assigned weights.
+3. `progress_start`: Notification that a specific stage has begun, with its initial counters.
+4. `progress_update`: Percentage and item-count progress within the active stage.
+5. `progress_end`: Notification that the active stage has completed.
 6. `finish`: Overall pipeline complete. Payload contains:
    ```json
    {

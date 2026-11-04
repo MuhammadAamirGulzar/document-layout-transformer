@@ -1,4 +1,6 @@
-# TransDOC V2.1 — Comprehensive Layout, Typesetting & Architectural Issues Report
+# Historical issue investigation (September 2026)
+
+> **Historical snapshot, not the current backlog.** Its defect descriptions and proposed milestones were written against an earlier checkout. Several are now implemented in source or have regression tests, while real-PDF behavior still needs reproduction. Use [`ENGINEERING_BACKLOG.md`](ENGINEERING_BACKLOG.md) for current priorities and status; use [`PROJECT_GUIDE.md`](PROJECT_GUIDE.md) to navigate the code. Do not treat the old test totals below as current results.
 
 **Document**: `docs/issues.md`  
 **Date**: September 8, 2026  

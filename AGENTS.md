@@ -11,43 +11,11 @@ It specializes in complex layout preservation for:
 
 ---
 
-## Repository Structure
-```
-d:\Uni Stuff\DataInsight\1\
-├── AGENTS.md                                   <- (This file) Master agent instruction & context guide
-└── doc-translator-V2.1\                        <- Core application repository
-    ├── .venv\                                  <- Python 3.12 virtual environment (use for all execution)
-    ├── server.py                               <- FastAPI backend server with SSE streaming & dual/mono export
-    ├── frontend\
-    │   └── index.html                          <- Modern Web UI for upload,    ├── tests\                                  <- Comprehensive regression test suites (31/31 passing)
-    │   ├── test_formatting_enhancements.py     <- Tests for RTL hanging indents, headers/footers, RLM locking, box expansion (5/5)
-    │   ├── test_financial_regression.py        <- Tests for equations, acronyms, currency, axes, SWIFT roundtrip (10/10)
-    │   ├── test_typography_regression.py       <- Tests for font weights, optical scale, hierarchy floors (5/5)
-    │   └── test_technical_document_regression.py <- Tests for SWIFT codes, 54 ISO codes, PUA bullets, formulas, TOC dots, table cells (11/11)
-    ├── docs\                                   <- Deep-dive technical documentation
-    │   ├── SESSION_HANDOFF_2026_09_07.md       <- Latest session state, defect remediations, and continuation agenda
-    │   ├── ARCHITECTURE.md                     <- 14-stage pipeline & Intermediate Representation (IL)
-    │   ├── RTL_AND_TYPESETTING.md              <- Line-level BiDi, hanging indents, mirroring, optical scaling
-    │   ├── FINANCIAL_TRANSLATION_RULES.md      <- Numeral protection, regex rules, currency, acronyms
-    │   ├── ENGINES_AND_SERVER.md               <- Meta NLLB-200, MarianMT, OpenAI, FastAPI & SSE
-    │   └── TESTING_AND_OPERATIONS.md           <- Testing commands, environment setup, CLI & operations
-    └── babeldoc\                               <- Core translation & typesetting engine
-        ├── assets\                             <- Embedded font metadata & ONNX models
-        ├── format\pdf\
-        │   ├── high_level.py                   <- Pipeline orchestrator (TRANSLATE_STAGES)
-        │   └── document_il\
-        │       ├── il_version_1.py             <- Data classes: Box, PdfParagraph, PdfFont, etc.
-        │       ├── backend\pdf_creater.py      <- PDF generation, font subsetting audit, emergency fallback
-        │       ├── midend\
-        │       │   ├── typesetting.py          <- RTL layout, line wrapping, BiDi, downward expansion, table balancing
-        │       │   ├── il_translator.py        <- Translation dispatcher, terminology, LTR parenthetical protection
-        │       │   ├── il_translator_llm_only.py
-        │       │   ├── paragraph_finder.py     <- Visual span clustering
-        │       │   ├── layout_parser.py        <- ONNX YOLO layout detection
-        │       │   └── automatic_term_extractor.py
-        │       └── utils\fontmap.py            <- FontMapper: bold weight detection, PUA bullet mapping
-        └── translator\
-            └── translator.py                   <- MarianMT, NLLB-200, OpenAI, _protect_numerals
+## Repository Location and Map
+
+The active repository is `D:\transformer\transdoc-afan`.
+
+See [`docs/PROJECT_GUIDE.md`](docs/PROJECT_GUIDE.md) for the maintained repository map, important files, and end-to-end data flow. Older handoff reports describe earlier paths and test snapshots and must not be treated as current status.
 
 ---
 
@@ -55,19 +23,24 @@ d:\Uni Stuff\DataInsight\1\
 
 > **CRITICAL**: Always use the virtual environment python: `.venv\Scripts\python` (PowerShell on Windows). `uv` is not globally installed in PATH.
 
-### 1. Run Regression Tests (31/31 Passing)
+### 1. Run Regression Tests
 ```powershell
-# In d:\Uni Stuff\DataInsight\1\doc-translator-V2.1
-.venv\Scripts\python tests/test_formatting_enhancements.py
-.venv\Scripts\python tests/test_financial_regression.py
-.venv\Scripts\python tests/test_typography_regression.py
-.venv\Scripts\python tests/test_technical_document_regression.py
+# In D:\transformer\transdoc-afan
+.venv\Scripts\python -m pytest -q
 ```
+
+Record the actual command and result when tests are run; this guide does not assert a passing count.
 
 ### 2. Run the FastAPI Server
 ```powershell
-.venv\Scripts\python -m uvicorn server:app --host 0.0.0.0 --port 7860 --reload
+.venv\Scripts\python -m uvicorn server:app --host 127.0.0.1 --port 7860
 ```
+
+### 3. Windows Unicode Console Encoding
+
+When printing Arabic strings directly in PowerShell, Python on Windows may throw `UnicodeEncodeError: 'charmap' codec can't encode characters`.
+
+- Fix: Use `sys.stdout.reconfigure(encoding='utf-8')` before printing Arabic text in scratch scripts.
 
 ---
 

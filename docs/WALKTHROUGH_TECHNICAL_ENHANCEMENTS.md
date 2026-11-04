@@ -1,4 +1,6 @@
-# Walkthrough: TransDOC Technical & Banking Document Enhancements
+# Historical walkthrough: technical and banking enhancements
+
+> **Historical implementation note, not a current defect list or test report.** It records changes and test output from an earlier session. Some items are now covered by current source/tests, but this document’s test totals and “all resolved” claim have not been freshly verified. Use [`ENGINEERING_BACKLOG.md`](ENGINEERING_BACKLOG.md) for current open work and [`TESTING_AND_OPERATIONS.md`](TESTING_AND_OPERATIONS.md) for current commands.
 
 All failure modes identified in the Qatar Central Bank IBAN Standards document (`13-193.pdf`) have been resolved, regression-tested, and verified across the pipeline.
 

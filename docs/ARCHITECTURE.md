@@ -3,7 +3,9 @@
 ## 1. Overview
 Doc-Translator V2.1 (TransDOC) transforms complex PDF documents from English (LTR) into Arabic (RTL) while preserving the exact layout, geometry, typography, vector drawings, tables, and charts of the original document.
 
-The architecture is built on an **Intermediate Language (IL)** representation that decouples PDF parsing, layout analysis, translation, typesetting, and PDF generation into 14 distinct sequential stages.
+The architecture is built on an **Intermediate Language (IL)** representation that decouples PDF parsing, layout analysis, translation, typesetting, and PDF generation into 13 distinct sequential stages.
+
+Version labels describe different layers: `pyproject.toml` declares BabelDOC package version `0.5.16`, the TransDOC documentation uses product label `V2.1`, and `server.py` exposes API version `1.0.0`; they are not interchangeable release numbers.
 
 ```mermaid
 flowchart TD
@@ -25,7 +27,7 @@ flowchart TD
 
 ---
 
-## 2. The 14 Translation Pipeline Stages
+## 2. The 13 Translation Pipeline Stages
 
 The pipeline is coordinated by `babeldoc.format.pdf.high_level.async_translate` and uses the following stage weights for progress monitoring:
 

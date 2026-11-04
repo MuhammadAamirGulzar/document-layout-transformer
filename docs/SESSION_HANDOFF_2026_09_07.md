@@ -1,4 +1,6 @@
-# TransDOC V2.1 — Session Handoff & Technical Status Report
+# Historical session handoff — 2026-09-07
+
+> **Dated handoff, not current environment status.** Its server-running, branch, test-count and next-day statements describe that session. Current verified planning lives in [`ENGINEERING_BACKLOG.md`](ENGINEERING_BACKLOG.md), current test guidance in [`TESTING_AND_OPERATIONS.md`](TESTING_AND_OPERATIONS.md), and architecture in [`PROJECT_GUIDE.md`](PROJECT_GUIDE.md). Historical results have not been rerun for this checkout.
 **Date**: September 7, 2026  
 **Status**: All 4 defect groups resolved, 31/31 regression tests passing (100%), Web server running.
 

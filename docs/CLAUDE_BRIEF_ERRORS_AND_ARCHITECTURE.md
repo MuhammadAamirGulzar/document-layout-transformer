@@ -1,4 +1,6 @@
-# TransDOC (Doc-Translator V2.1) — Architecture, Error Diagnostics & Strategy Brief
+# Historical architecture and error brief
+
+> **Historical snapshot, not current status.** This report records earlier logs, source locations and a proposed fix strategy. The code has changed since it was written, so verify every claim against the current checkout. Current work is tracked in [`ENGINEERING_BACKLOG.md`](ENGINEERING_BACKLOG.md); current architecture starts at [`PROJECT_GUIDE.md`](PROJECT_GUIDE.md). Old test counts and machine-specific environment details are not current verification.
 
 > **Target Audience**: AI Engineering Agents (Claude, GPT, DeepSeek) & System Maintainers  
 > **Purpose**: Provide complete architectural context, exact log error analysis, line-by-line code causality, and the technical resolution strategy for TransDOC V2.1.

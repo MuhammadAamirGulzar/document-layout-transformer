@@ -1,120 +1,83 @@
-# Testing, CLI & Operations Guide
+# Testing and operations
 
-## 1. Regression Test Suites (`tests/`)
+This page describes the current repository layout and available commands. The commands below were inspected but **not run as part of this documentation change**; no passing result is claimed. The last known test totals in older documents are historical only.
 
-The repository includes 3 dedicated, standalone test suites validating all specialized RTL, financial, and typography algorithms. All test suites can run without pytest using standard Python asserts.
+## Environment and dependencies
 
-### Test Suite 1: RTL Formatting Enhancements (`tests/test_formatting_enhancements.py`)
-Validates structural and bidirectional rendering:
-- `test_punctuation_bidi_locking`: Trailing neutral punctuation (`.`, `:`, `!`) following numbers/acronyms/percent receives RLM (`\u200F`).
-- `test_header_footer_mirroring`: Running headers, footers, and page numbers mirror across the page vertical midline.
-- `test_bullet_point_hanging_indent`: Line 0 starts flush right; wrapped lines `1+` are indented inward by `bullet_indent`.
-- `test_legend_swatch_placement`: Legend swatch symbol `■` is placed at the correct visual side in RTL rendering.
-- `test_overflow_paragraph_expansion_and_composition`: Verifies that vertically overflowing paragraphs dynamically expand `box.y` downwards into available bottom space and populate non-empty paragraph composition with zero drops.
+- The repository specifies Python `3.12` in `.python-version`; `pyproject.toml` permits Python `>=3.12,<3.14`.
+- This `.venv` ran a passing test suite on the maintainer's laptop earlier; a fresh install needs `bitstring<5` (see B-06). Rerun `pip check` and the full suite after any install and record the date, commit and result.
+- Always use the repository virtual-environment interpreter, `.\.venv\Scripts\python.exe`, for project commands on Windows. Do not substitute a system Python unless the maintainer explicitly intends to test a separate environment.
+- Dependencies are currently declared in `requirements.txt` and `pyproject.toml` and resolved in `uv.lock`; these files disagree. See the dependency item in [`ENGINEERING_BACKLOG.md`](ENGINEERING_BACKLOG.md) before relying on a clean install.
+- Do not install a different dependency set into a shared environment without checking with the maintainer.
 
-### Test Suite 2: Financial & Technical Regression (`tests/test_financial_regression.py`)
-Validates terminology preservation and numeral protection:
-- `test_equation_protection`: Equations like `(2018=100)` and formula placeholders `<b1>` are protected.
-- `test_acronym_protection`: Standalone and parenthesized acronyms (`QCBRR`, `QCBLR`, `QCBDR`, `Chart 7-1`) are preserved.
-- `test_nds3_protection`: Third National Development Strategy (`NDS3`) terminology mapping.
-- `test_currency_standardization`: Eliminates `كرو` and standardizes `QR million`, `QR billion` to `ريال قطري`.
-- `test_percent_formatting`: Fixes stray periods around Arabic percent signs (`8.6 .٪` -> `8.6٪.`).
-- `test_chapter_and_chart_references`: Preserves `CHAPTER 03` -> `الفصل 03`, `Chart 7-1` -> `المخطط 7-1`.
-- `test_multi_line_classification`: Distinguishes short chart labels from flowing multi-line paragraphs.
-- `test_typesetting_rigid_body_shift`: Margin shift moves characters as a rigid body, preventing character stacking/overlap.
-- `test_chronological_axis_detection`: Detects multi-month time series (`Jan ... Dec`) and preserves LTR axis order.
-- `test_swift_bic_codes_byte_identity_roundtrip`: Verifies 100% byte-identical preservation of all 17 SWIFT BIC codes and 4-letter bank identifiers.
+## Test inventory
 
-### Test Suite 3: Typography & Font Hierarchy (`tests/test_typography_regression.py`)
-Validates font family mapping and visual scaling:
-- `test_ar_font_family_resolution`: Verifies `AR_FONT_FAMILY` contains `GoNotoKurrent-Regular.ttf` and `GoNotoKurrent-Bold.ttf`.
-- `test_bold_weight_detection_and_mapping`: Verifies English bold fonts map accurately to `GoNotoKurrent-Bold.ttf`.
-- `test_title_exempt_from_mode_scale`: Verifies titles are exempt from body text `mode_scale` clamping.
-- `test_role_based_min_scale_floors`: Verifies minimum scale floors (titles `>= 0.88`, captions `>= 0.82`, body `>= 0.72`).
-- `test_arabic_optical_compensation`: Verifies Arabic text receives the `1.08x` optical font size compensation.
+| Test file | Main focus (from test names and imports) |
+|---|---|
+| `tests/test_financial_regression.py` | Numeral/formula protection, terminology, financial identifiers and related translation/typesetting helpers |
+| `tests/test_formatting_anti_collision.py` | Paragraph grouping, table geometry, style boundaries, collision handling and RTL layout |
+| `tests/test_formatting_enhancements.py` | BiDi punctuation, headers/footers, bullets, overflow and glyph handling |
+| `tests/test_technical_document_regression.py` | Banking identifiers, equations, fonts, technical text, tables and mixed-script behavior |
+| `tests/test_typography_regression.py` | Font selection, weight mapping, hierarchy and Arabic scaling |
 
-### Test Suite 4: Technical & Banking Standards (`tests/test_technical_document_regression.py`)
-Validates alphanumeric codes, dense tables, and formula integrity:
-- `test_bank_swift_and_identifiers_passthrough`: All 17 Qatar bank SWIFT codes (`ABQQQAQAXXX`, `BBMEQAQXXXX`) and 4-letter bank identifiers (`QNBA`, `CBQA`) bypass translation.
-- `test_54_country_iso_codes_ltr_preservation`: All 54 country 2-letter ISO codes (`AL` ... `AE`) retain strict LTR order in table cells.
-- `test_previously_reversed_9_iso_codes_specifically`: Specifically verifies `BA`, `CZ`, `FO`, `GI`, `ME`, `SM`, `SA`, `GB`, `AE` never reverse.
-- `test_pua_bullet_point_hanging_indent`: PUA Wingdings bullets (`\uF0B7`, 61623) trigger hanging indents without word collision (`ابتولديها`).
-- `test_mathematical_equations_atomic_protection`: Division formulas (`281211210/97 = 62`) and modulo standards (`MOD 97-10`) are atomically protected.
-- `test_contact_info_and_phone_standardization`: Contact metadata (`Tel : +974 44456371` -> `الهاتف: ...`) standardizes accurately without `التلفزيون` hallucinations.
-- `test_paragraph_pipeline_trace_diagnostics`: Paragraph execution tracing records layout labels and translation pathways.
-- `test_toc_leader_dots_preservation`: Table of Contents leader dots (`...`) are protected from collapsing, isolated from neural translation, and dynamically resized in typesetting to fit on a single line.
-- `test_qatar_banks_table_cell_no_overlap_and_synchronized_row_height`: Table cells across all 17 Qatar Bank rows never overlap horizontally, and row heights remain synchronized.
-- `test_bban_characteristics_zero_notdef_glyphs`: Verifies zero `.notdef` (glyph 0) characters across the full BBAN characteristics section with PUA bullet remapping.
-- `test_mixed_script_bidi_ordering_in_table_cell_and_bullets`: Verifies strict Left-to-Right character order inside Arabic bullet items and table cells for Latin parenthetical expressions (`(First 4 character of BIC)` and `(25 Characters for Qatar)`).
+These files mainly cover engine behavior. The current inventory does not show a dedicated API integration test or a complete PDF upload-to-download test. Do not infer that the server or full model pipeline is tested because helper-level tests exist.
 
----
+## Run tests (not run during this documentation update)
 
-## 2. Running the Tests
-
-Execute all test suites from the `doc-translator-V2.1` directory using the virtual environment:
+From the repository root, if the current environment already has the project’s test dependencies:
 
 ```powershell
-# 1. Advanced RTL formatting suite (5/5 tests)
-.venv\Scripts\python tests/test_formatting_enhancements.py
-
-# 2. Financial translation regression suite (10/10 tests)
-.venv\Scripts\python tests/test_financial_regression.py
-
-# 3. Typography & font hierarchy suite (5/5 tests)
-.venv\Scripts\python tests/test_typography_regression.py
-
-# 4. Technical & banking standards suite (11/11 tests)
-.venv\Scripts\python tests/test_technical_document_regression.py
+.\.venv\Scripts\python.exe -m pytest -q
 ```
 
-Expected output:
-```
-ALL ADVANCED FORMATTING TESTS PASSED SUCCESSFULLY!
-ALL REGRESSION TESTS PASSED SUCCESSFULLY!
-ALL TYPOGRAPHY TESTS PASSED SUCCESSFULLY!
-ALL TECHNICAL & BANKING DOCUMENT REGRESSION TESTS PASSED SUCCESSFULLY!
-```
-(31 / 31 tests passing 100%)
-
----
-
-## 3. Running the Application
-
-### Running the Production / Dev Web Server
-```powershell
-cd "d:\Uni Stuff\DataInsight\1\doc-translator-V2.1"
-.venv\Scripts\python -m uvicorn server:app --host 0.0.0.0 --port 7860 --reload
-```
-Once started, visit:
-- Web Interface: `http://localhost:7860/`
-- Interactive API Docs (Swagger): `http://localhost:7860/docs`
-- Health Check: `http://localhost:7860/health`
-
-### Running via BabelDOC CLI Directly
-Translate any PDF document from the command line:
+To run one test file:
 
 ```powershell
-# Using local Meta NLLB-200 (default, offline)
-.venv\Scripts\python -m babeldoc --files input.pdf --lang-in en --lang-out ar
-
-# Using local MarianMT model
-.venv\Scripts\python -m babeldoc --huggingface --files input.pdf --lang-in en --lang-out ar
-
-# Using OpenAI GPT-4o-mini
-.venv\Scripts\python -m babeldoc --openai --openai-model "gpt-4o-mini" --openai-api-key "sk-..." --files input.pdf --lang-in en --lang-out ar
+.\.venv\Scripts\python.exe -m pytest -q tests/test_formatting_anti_collision.py
 ```
 
----
+For a named test, append `-k` with part of its name, for example:
 
-## 4. Troubleshooting & Gotchas
+```powershell
+.\.venv\Scripts\python.exe -m pytest -q tests/test_technical_document_regression.py -k swift
+```
 
-1. **Python Virtual Environment**:
-   Always run using `.venv\Scripts\python`. Do not invoke system `python` or `uv` directly if not in system PATH.
-2. **Windows Unicode Console Encoding**:
-   When printing Arabic strings directly in PowerShell, Python on Windows may throw `UnicodeEncodeError: 'charmap' codec can't encode characters`.
-   - Fix: Use `sys.stdout.reconfigure(encoding='utf-8')` before printing Arabic text in scratch scripts.
-3. **GPU vs CPU Inference for NLLB**:
-   - On CUDA GPUs, NLLB loads automatically in `torch.float16`, consuming only ~1.4 GB VRAM for the 600M model.
-   - On CPU, inference takes slightly longer; ensure sufficient RAM is free (~3 GB).
-4. **Temporary Files**:
-   Session files and uploaded PDFs are saved in `TEMP_DIR/babeldoc_api/<session_id>`. Clean up periodically if disk space is constrained.
+These commands are documented, not executed here. Record the date, branch/commit, exact command, exit code and summary whenever reporting a test result. Do not copy stale totals from older notes.
+
+## Start the web server for local development
+
+If dependencies are already installed, start from the repository root:
+
+```powershell
+.\.venv\Scripts\python.exe -m uvicorn server:app --host 127.0.0.1 --port 7860
+```
+
+Then visit `http://127.0.0.1:7860/`; `/health` is the health endpoint, and `http://127.0.0.1:7860/docs` is FastAPI's interactive Swagger API page. This is a suggested local command, not a verified server run. Binding to `127.0.0.1` keeps it local to the machine. The Dockerfile binds to `0.0.0.0` for container networking; public exposure requires the controls in [`SECURITY_AND_DEPLOYMENT.md`](SECURITY_AND_DEPLOYMENT.md).
+
+## Windows Unicode console encoding
+
+If a Windows command or diagnostic script fails with `UnicodeEncodeError` while printing Arabic or other Unicode text, configure standard output before printing:
+
+```python
+import sys
+
+sys.stdout.reconfigure(encoding="utf-8")
+```
+
+This changes console output encoding for that process; it does not change PDF text, translation behavior or source files.
+
+## Debugging a translation
+
+When a job appears stuck or ends without a PDF, collect:
+
+1. Branch and commit, OS/Python, chosen model and CPU/GPU details.
+2. Input PDF page count and whether text is selectable.
+3. Timestamped server log from job start to terminal event.
+4. SSE event sequence shown to the browser.
+5. Whether output files exist in that job’s output directory.
+
+Do not include secrets or sensitive document text in public bug reports. The current reported paragraph-stage stall is tracked in [`ENGINEERING_BACKLOG.md`](ENGINEERING_BACKLOG.md), and its cause is not yet verified.
+
+## Deployment pointers
+
+The current Dockerfile uses Python 3.12, installs `requirements.txt`, exposes port 7860 and starts Uvicorn. Dependency alignment, health checks, non-root execution, resource limits, secret handling, temporary file retention and model caching need review before production. See [`SECURITY_AND_DEPLOYMENT.md`](SECURITY_AND_DEPLOYMENT.md).
