@@ -1,6 +1,6 @@
 # Testing and operations
 
-This page describes the current repository layout and available commands. The commands below were inspected but **not run as part of this documentation change**; no passing result is claimed. The last known test totals in older documents are historical only.
+This page describes the current repository layout and available commands. Commands below were **not run as part of this documentation change**. VERIFIED maintainer evidence: at commit `a7ba72f`, the full suite reported 94 passed + 106 subtests. This result applies to that commit/environment; older documents remain historical snapshots.
 
 ## Environment and dependencies
 
@@ -19,8 +19,11 @@ This page describes the current repository layout and available commands. The co
 | `tests/test_formatting_enhancements.py` | BiDi punctuation, headers/footers, bullets, overflow and glyph handling |
 | `tests/test_technical_document_regression.py` | Banking identifiers, equations, fonts, technical text, tables and mixed-script behavior |
 | `tests/test_typography_regression.py` | Font selection, weight mapping, hierarchy and Arabic scaling |
+| `tests/test_stage_labels.py` | VERIFIED implementation evidence: 17 stage-label tests added in `a7ba72f`; browser verification is NOT VERIFIED and B-01 stays open |
 
 These files mainly cover engine behavior. The current inventory does not show a dedicated API integration test or a complete PDF upload-to-download test. Do not infer that the server or full model pipeline is tested because helper-level tests exist.
+
+**NOT VERIFIED — reported API-test blocker:** Starlette 0.27.0 + httpx 0.28.1 `TestClient` fails with `TypeError` about unexpected keyword `app`. Plan HTTP tests with `httpx.ASGITransport`, or plain function tests for helpers, without changing the environment. Alternatives were not run here; function tests alone do not verify HTTP behavior. Track this in B-08 and G1/B-06.
 
 ## Run tests (not run during this documentation update)
 
@@ -76,8 +79,12 @@ When a job appears stuck or ends without a PDF, collect:
 4. SSE event sequence shown to the browser.
 5. Whether output files exist in that job’s output directory.
 
-Do not include secrets or sensitive document text in public bug reports. The current reported paragraph-stage stall is tracked in [`ENGINEERING_BACKLOG.md`](ENGINEERING_BACKLOG.md), and its cause is not yet verified.
+Do not include secrets or sensitive document text in public bug reports. VERIFIED supplied evidence: the first 14-page QCB IBAN web run completed with 600M on laptop CPU in 1297 s, peak 3652 MB, one submission/progress connection/finish, no “Error during NLLB” lines and download 200 OK. Reconnect behavior and first-progress timing remain NOT VERIFIED. See B-20 and the Benchmark section in [`ENGINEERING_BACKLOG.md`](ENGINEERING_BACKLOG.md).
+
+## Packaging for notebook experiments
+
+**LIKELY packaging failure; archive execution NOT VERIFIED here:** Git stores LFS pointer stubs for the CMap assets under `babeldoc/pdfminer/cmap/` (pointer text is visible in committed blobs). A plain `git archive` zip retains those stubs instead of usable asset contents, making it unsuitable for this experiment. Build the zip from the working tree with real LFS asset contents present; confirm those files are hydrated before packaging. Include the required source/assets, not `.git`, `.venv`, secrets or unrelated uploads. No zip was built during this docs task.
 
 ## Deployment pointers
 
-The current Dockerfile uses Python 3.12, installs `requirements.txt`, exposes port 7860 and starts Uvicorn. Dependency alignment, health checks, non-root execution, resource limits, secret handling, temporary file retention and model caching need review before production. See [`SECURITY_AND_DEPLOYMENT.md`](SECURITY_AND_DEPLOYMENT.md).
+The current Dockerfile uses Python 3.12, installs `requirements.txt`, exposes port 7860 and starts Uvicorn. Deployment readiness is NOT VERIFIED. Resolve ownership and license decisions (B-05, B-15) before deployment, along with dependency alignment, health checks, non-root execution, resource limits, secrets, temporary-file retention and model caching. See [`SECURITY_AND_DEPLOYMENT.md`](SECURITY_AND_DEPLOYMENT.md).
