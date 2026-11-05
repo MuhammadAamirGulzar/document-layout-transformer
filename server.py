@@ -560,9 +560,6 @@ async def download_translation(session_id: str, type: Optional[str] = "mono"):
         path=output_path,
         filename=output_filename,
         media_type="application/pdf",
-        headers={
-            "Content-Disposition": f"attachment; filename={output_filename}"
-        }
     )
 
 
