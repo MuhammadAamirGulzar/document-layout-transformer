@@ -1246,7 +1246,6 @@ def _do_translate_single(
             f"Output path: {result.mono_pdf_path}"
         )
         detailed_logger.end_stage("Generate Drawing Instructions and Save PDF")
-        result = pdf_creater.write(translation_config)
         try:
             if mono_watermark_first_page_doc_bytes:
                 mono_watermark_pdf = merge_watermark_doc(
