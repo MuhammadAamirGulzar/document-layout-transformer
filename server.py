@@ -168,6 +168,53 @@ async def get_supported_languages():
     }
 
 
+UPLOAD_CHUNK = 1024 * 1024
+
+
+def _max_upload_bytes():
+    """Upload size limit in bytes. Set MAX_UPLOAD_MB to change it (default 50)."""
+    try:
+        megabytes = float(os.getenv("MAX_UPLOAD_MB", "50"))
+    except ValueError:
+        megabytes = 50.0
+    return int(megabytes * 1024 * 1024)
+
+
+def _copy_limited(src, buffer):
+    """Copy an upload to disk in chunks.
+
+    Stops with 413 when the limit is passed and with 400 when the file is empty or
+    has no %PDF- header in its first 1024 bytes. On any of these the partly written
+    file and its session folder (the folder that holds it) are removed.
+    """
+    limit = _max_upload_bytes()
+    total = 0
+    first = True
+    try:
+        while True:
+            chunk = src.read(UPLOAD_CHUNK)
+            if not chunk:
+                break
+            if first:
+                first = False
+                if b"%PDF-" not in chunk[:1024]:
+                    raise HTTPException(status_code=400, detail="File is not a valid PDF")
+            total += len(chunk)
+            if total > limit:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"File is larger than {limit / (1024 * 1024):g} MB",
+                )
+            buffer.write(chunk)
+        if first:
+            raise HTTPException(status_code=400, detail="File is empty")
+    except HTTPException:
+        name = buffer.name
+        buffer.close()
+        shutil.rmtree(Path(name).parent, ignore_errors=True)
+        raise
+
+
 def _display_name(name):
     """Name shown to the user. It is never used as a path on disk."""
     cleaned = (name or "").replace("\\", "/").split("/")[-1].strip()
@@ -209,7 +256,7 @@ async def start_translation(
     
     # Save uploaded file
     with open(input_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+        _copy_limited(file.file, buffer)
     
     # Store session info
     translation_sessions[session_id] = {
@@ -553,7 +600,7 @@ async def translate_document(
         logger.info(f"Model: {model}")
         
         with open(input_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
+            _copy_limited(file.file, buffer)
         
         # Create translator
         openai_api_key = os.getenv("OPENAI_API_KEY")
