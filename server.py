@@ -2,6 +2,9 @@
 import asyncio
 import json
 import logging
+import math
+import threading
+import time
 import os
 import re
 import shutil
@@ -263,6 +266,7 @@ async def start_translation(
     
     # Store session info
     translation_sessions[session_id] = {
+        "_created_at": time.time(),
         "status": "pending",
         "input_path": str(input_path),
         "output_directory": str(output_directory),
@@ -283,10 +287,155 @@ async def start_translation(
 
 # One model job at a time in this server process. Uploads remain upload-only.
 _job_slots = asyncio.Semaphore(1)
-_terminal_states = {"completed", "error"}
+_terminal_states = {"completed", "error", "cancelled", "timed_out"}
+
+
+def _setting_seconds(name, default):
+    try:
+        value = float(os.getenv(name, str(default)))
+        if math.isfinite(value) and value > 0:
+            return value
+    except ValueError:
+        pass
+    return float(default)
+
+
+def _finish_stopped(session):
+    reason = session.get("_stop_reason", "cancelled")
+    message = "Translation timed out" if reason == "timed_out" else "Translation cancelled"
+    session["status"] = reason
+    session["error"] = message
+    session["_finished_at"] = time.time()
+    _job_event(session, {"type": reason, "error": message})
+
+
+def _request_stop(session, reason):
+    if session.get("status") in _terminal_states:
+        return False
+    if session.get("_stop_reason"):
+        return True
+    session["_stop_reason"] = reason
+    if session.get("_cancel_signal") is not None:
+        session["_cancel_signal"].set()
+    if session.get("_stop_event") is not None:
+        session["_stop_event"].set()
+    if session.get("_task") is None:
+        _finish_stopped(session)
+    else:
+        session["status"] = "cancelling"
+        _job_event(session, {"type": "stopping", "message": "Stopping after the current operation..."})
+    return True
+
+
+async def _acquire_job_slot(session):
+    if session.get("_stop_reason"):
+        return False
+    acquire = asyncio.create_task(_job_slots.acquire())
+    stop = asyncio.create_task(session["_stop_event"].wait())
+    transferred = False
+    try:
+        await asyncio.wait({acquire, stop}, return_when=asyncio.FIRST_COMPLETED)
+        if session.get("_stop_reason"):
+            return False
+        await acquire
+        transferred = True
+        return True
+    finally:
+        for task in (acquire, stop):
+            if not task.done():
+                task.cancel()
+        try:
+            await asyncio.gather(acquire, stop, return_exceptions=True)
+        finally:
+            if not transferred and acquire.done() and not acquire.cancelled() and acquire.exception() is None and acquire.result():
+                _job_slots.release()
+
+
+async def _watch_job_deadline(session):
+    deadline = time.monotonic() + _setting_seconds("JOB_TIMEOUT_SECONDS", 3600)
+    while session.get("status") not in _terminal_states:
+        if time.monotonic() >= deadline:
+            _request_stop(session, "timed_out")
+            return
+        await asyncio.sleep(0.05)
+
+
+def _purge_expired_sessions():
+    # Only tracked, inactive sessions are eligible. Never infer orphan ownership.
+    root = TEMP_DIR.resolve()
+    now = time.time()
+    ttl = _setting_seconds("SESSION_TTL_SECONDS", 86400)
+    removed = []
+    for sid, session in list(translation_sessions.items()):
+        if not _valid_session_id(sid):
+            continue
+        task = session.get("_task")
+        if task is not None and not task.done():
+            continue
+        state = session.get("status")
+        stamp = session.get("_finished_at") if state in _terminal_states else session.get("_created_at")
+        if state not in _terminal_states and state != "pending":
+            continue
+        if stamp is None or now - stamp < ttl:
+            continue
+        target = TEMP_DIR / sid
+        # Check the exact resolved child, and reject symlink/junction aliases.
+        if target.is_symlink() or target.is_junction() or target.resolve().parent != root:
+            logger.warning("Refusing unsafe session cleanup target: %s", sid)
+            continue
+        try:
+            if target.exists():
+                shutil.rmtree(target)
+        except OSError:
+            logger.exception("Could not remove expired session %s", sid)
+            continue
+        translation_sessions.pop(sid, None)
+        removed.append(sid)
+    return removed
+
+
+_retention_task = None
+
+
+@app.on_event("startup")
+async def _start_retention():
+    global _retention_task
+    async def sweep():
+        while True:
+            try:
+                _purge_expired_sessions()
+            except Exception:
+                logger.exception("Session expiry sweep failed")
+            await asyncio.sleep(60)
+    _retention_task = asyncio.create_task(sweep())
+
+
+@app.on_event("shutdown")
+async def _stop_retention_and_jobs():
+    if _retention_task is not None:
+        _retention_task.cancel()
+        await asyncio.gather(_retention_task, return_exceptions=True)
+    jobs = []
+    for session in translation_sessions.values():
+        task = session.get("_task")
+        if task is not None and not task.done():
+            _request_stop(session, "cancelled")
+            jobs.append(task)
+    if jobs:
+        await asyncio.gather(*jobs, return_exceptions=True)
+
+
+@app.post("/translate/cancel/{session_id}")
+async def cancel_translation_job(session_id: str):
+    session = _job_session(session_id)
+    if not _request_stop(session, "cancelled"):
+        if session.get("status") != "cancelled":
+            raise HTTPException(status_code=409, detail="Job has already ended")
+    return {"session_id": session_id, "status": session["status"]}
 
 
 def _job_session(session_id):
+    _purge_expired_sessions()
     if not _valid_session_id(session_id) or session_id not in translation_sessions:
         raise HTTPException(status_code=404, detail="Session not found")
     return translation_sessions[session_id]
@@ -306,44 +455,73 @@ def _job_event(session, event):
 def _job_error(session, message):
     session["status"] = "error"
     session["error"] = message
+    session["_finished_at"] = time.time()
     _job_event(session, {"type": "error", "error": message})
 
 
 async def _run_job(session):
+    acquired = False
+    watcher = None
     try:
-        async with _job_slots:
-            final = None
-            async for raw in _translation_events(session):
-                # Keep one event format for the existing SSE adapter and polling.
-                event = json.loads(raw.removeprefix("data: ").strip())
-                if event.get("type") == "finish":
-                    final = event
-                else:
-                    _job_event(session, event)
-            # Drain the engine stream before declaring success/releasing the slot.
-            if session.get("status") == "error":
-                return
-            output = session.get("output_path")
-            if final is None:
-                _job_error(session, "Translation ended without a finish event")
-            elif not output or not Path(output).is_file():
-                _job_error(session, "Translation completed but output file not found")
+        acquired = await _acquire_job_slot(session)
+        if not acquired or session.get("_stop_reason"):
+            _finish_stopped(session)
+            return
+        watcher = asyncio.create_task(_watch_job_deadline(session))
+        final = None
+        async for raw in _translation_events(session):
+            event = json.loads(raw.removeprefix("data: ").strip())
+            if session.get("_stop_reason"):
+                session["status"] = "cancelling"
+                continue
+            if event.get("type") == "finish":
+                final = event
             else:
-                session["status"] = "completed"
-                session["progress"] = 100
-                _job_event(session, final)
+                _job_event(session, event)
+        if session.get("_stop_reason"):
+            _finish_stopped(session)
+        elif session.get("status") == "error":
+            return
+        elif final is None:
+            _job_error(session, "Translation ended without a finish event")
+        elif not session.get("output_path") or not Path(session["output_path"]).is_file():
+            _job_error(session, "Translation completed but output file not found")
+        else:
+            session["status"] = "completed"
+            session["progress"] = 100
+            session["_finished_at"] = time.time()
+            _job_event(session, final)
     except asyncio.CancelledError:
-        _job_error(session, "Translation task was cancelled")
+        if session.get("_stop_reason"):
+            _finish_stopped(session)
+        else:
+            _job_error(session, "Translation task was cancelled")
         raise
     except Exception as exc:
         logger.exception("Background translation failed")
-        _job_error(session, str(exc))
+        if session.get("_stop_reason"):
+            _finish_stopped(session)
+        else:
+            _job_error(session, str(exc))
+    finally:
+        try:
+            if watcher is not None:
+                watcher.cancel()
+                await asyncio.gather(watcher, return_exceptions=True)
+        finally:
+            if acquired:
+                _job_slots.release()
+            if session.get("status") in _terminal_states:
+                session.setdefault("_finished_at", time.time())
 
 
 def _schedule_job(session):
     # No await between the check and assignment: duplicate requests share one task.
     if session.get("_task") is not None or session.get("status") in _terminal_states:
         return False
+    session.setdefault("_created_at", time.time())
+    session["_cancel_signal"] = threading.Event()
+    session["_stop_event"] = asyncio.Event()
     session["status"] = "queued"
     session["error"] = None
     _job_event(session, {"type": "init", "message": "Queued for translation..."})
@@ -459,6 +637,8 @@ async def _translation_events(session):
             skip_clean=False,
             auto_extract_glossary=auto_extract,
         )
+
+        config._job_cancel_event = session["_cancel_signal"]
 
         # Process translation and stream progress
         translate_result = None
@@ -602,7 +782,7 @@ async def _translation_events(session):
                 session["status"] = "error"
                 session["error"] = error_msg
                 yield f"data: {json.dumps({'type': 'error', 'error': error_msg})}\n\n"
-                break
+                # Drain engine cleanup before releasing the job slot.
 
             # Small delay to prevent overwhelming the client
             await asyncio.sleep(0.05)
@@ -624,6 +804,8 @@ async def download_translation(session_id: str, type: Optional[str] = "mono"):
     if not _valid_session_id(session_id):
         raise HTTPException(status_code=404, detail="Session not found")
     session = translation_sessions.get(session_id)
+    if session and session.get("status") != "completed":
+        raise HTTPException(status_code=409, detail="Job has no completed download")
     req_type = (type or "mono").lower()
 
     output_path = None

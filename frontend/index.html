@@ -1226,9 +1226,20 @@
             await startTranslation(selectedFile, sourceLang, targetLang);
         });
 
-        // A disconnected browser no longer cancels the background job.
+        // Request cancellation on the server; keep polling until the worker stops.
         cancelBtn.disabled = true;
-        cancelBtn.title = 'This job runs on the server. Cancellation will be enabled separately.';
+        cancelBtn.addEventListener('click', async () => {
+            if (!currentSessionId) return;
+            cancelBtn.disabled = true;
+            try {
+                const reply = await fetch(`${API_BASE_URL}/translate/cancel/${currentSessionId}`, { method: 'POST' });
+                if (!reply.ok) throw new Error('Could not cancel this job');
+                currentStageName.textContent = 'Stopping after the current operation...';
+            } catch (error) {
+                showError(error.message);
+                cancelBtn.disabled = false;
+            }
+        });
 
         // Model Selection
         function selectModel(modelKey) {
@@ -1306,6 +1317,7 @@
                 const body = await started.json();
                 throw new Error(body.detail || 'Could not run translation');
             }
+            cancelBtn.disabled = false;
             let cursor = 0;
             let currentActiveStage = null;
             function renderEvent(data) {
@@ -1359,6 +1371,7 @@
                             break;
 
                         case 'finish':
+                            cancelBtn.disabled = true;
                             // Mark all stages as completed
                             Array.from(stagesContainer.children).forEach(el => {
                                 el.className = 'stage-item completed';
@@ -1380,7 +1393,15 @@
                             }, 1000);
                             break;
 
+                        case 'stopping':
+                            cancelBtn.disabled = true;
+                            currentStageName.textContent = data.message;
+                            break;
+
+                        case 'cancelled':
+                        case 'timed_out':
                         case 'error':
+                            cancelBtn.disabled = true;
                             pollStopped = true;
                             hideProgress();
                             showError(data.error || 'An error occurred during translation');
@@ -1408,7 +1429,7 @@
                         cursor = Math.max(cursor, event.event_id || 0);
                     }
                     cursor = Math.max(cursor, state.next_event_id || 0);
-                    if (state.status === 'error' && !pollStopped) {
+                    if (['error', 'cancelled', 'timed_out'].includes(state.status) && !pollStopped) {
                         pollStopped = true;
                         hideProgress();
                         showError(state.error || 'Translation failed');

@@ -414,9 +414,10 @@ async def async_translate(translation_config: TranslationConfig):
     """
     loop = asyncio.get_running_loop()
     callback = asynchronize.AsyncCallback()
-
     finish_event = asyncio.Event()
-    cancel_event = threading.Event()
+    cancel_event = getattr(translation_config, "_job_cancel_event", None)
+    if cancel_event is None:
+        cancel_event = threading.Event()
     with ProgressMonitor(
         get_translation_stage(translation_config),
         progress_change_callback=callback.step_callback,
@@ -438,10 +439,25 @@ async def async_translate(translation_config: TranslationConfig):
         except KeyboardInterrupt:
             logger.info("Translation cancelled by user through keyboard interrupt")
             cancel_event.set()
-    if cancel_event.is_set():
-        future.cancel()
-    logger.info("Waiting for translation to finish...")
-    await finish_event.wait()
+        finally:
+            # A cancelled Future is not proof that its worker thread stopped.
+            # Keep the engine slot until do_translate's finally/cleanup returns.
+            if not future.done():
+                cancel_event.set()
+            while not future.done():
+                try:
+                    await asyncio.shield(future)
+                except CancelledError:
+                    cancel_event.set()
+                except Exception:
+                    break
+            if not future.cancelled():
+                try:
+                    future.result()
+                except CancelledError:
+                    pass
+                except Exception:
+                    logger.exception("Translation worker ended with an error")
 
 
 class MemoryMonitor:
