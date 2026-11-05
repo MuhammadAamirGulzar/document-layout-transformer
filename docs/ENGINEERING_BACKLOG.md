@@ -1,29 +1,34 @@
 # Engineering backlog
 
-This is the single current planning and reconciliation document. It contains the prioritized work list, the old-document findings checked against the current source, and the learning/documentation path. Items are based on static source review as of 2026-11-04. “Open” means the work or verification remains; it does not claim a reproduced runtime defect. Keep entries small and update evidence/status when work is done.
+This is the single current planning and reconciliation document. It contains the prioritized work list, the old-document findings checked against the current source, and the learning/documentation path. The original static review is dated 2026-11-04; the maintainer-supplied G3/G4 and Git updates below are dated 2026-11-05. “Open” means the work or verification remains; it does not claim a reproduced runtime defect. Keep entries small and update evidence/status when work is done.
 
 **Statuses:** Open = not completed; Verify = collect evidence before deciding whether code needs changing; Implemented, verify runtime = matching code/tests exist but real output is not confirmed. No item below is marked complete based only on an old document.
 
 Evidence labels: VERIFIED = the cited source lines were read or the output was shown; it does NOT mean the code was executed. LIKELY = static evidence points to it. NOT VERIFIED = needs direct evidence.
 
+## Git handoff — 2026-11-05
+
+- **VERIFIED — maintainer-supplied Git state:** `cleanup-baseline` was pushed as a NEW branch to the owner's public repository on 2026-11-05, tip `8c727f1`. `main` and `afan` were not touched. The commit email is the GitHub noreply address.
+- **VERIFIED — history and contribution rule:** `main` and `afan` have unrelated histories. Never merge them; a future PR goes into `afan`.
+
 ## P0 — before public or production use
 
 | ID | Status | Item and evidence | Likely files | Acceptance evidence |
 |---|---|---|---|---|
-| B-01 | Open; implementation VERIFIED; browser NOT VERIFIED | Commit `a7ba72f` renames `server.py` stage-label keys to real engine names and sorts fallback matching longest-key-first. `tests/test_stage_labels.py` adds 17 tests. The maintainer's terminal run at that commit reported 94 passed + 106 subtests (VERIFIED). Browser check is still pending; keep this item open. The runtime investigation is B-20. | `server.py`, `frontend/index.html`, API tests | Record the browser's displayed stage label, its initial 0/N behavior and when it advances; add focused API/SSE coverage. |
+| B-01 | Open; implementation VERIFIED; browser NOT VERIFIED | The stage-label fix renames `server.py` stage-label keys to real engine names and sorts fallback matching longest-key-first. `tests/test_stage_labels.py` adds 17 tests. The maintainer's terminal run at that stage reported 94 passed + 106 subtests (VERIFIED). Browser check is still pending; keep this item open. The runtime investigation is B-20. | `server.py`, `frontend/index.html`, API tests | Record the browser's displayed stage label, its initial 0/N behavior and when it advances; add focused API/SSE coverage. |
 | B-02 | Open; smoke baseline VERIFIED | A clean laptop-CPU smoke run used the 600M model with `sample_en.pdf` (2 paragraphs) through a guarded script calling `translate()`, not the web path. It took 131 seconds, peaked at 4,694 MB, recorded 0 swallowed translation errors and produced both PDFs. Add a repeatable automated smoke test; the current tests mostly exercise engine components. | `tests/`, `high_level.py`, `pdf_creater.py` | Deterministic fixture test produces readable mono and dual PDFs with expected pages/text, without downloading a large model during the test. |
-| B-03 | Open; traversal LIKELY | Harden upload paths, size/content validation, session access and temporary-file expiry. Upload routes join the client filename to the session path (`server.py:200-206,534-550`); the UI’s 50 MB text is not a server limit (`frontend/index.html:827-832`). The download route builds its path from the `session_id` in the URL with no format check (`server.py:472-495`) and `Content-Disposition` is not quoted (`:505`); path traversal is LIKELY but NOT tested. | `server.py`, API tests | Server-generated disk name, enforced byte/page limits, valid PDF check, path containment, denied unauthorized downloads and tested expiry/cleanup. |
-| B-04 | Open | Define and test async terminal behavior for success, errors, cancellation, disconnect and timeout. | `high_level.py:415-444,779-784`, `progress_monitor.py`, `server.py` | Every submitted job reaches one clear terminal state; no browser or worker waits forever. |
+| B-03 | Done; VERIFIED by tests | G3 server safety is committed: fixed upload file name (`b908064`), upload size cap 50 MB plus `%PDF-` check (`b048202`), session-id validation on download (`0d87c66`), CORS removed (`0d9fefb`), download filename header (`34cff55`), fake `/translate/stream` entry removed (`0a935c1`). | `server.py`, API tests | All six fixes VERIFIED by tests. UUID check is not authentication. |
+| B-04 | Done for the new route; VERIFIED | G4 batch 1 (`3ed2c50`): background jobs, page polling of `GET /translate/status/{id}`, explicit `POST /translate/run/{id}`, duplicate run returns 409, one engine job at a time per server process. G4 batch 2 (`8c727f1`) adds cooperative cancellation, timeout, retention and worker-stop waiting; see G4 below. | `server.py`, `frontend/index.html`, `high_level.py` | VERIFIED: 199 passed + 106 subtests, 600M 2-paragraph smoke 63 s / 0 errors, browser cancel working. Normal browser finish plus download after batch 2 is NOT VERIFIED. B-21 remains open for the old route. |
 | B-05 | Open | Confirm repo owner/contribution target and review AGPL plus each font/model/data asset license before deployment. | `LICENSE`, `pyproject.toml`, asset metadata, repository settings | Supervisor/owner confirms rights and asset manifest/source-offer plan. |
 
 ## P1 — engineering foundations
 
 | ID | Status | Item and evidence | Likely files | Acceptance evidence |
 |---|---|---|---|---|
-| B-06 | Open; install failure VERIFIED | Reconcile dependency declarations. `requirements.txt`, `pyproject.toml` and `uv.lock` differ; RapidOCR is `==1.2.3` in requirements versus `>=1.4.4` in project metadata/lock. A fresh install of the afan branch crashed because bitstring 5.0.0 removed `BitStream`, which is imported only at `pdf_creater.py:15`; local commit `5b412d4` pins `bitstring<5` (not pushed). Declare the pin in every dependency source. Map actual imports to direct dependencies before removing packages; web, Arabic and local-model paths need explicit coverage. | `requirements.txt`, `pyproject.toml`, `uv.lock`, `Dockerfile`, source imports | Import-to-package map and clean supported CPU install succeed; GPU optional set is documented; lock and container match. |
+| B-06 | Open; install failure VERIFIED | Reconcile dependency declarations. `requirements.txt`, `pyproject.toml` and `uv.lock` differ; RapidOCR is `==1.2.3` in requirements versus `>=1.4.4` in project metadata/lock. A fresh install of the afan branch crashed because bitstring 5.0.0 removed `BitStream`, which is imported only at `pdf_creater.py:15`; the recorded fix pins `bitstring<5`. Declare the pin in every dependency source. Map actual imports to direct dependencies before removing packages; web, Arabic and local-model paths need explicit coverage. | `requirements.txt`, `pyproject.toml`, `uv.lock`, `Dockerfile`, source imports | Import-to-package map and clean supported CPU install succeed; GPU optional set is documented; lock and container match. |
 | B-07 | Open | Add PR CI for tests and lint; current branch has no workflow files while cached `origin/main` has workflows. | `.github/workflows/` | PR checks run least-privilege and do not publish or auto-write code. |
-| B-08 | Open; compatibility report NOT VERIFIED | Add API tests and unify duplicate model-selection/translation setup in `/translate/start` and `/translate`. Reported blocker: Starlette 0.27.0 + httpx 0.28.1 `TestClient` raises `TypeError` about unexpected keyword `app`. Use `httpx.ASGITransport` for HTTP tests, or plain function tests for helper behavior; neither alternative was executed in this docs task. Do not change the environment. | `server.py`, `tests/` | Both routes have explicit compatibility behavior and common validation covered by tests; helper tests alone do not establish HTTP behavior. |
-| B-09 | Open | Define session storage, worker topology, concurrency and memory limits. Sessions currently live in a module-level dictionary (`server.py:59-60`). | `server.py`, deployment docs | Multi-worker behavior and concurrent model use are tested within documented CPU/RAM/GPU limits. |
+| B-08 | Open; test approach VERIFIED | `TestClient` is broken here with Starlette 0.27.0 + httpx 0.28.1, so tests use `httpx.ASGITransport` inside `asyncio.run`. The old `POST /translate` bypasses job controls (B-21 remains open). | `server.py`, `tests/` | VERIFIED test approach; old-route reconciliation remains open. |
+| B-09 | Open; process boundary VERIFIED | One engine job at a time per server process; the semaphore works within one process only. Sessions and tasks are in memory and lost on restart. | `server.py`, deployment docs | Define session storage, worker topology, concurrency and memory limits. |
 | B-10 | Open | Make Docker reproducible and safer: align dependency source, run as non-root, add health check, define cache/resource behavior. | `Dockerfile`, `.dockerignore`, docs | Image build and smoke test succeed; health check and graceful shutdown verified. |
 
 ## P2 — fidelity and maintainability
@@ -45,7 +50,7 @@ This register groups the backlog by engineering area. `VERIFIED` means the cited
 
 | ID | Evidence | Item, evidence and next proof |
 |---|---|---|
-| B-06 | VERIFIED | Dependency declarations disagree. A fresh install of the afan branch crashed because bitstring 5.0.0 removed `BitStream`, which is imported only at `pdf_creater.py:15`; local commit `5b412d4` pins `bitstring<5` (not pushed). Declare the pin in every dependency source. Supplied `pip show` evidence reports `transformers 4.57.6` required only by `magic-pdf`, and `torch 2.15.0` required only by `magic-pdf`, `torchvision` and `ultralytics`; this docs-only pass did not rerun those commands. `sentencepiece` was reported absent while NLLB works. Declare the libraries used directly by `translator.py:904-912` before removing `magic-pdf` or `ultralytics`, then prove clean CPU/GPU installs. |
+| B-06 | VERIFIED | Dependency declarations disagree. A fresh install of the afan branch crashed because bitstring 5.0.0 removed `BitStream`, which is imported only at `pdf_creater.py:15`; the recorded fix pins `bitstring<5`. Declare the pin in every dependency source. Supplied `pip show` evidence reports `transformers 4.57.6` required only by `magic-pdf`, and `torch 2.15.0` required only by `magic-pdf`, `torchvision` and `ultralytics`; this docs-only pass did not rerun those commands. `sentencepiece` was reported absent while NLLB works. Declare the libraries used directly by `translator.py:904-912` before removing `magic-pdf` or `ultralytics`, then prove clean CPU/GPU installs. |
 | B-10 | VERIFIED | `Dockerfile:14` copies the whole build context and the tracked inventory has no `.dockerignore`. Review required assets first; then prove a reproducible non-root image, health check, cache behavior and smoke test. |
 | B-15 | NOT VERIFIED | Complete the license review: AGPL-3.0 is declared, but hosting/source-offer duties and the font/model asset inventory are unresolved. NLLB weight terms are reported as likely non-commercial but were not verified from the governing model license. Record exact font licenses and redistribution terms before deployment. |
 
@@ -56,7 +61,7 @@ This register groups the backlog by engineering area. `VERIFIED` means the cited
 - **NOT VERIFIED — reported resolver outcome:** installing `transformers==4.57.6` resolved `huggingface-hub` to 0.36.2 in Colab. Preserve the resolver output; do not assume that exact Hub version is required in every environment.
 - **NOT VERIFIED — completeness of direct dependencies:** the blanket claim that no manifest declares all six packages conflicts with source. `requirements.txt:15-19` already declares `arabic-reshaper`, `python-bidi` and `torch`; these are absent from the project runtime list. `transformers`, `accelerate` and `fonttools` have no direct declaration in either runtime manifest. Reconcile the actual imports and supported install paths before removing transitive providers.
 - **LIKELY — stale lock metadata:** `uv.lock:125` still records `bitstring>=4.3.0`, while both runtime manifests now include `<5`; the locked package is 4.3.1 (`uv.lock:266-267`). The bitstring pin likely did not refresh lock metadata. Do not regenerate it during this docs task.
-- **NOT VERIFIED — B-08 API-test compatibility:** Starlette 0.27.0 + httpx 0.28.1 reportedly breaks `TestClient` with unexpected keyword `app`. Plan `httpx.ASGITransport` or helper-level function tests without changing the installed environment; retain HTTP-level coverage as an acceptance requirement.
+- **VERIFIED — B-08 API-test compatibility:** `TestClient` is broken here with Starlette 0.27.0 + httpx 0.28.1, so tests use `httpx.ASGITransport` inside `asyncio.run`.
 
 ### G2 — engine bugs and cleanup
 
@@ -71,8 +76,10 @@ This register groups the backlog by engineering area. `VERIFIED` means the cited
 
 | ID | Evidence | Item, evidence and next proof |
 |---|---|---|
-| B-03 | VERIFIED source; traversal LIKELY | Client filenames reach upload paths and the UI-only 50 MB statement is not an enforced server limit (`server.py:200-206,534-550`; `frontend/index.html:827-832`). The download route builds its path from the `session_id` in the URL with no format check (`server.py:472-495`) and `Content-Disposition` is not quoted (`:505`); path traversal is LIKELY but NOT tested. Add generated names, containment, byte/page/content checks, authorization and expiry tests. |
-| B-09 | VERIFIED | Sessions are process-local in a module dictionary (`server.py:59-60`); concurrency, ownership, worker topology and memory limits need an explicit deployment contract and tests. |
+| B-03 | VERIFIED by tests; Done | G3 server safety is committed: fixed upload file name (`b908064`), upload size cap 50 MB plus `%PDF-` check (`b048202`), session-id validation on download (`0d87c66`), CORS removed (`0d9fefb`), download filename header (`34cff55`), fake `/translate/stream` entry removed (`0a935c1`). UUID check is not authentication. |
+| B-09 | VERIFIED; Open | One engine job at a time per server process; the semaphore works within one process only. Sessions and tasks are in memory and lost on restart. |
+
+**NOT VERIFIED — upload spooling:** Starlette 0.27 probably spools the whole upload before the size cap runs, so the deployment proxy must also cap body size.
 
 ### G4 — job lifecycle and progress
 
@@ -80,10 +87,42 @@ This register groups the backlog by engineering area. `VERIFIED` means the cited
 |---|---|---|
 | B-20 | VERIFIED web-run evidence; reconnect/timing NOT VERIFIED | First real web-path run: 14-page QCB IBAN document, NLLB 600M on laptop CPU, 1297 s, peak 3652 MB; one `POST /translate/start`, one progress connection, one finish, no “Error during NLLB” lines, download 200 OK (VERIFIED from `audit\web-run1.log`, per maintainer). This run completed. Reconnect behavior and first-progress timing remain NOT VERIFIED. Earlier guarded engine-only smoke: 2 paragraphs, 131 s, 4694 MB, 0 swallowed errors, both PDFs, first paragraph about 37 s after translation began. That timing does not establish browser timing. The first unguarded smoke failed with a bootstrapping `RuntimeError` and is not valid benchmark evidence. |
 | B-26 | NOT VERIFIED | Progress counters are reported to look doubled in some output. Preserve an SSE trace and compare emitted current/total values with the engine's unit counts before changing counter aggregation or UI rendering. |
-| B-21 | VERIFIED | `POST /translate/start` and the legacy `POST /translate` are distinct routes (`server.py:171,510`) but duplicate model-selection/translation workflow logic. This is not a duplicate decorator for the same path. Define compatibility, share validation/setup and test both. |
-| B-04 | LIKELY | Translation work is tied to consumption of the SSE progress route (`server.py:228-294`), so reconnect/disconnect behavior may duplicate or strand work. Reproduce reconnect, cancellation, timeout and error terminal states before redesigning the lifecycle. |
-| B-34 | VERIFIED cache bypass; safe enablement NOT VERIFIED | Both web routes construct all three translators with `ignore_cache=True` (`server.py:258,267,275,561,570,578`), so the web path bypasses the translation cache and repeated page headers/footers are re-translated on each page. Whether enabling the cache is safe, including whether its key covers model and language correctly, is NOT VERIFIED. Review key construction, invalidation and repeated-text behavior before changing it. |
-| B-35 | Open; reporting implementation NOT VERIFIED | Show the user a count of skipped or untranslated paragraphs during progress and at completion. Include all three B-17 error-swallowing locations, especially “Error translating paragraph”, rather than relying on the smoke script's single-message `ERRORS` counter. Keep expected pass-through identifiers distinct from skipped translations. Acceptance: each error path updates the appropriate count and the user can see the final totals. |
+| B-21 | VERIFIED; Open | The old `POST /translate` bypasses job controls. |
+| B-04 | VERIFIED; Done for the new route | G4 batch 1 (`3ed2c50`): jobs run in the background; the page polls `GET /translate/status/{id}`; explicit `POST /translate/run/{id}`; duplicate run returns 409; one engine job at a time per server process. G4 batch 2 (`8c727f1`) adds the controls below. |
+| B-34 | Decided: keep the cache off on the web path; no code change | The web path builds translators with `ignore_cache=True`, so it is not affected now. Before enabling the cache: stop caching fallback results, and read the key. See the B-34 decision below. |
+| B-35 | Built; validation pending | Built and committed (841e0db). 212 passed + 106 subtests; real 600M smoke OK (UNTRANSLATED 0). A real forced-failure run and a browser check of the note are NOT VERIFIED. Not done until those are seen. Original requirement (kept): Show the user a count of skipped or untranslated paragraphs during progress and at completion. Include all three B-17 error-swallowing locations, especially 'Error translating paragraph', rather than relying on the smoke script's single-message ERRORS counter. Keep expected pass-through identifiers distinct from skipped translations. Acceptance: each error path updates the appropriate count and the user can see the final totals. Gap: the count currently appears at finish only, not during progress. |
+
+**Model-loading hint (built, browser check pending):**
+
+- Built and committed (7f905b1), page-only.
+- It shows "Loading the translation model. First use can take several minutes. This is not stuck." while the Translate Paragraphs stage is active and 0 paragraphs are done. It hides on the first finished paragraph or any other event.
+- Checked by static tests and a node run on a fake page. How it looks in a real browser is NOT VERIFIED.
+- It cannot tell model loading from a slow first paragraph. A real loading flag waits for B-18.
+
+**B-34 decision:**
+
+- VERIFIED from code: `BaseTranslator.translate()` (`translator.py:432-463`) calls `self.cache.set(text, translation)` after `do_translate` unless `ignore_cache` is set.
+- NLLB and Marian `do_translate` return the source text on error, so that fallback would be cached and reused as if translated.
+- The banking-code AssertionError is raised in `_restore_numerals` before `cache.set`, so it is not cached.
+- The cache key is engine name + engine params JSON + original text (`cache.py:33-47`). Whether the source and target languages are in the params is NOT VERIFIED (`translator.py:396-412` not read).
+- The web path builds translators with `ignore_cache=True`, so it is not affected now.
+- Before enabling the cache: stop caching fallback results, and read the key.
+
+**B-35 limits:**
+
+- (a) The two engine exits and the page note were checked by code shape and static text only.
+- (b) B-30 (silent English with no error) is not counted.
+- (c) The unit is text blocks (translate calls), not paragraphs.
+- (d) The counter has no lock, so it can undercount.
+- (e) A block can rarely count twice.
+- (f) Only the new job route reports it; the old `POST /translate` ignores it (B-21).
+- (g) The count is set at finish only, so it shows 0 while running.
+
+**VERIFIED — G4 batch 2 (`8c727f1`):** cooperative cancel via `POST /translate/cancel/{id}`; `JOB_TIMEOUT_SECONDS` default 3600; `SESSION_TTL_SECONDS` default 86400 with a 60 s sweep; the engine slot is released only after the worker really stops. Cancel and timeout are cooperative, not a hard kill.
+
+**VERIFIED — batch-2 validation:** 199 passed + 106 subtests; a 600M smoke run on the 2-paragraph file took 63 s with 0 errors; a browser cancel was seen working. **NOT VERIFIED:** a normal browser finish plus download after batch 2.
+
+**VERIFIED - still open:** B-35, model-loading hint (built, browser check pending), B-21, B-17 and B-18. **NOT VERIFIED - still open:** B-26 (possibly doubled counters). B-34 is decided: keep the cache off on the web path; no code change.
 
 **B-20 — VERIFIED supplied Colab timing:** the 14-page 3.3B smoke run used `audit\smoke.py` calling `translate()` directly. First-use progress stayed at `0/N` for about nine minutes: the first paragraph started at 11:33:39 and the first finished at 11:42:15 (about 516 s, including weight download and shard loading). This wait occurred on a T4 GPU; the 600M web run had no comparable wait. This is engine-smoke evidence, not a 3.3B browser check. Web reconnect behavior and precise browser first-progress timing remain NOT VERIFIED. See Benchmark for the full timeline.
 
@@ -91,7 +130,7 @@ This register groups the backlog by engineering area. `VERIFIED` means the cited
 
 | ID | Evidence | Item, evidence and next proof |
 |---|---|---|
-| B-01 | VERIFIED implementation/tests; browser NOT VERIFIED | Implemented in `a7ba72f`: real engine stage-name keys and longest-key-first fallback. `tests/test_stage_labels.py` contains 17 tests; full suite at that commit: 94 passed + 106 subtests, VERIFIED by the maintainer's terminal run. Keep open until the browser label/progress check is recorded. API/SSE integration coverage remains pending. |
+| B-01 | VERIFIED implementation/tests; browser NOT VERIFIED | Implemented stage-label fix: real engine stage-name keys and longest-key-first fallback. `tests/test_stage_labels.py` contains 17 tests; full suite at that stage: 94 passed + 106 subtests, VERIFIED by the maintainer's terminal run. Keep open until the browser label/progress check is recorded. API/SSE integration coverage remains pending. |
 | B-14 | VERIFIED T4 observation; true requirements NOT VERIFIED | The Colab T4 3.3B run logged CUDA, 8-bit True and BitsAndBytes enablement with no float16 fallback line; `nvidia-smi` reported 9,451 MiB used, including PyTorch cache. This measurement does not support the UI's “~3.5 GB VRAM” claim (`frontend/index.html:874-889`). True required GPU memory, general accuracy/speed claims and portable memory requirements remain NOT VERIFIED. |
 
 ### G6 — CI, tests and maintained documentation
@@ -100,7 +139,7 @@ This register groups the backlog by engineering area. `VERIFIED` means the cited
 |---|---|---|
 | B-02 | VERIFIED | A guarded `translate()` script completed a clean 600M laptop-CPU run of `sample_en.pdf` (2 paragraphs) in 131 seconds, peaked at 4,694 MB, recorded 0 swallowed errors and produced both PDFs. This verifies an engine smoke baseline, not the web path or an automated test. The first run lacked the `if __name__ == "__main__":` guard, failed with a bootstrapping `RuntimeError`, and is not valid evidence. Add a deterministic automated smoke test that avoids downloading a large model. |
 | B-07 | VERIFIED | The current branch has no workflow files; locally cached upstream refs contain candidates whose permissions/triggers remain unreviewed. Port only reviewed test/lint/security workflows. |
-| B-08 | VERIFIED coverage gap; compatibility report NOT VERIFIED | API routes and duplicated setup lack focused compatibility, validation and terminal-state coverage. Starlette 0.27.0 + httpx 0.28.1 reportedly makes `TestClient` fail with unexpected keyword `app`. Use `httpx.ASGITransport` for HTTP tests or plain function tests for helpers without changing the environment; verify alternatives before unifying implementations. See G1/B-06. |
+| B-08 | VERIFIED test approach; Open | `TestClient` is broken here with Starlette 0.27.0 + httpx 0.28.1, so tests use `httpx.ASGITransport` inside `asyncio.run`. The old `POST /translate` bypasses job controls; B-21 remains open. |
 | B-25 | VERIFIED | On Windows, any standalone script that calls `translate()` needs an `if __name__ == "__main__":` guard because the engine spawns child processes. A smoke script without the guard failed with a multiprocessing bootstrapping `RuntimeError`. Document the guarded pattern and keep it in future smoke tooling. |
 
 ### G7 — translation and layout quality
@@ -120,7 +159,18 @@ This register groups the backlog by engineering area. `VERIFIED` means the cited
 
 ## Benchmark
 
-**VERIFIED — supplied web-run evidence:** first real web-path benchmark at commit `a7ba72f`:
+`sample_en.pdf`, `small.pdf` and `qcb14.pdf` are the same 14-page file.
+
+### G4 batch-2 smoke and browser evidence
+
+- **VERIFIED:** batch 2 is committed as `8c727f1`; tests reported 199 passed + 106 subtests.
+- **VERIFIED:** a 600M smoke run on the 2-paragraph file took 63 s with 0 errors.
+- **VERIFIED:** a browser cancel was seen working.
+- **NOT VERIFIED:** a normal browser finish plus download after batch 2.
+
+### Earlier 14-page web benchmark
+
+**VERIFIED — supplied web-run evidence:** first real web-path benchmark:
 
 | Field | Recorded value |
 |---|---|
@@ -196,17 +246,17 @@ This section carries forward the consolidated review of the old issue reports an
 | Table columns are never mirrored (`issues.md:79-99,185-210`). | Current code clusters table cells and balances rows (`typesetting.py:2728,2819,2918-2964`); RTL grid test exists at `tests/test_formatting_anti_collision.py:843`. | Old claim is stale/incomplete; complex merged headers and real document output remain unverified. | Reproduce with the historical table PDF and record cell-order expectations. |
 | Duplicate text smudges / coordinate collisions (`issues.md:18,60-75`). | Current anti-collision tests cover duplicate ownership and rendered collisions; typesetting uses vertical clearance (`typesetting.py:1363-1390`). | Mitigations/tests exist; historical sample not re-run. | Reproduce the source PDF before treating as open or fixed. |
 | Paragraph merge, acronym duplication and line grouping defects. | Safeguards exist in `paragraph_finder.py:1054-1133`; regression cases cover visual reassembly and acronym deduplication. | Several mitigations appear incorporated; old screenshots unverified. | Treat remaining cases as sample-specific reproduction tasks. |
-| Historical reports say 26/26, 31/31 or 35/35 tests pass. | `tests/test_stage_labels.py` adds 17 tests. The maintainer reports 94 passed + 106 subtests at `a7ba72f` (VERIFIED terminal run); no tests were run for this docs task. | Old counts are historical; the supplied result applies to that commit/environment. Browser/API checks remain NOT VERIFIED. | Record the command, branch/commit, exit status and result for each later run. |
+| Historical reports say 26/26, 31/31 or 35/35 tests pass. | VERIFIED maintainer-supplied batch-2 result: 199 passed + 106 subtests (`8c727f1`). No tests were run for this docs task. | VERIFIED browser cancel; normal browser finish plus download after batch 2 is NOT VERIFIED. | Record the command, branch/commit, exit status and result for each later run. |
 | NLLB long-paragraph truncation was solved (`SESSION_HANDOFF_2026_09_07.md:77-86`). | Sentence-splitting and numeral restoration logic/tests exist in translator code and current tests. | Mitigation exists; current model quality is not verified. | Re-test with supported model versions and known long-paragraph fixtures. |
 | Add Mutarjim or quantized NLLB (`SESSION_HANDOFF:116-122`). | No Mutarjim engine was verified in current translator source; UI/runtime claims were not executed. | Historical exploration, not an approved requirement. | Research model provenance, license, quality and hardware needs before proposing integration. |
 | Full PDF test and scratch cleanup were next steps (`SESSION_HANDOFF:123-127`). | No complete API-to-output test was found; local cache/venv folders exist. | Test gap remains. No deletion should happen before classifying files. | See B-02 and B-16. Preserve user data and environment until reviewed. |
 | “Server running” and environment claims (`SESSION_HANDOFF:105-112`). | Dated record refers to a different path/branch; this audit did not start a server. | Not current verification. | Do not repeat as present state without a fresh run. |
 | Transformers deprecation and Hugging Face warnings (`CLAUDE_BRIEF_ERRORS_AND_ARCHITECTURE.md:165-173`). | Old logs exist; installed library versions and current runtime warning were not checked. | Not verified and version-sensitive. | Inspect current call site/runtime before changing. |
 | Machine paths and old test instructions are current. | Several old docs use `d:\Uni Stuff\...`; active checkout is `D:\transformer\transdoc-afan`. | Stale. | Keep machine-specific paths out of maintained docs; use repository-relative commands. |
-| UI promises a 50 MB limit and layout selection works. | UI text at `frontend/index.html:827-832`; handler does not accept a `layout` argument and no server size cap is visible (`server.py:171-206`). | Verified interface mismatch. | Address in B-03 and B-08 with API tests. |
+| UI promises a 50 MB limit and layout selection works. | VERIFIED: upload size cap 50 MB plus `%PDF-` check committed in `b048202`. The earlier review also recorded that the handler does not accept a `layout` argument (`server.py:171-206`). | B-03 is done and VERIFIED by tests; the separate historical layout-selection finding is unchanged. | B-08 remains open; see the test approach above. |
 | `migrate_toc` bug. | VERIFIED source: invalid iteration at `high_level.py:812` is inside `only_include_translated_page`; the call is wrapped by `try/except` at `:764-769`. The web log contains “No TOC found... skipping migration.” | The function is called on the web path; the buggy conditional branch is not reached by the current server. Branch failure remains NOT VERIFIED by execution. | B-11 (P2): exercise the option with a TOC-bearing PDF and add a focused regression test. |
-| Progress may end early or hang. | Async callback/worker lifecycle is in `high_level.py:415-444,779-784` and `progress_monitor.py:139-147,250-259`. | Lifecycle needs tests; the reported stall cause is unknown. | B-20 and B-04: collect logs/SSE trace; do not guess cause. |
-| Upload, session, CORS and dependency risks. | Upload path uses client name (`server.py:200-206,534-550`), in-memory sessions (`:59-60`), permissive CORS (`:40-47`), divergent dependency declarations. | Verified code-level concerns. | B-03, B-06, B-09 and the security guide. |
+| Progress may end early or hang. | VERIFIED: background jobs and polling (`3ed2c50`), cooperative cancel/timeout and release only after worker stop (`8c727f1`). | B-04 is done for the new route. Normal browser finish plus download after batch 2 is NOT VERIFIED. | B-21, B-35, model-loading hint (built, browser check pending), B-26, B-17 and B-18 remain open. B-34 is decided: keep the cache off on the web path; no code change. |
+| Upload, session, CORS and dependency risks. | VERIFIED: G3 server safety (B-03) is done and committed; the semaphore is process-local and sessions/tasks are in memory and lost on restart. | VERIFIED fixes do not make UUID validation authentication. | B-06, B-09 and the security guide. |
 | CI/security workflows should be restored from `origin/main`. | Cached upstream ref has test, lint and CodeQL workflows; current branch does not. Git histories have no common base. | Workflow availability verified from local refs; suitability not verified. | Port selected workflows after reviewing permissions, triggers and dependency setup; avoid blind history merge or publish workflow. |
 | AGPL and attribution are settled by the main project license. | Project declares AGPL-3.0 and has upstream attribution, but asset metadata references fonts/models without a complete verified inventory. | Project license declaration verified; legal deployment and asset rights unresolved. | B-05/B-15 and `SECURITY_AND_DEPLOYMENT.md`. |
 
@@ -234,7 +284,7 @@ These source-based corrections have been reconciled into the maintained document
 - VERIFIED by text search/source read: maintained `ARCHITECTURE.md` already states 13 stages, matching the 13 active entries in `TRANSLATE_STAGES` (`high_level.py:70-84`); the commented-out stage is excluded. No architecture edit was needed.
 - VERIFIED by text search/source read: `ENGINES_AND_SERVER.md` already lists the real events from `server.py:245-428`: `init`, `stage_summary`, `progress_start`, `progress_update`, `progress_end`, `finish`, `error`. No event-name edit was needed; SSE runtime was NOT VERIFIED in this task.
 - The NLLB model is loaded on first use (`translator.py:905-926`), so loading/download time may explain an apparent stall. This remains a hypothesis; B-20 requires timestamps to distinguish it from slow inference or errors.
-- Job work occurs while the SSE progress route is consumed (`server.py:228-294`). Duplicate work on reconnect needs reproduction before choosing a background-task/status-endpoint design; add that case to B-04.
+- **VERIFIED — current lifecycle:** jobs run in the background (`3ed2c50`); the page polls `GET /translate/status/{id}` after explicit `POST /translate/run/{id}`. Duplicate run returns 409. B-04 is done for the new route; B-21 remains open because the old `POST /translate` bypasses job controls.
 - Translator fallback paths return cleaned source text (`translator.py:824-826,1007-1009`), while an output file makes the server report completion (`server.py:410-418`); this is tracked as B-17.
 - Docker copies the full context (`Dockerfile:14`); no `.dockerignore` exists in the tracked inventory. Review required assets before adding one under B-10.
 - Explain the difference between package version, API version and product branding rather than silently unifying them.
@@ -244,8 +294,8 @@ These source-based corrections have been reconciled into the maintained document
 These are code-reading tasks; they do not modify the repository:
 
 1. Find `TRANSLATE_STAGES` in `high_level.py`; follow the Paragraph stage into `paragraph_finder.py` and identify how completion is reported.
-2. Trace upload in `server.py` into the browser EventSource in `frontend/index.html`. Note where the upload is stored and which ID is used to access progress/downloads.
+2. Trace upload in `server.py` into the explicit run request and status polling in `frontend/index.html`. Note where the upload is stored and which ID is used to access progress/downloads.
 3. Compare one historical finding above (ordinals or PUA bullets) with the current test. Explain what the unit test proves and what a real PDF render would still need to verify.
 4. Compare `Dockerfile`, `requirements.txt`, `pyproject.toml` and `uv.lock`; list disagreements without changing them.
 
-Suggested engineering sequence: preserve the guarded smoke and web benchmark evidence; finish the pending browser check and API tests for the implemented stage-label fix (G5/G6); address server safety (G3); make the job lifecycle reliable (G4); reconcile dependencies (G1); resolve ownership and license decisions (B-05, B-15) before deployment; prepare and verify deployment; then work through translation/layout quality (G7) and cleanup. Proposed steps are plans, not VERIFIED outcomes.
+**VERIFIED - current progress:** G3 server safety (B-03) is done and committed; B-04 is done for the new route. Still open: B-35, model-loading hint (built, browser check pending), B-21, B-17 and B-18. B-34 is decided: keep the cache off on the web path; no code change. B-26 remains open and **NOT VERIFIED**. A normal browser finish plus download after batch 2 is **NOT VERIFIED**. The remaining dependency, ownership/license, deployment, quality and cleanup plans above are unchanged.
