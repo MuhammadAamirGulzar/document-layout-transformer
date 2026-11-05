@@ -81,6 +81,20 @@ When a job appears stuck or ends without a PDF, collect:
 
 Do not include secrets or sensitive document text in public bug reports. VERIFIED supplied evidence: the first 14-page QCB IBAN web run completed with 600M on laptop CPU in 1297 s, peak 3652 MB, one submission/progress connection/finish, no “Error during NLLB” lines and download 200 OK. Reconnect behavior and first-progress timing remain NOT VERIFIED. See B-20 and the Benchmark section in [`ENGINEERING_BACKLOG.md`](ENGINEERING_BACKLOG.md).
 
+### Smoke-script error-counter coverage
+
+**VERIFIED — supplied Colab trace analysis:** the smoke script's `ERRORS` counter only matches “Error during NLLB translation” (`translator.py:1008`). It misses the separate “Error translating paragraph” path, including the banking-code byte-identity guard assertion for `IIBBAANN` (B-17/B-30). The Colab run completed with `ERRORS 0` and both PDFs despite that paragraph error. Treat the printed counter as one-path coverage, not proof that no errors occurred.
+
+Also count both messages in the saved log with PowerShell `Select-String`. Replace the placeholder with the actual saved log path; these commands are documented, not executed in this docs task:
+
+```powershell
+$savedLog = 'path\to\saved-run.log'
+@(Select-String -LiteralPath $savedLog -SimpleMatch 'Error during NLLB translation').Count
+@(Select-String -LiteralPath $savedLog -SimpleMatch 'Error translating paragraph').Count
+```
+
+These are matching-log-line counts, not necessarily distinct failed paragraphs. Inspect the surrounding traceback and paragraph ID before assigning cause or impact. The guard appears to fail closed (LIKELY); its paragraph's output PDF appearance and whether the same paragraph failed in the 600M web run remain NOT VERIFIED.
+
 ## Packaging for notebook experiments
 
 **LIKELY packaging failure; archive execution NOT VERIFIED here:** Git stores LFS pointer stubs for the CMap assets under `babeldoc/pdfminer/cmap/` (pointer text is visible in committed blobs). A plain `git archive` zip retains those stubs instead of usable asset contents, making it unsuitable for this experiment. Build the zip from the working tree with real LFS asset contents present; confirm those files are hydrated before packaging. Include the required source/assets, not `.git`, `.venv`, secrets or unrelated uploads. No zip was built during this docs task.
