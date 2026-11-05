@@ -3,6 +3,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shutil
 import tempfile
 import uuid
@@ -213,6 +214,17 @@ def _copy_limited(src, buffer):
         buffer.close()
         shutil.rmtree(Path(name).parent, ignore_errors=True)
         raise
+
+
+SESSION_ID_PATTERN = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+    r"|session_[0-9a-f]{16}"
+)
+
+
+def _valid_session_id(value):
+    """True only for ids this server makes: a uuid4 or the older session_ + 16 hex."""
+    return bool(value) and SESSION_ID_PATTERN.fullmatch(value) is not None
 
 
 def _display_name(name):
@@ -507,6 +519,8 @@ async def download_translation(session_id: str, type: Optional[str] = "mono"):
     Download the translated PDF file.
     type: 'mono' (Arabic only) or 'dual' (side-by-side English + Arabic)
     """
+    if not _valid_session_id(session_id):
+        raise HTTPException(status_code=404, detail="Session not found")
     session = translation_sessions.get(session_id)
     req_type = (type or "mono").lower()
 
