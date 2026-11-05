@@ -281,227 +281,338 @@ async def start_translation(
     return {"session_id": session_id}
 
 
+# One model job at a time in this server process. Uploads remain upload-only.
+_job_slots = asyncio.Semaphore(1)
+_terminal_states = {"completed", "error"}
+
+
+def _job_session(session_id):
+    if not _valid_session_id(session_id) or session_id not in translation_sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return translation_sessions[session_id]
+
+
+def _job_event(session, event):
+    session["_event_id"] = session.get("_event_id", 0) + 1
+    event = dict(event, event_id=session["_event_id"])
+    history = session.setdefault("_events", [])
+    history.append(event)
+    # Bound retained progress history; preserve the stage summary for late readers.
+    del history[:-512]
+    if event.get("type") == "stage_summary":
+        session["_stage_summary"] = event
+
+
+def _job_error(session, message):
+    session["status"] = "error"
+    session["error"] = message
+    _job_event(session, {"type": "error", "error": message})
+
+
+async def _run_job(session):
+    try:
+        async with _job_slots:
+            final = None
+            async for raw in _translation_events(session):
+                # Keep one event format for the existing SSE adapter and polling.
+                event = json.loads(raw.removeprefix("data: ").strip())
+                if event.get("type") == "finish":
+                    final = event
+                else:
+                    _job_event(session, event)
+            # Drain the engine stream before declaring success/releasing the slot.
+            if session.get("status") == "error":
+                return
+            output = session.get("output_path")
+            if final is None:
+                _job_error(session, "Translation ended without a finish event")
+            elif not output or not Path(output).is_file():
+                _job_error(session, "Translation completed but output file not found")
+            else:
+                session["status"] = "completed"
+                session["progress"] = 100
+                _job_event(session, final)
+    except asyncio.CancelledError:
+        _job_error(session, "Translation task was cancelled")
+        raise
+    except Exception as exc:
+        logger.exception("Background translation failed")
+        _job_error(session, str(exc))
+
+
+def _schedule_job(session):
+    # No await between the check and assignment: duplicate requests share one task.
+    if session.get("_task") is not None or session.get("status") in _terminal_states:
+        return False
+    session["status"] = "queued"
+    session["error"] = None
+    _job_event(session, {"type": "init", "message": "Queued for translation..."})
+    session["_task"] = asyncio.create_task(_run_job(session))
+    return True
+
+
+def _job_events_after(session, after):
+    events = [event for event in session.get("_events", []) if event["event_id"] > after]
+    summary = session.get("_stage_summary")
+    if after == 0 and summary and summary not in events:
+        events.insert(0, summary)
+    return events
+
+
+@app.post("/translate/run/{session_id}")
+async def run_translation_job(session_id: str):
+    session = _job_session(session_id)
+    if not _schedule_job(session):
+        raise HTTPException(status_code=409, detail="Job already started")
+    return {"session_id": session_id, "status": session["status"]}
+
+
+@app.get("/translate/status/{session_id}")
+async def translation_job_status(session_id: str, after: int = 0):
+    session = _job_session(session_id)
+    if after < 0:
+        raise HTTPException(status_code=400, detail="Event cursor must be non-negative")
+    return {
+        "session_id": session_id,
+        "status": session["status"],
+        "progress": session.get("progress", 0),
+        "stage": session.get("stage", "Initializing"),
+        "error": session.get("error"),
+        "has_mono": bool(session.get("mono_output_path")),
+        "has_dual": bool(session.get("dual_output_path")),
+        "events": _job_events_after(session, after),
+        "next_event_id": session.get("_event_id", 0),
+    }
+
+
 @app.get("/translate/progress/{session_id}")
 async def get_translation_progress(session_id: str):
-    """
-    Stream translation progress events using Server-Sent Events (SSE).
-    """
-    if session_id not in translation_sessions:
-        raise HTTPException(status_code=404, detail="Session not found")
-    
-    session = translation_sessions[session_id]
-    
-    async def event_generator():
-        """Generate SSE events for translation progress"""
-        try:
-            # Update session status
-            session["status"] = "processing"
-            
-            # Send initial event
-            yield f"data: {json.dumps({'type': 'init', 'message': 'Starting translation...'})}\n\n"
-            
-            # Create translator
-            selected_model = session.get("model", "nllb")
-            openai_api_key = os.getenv("OPENAI_API_KEY")
-            
-            if selected_model and selected_model.startswith("gpt") and openai_api_key:
-                logger.info(f"Using OpenAITranslator with model {selected_model}")
-                translator = OpenAITranslator(
-                    lang_in=LANGUAGE_CODES[session["source_lang"]],
-                    lang_out=LANGUAGE_CODES[session["target_lang"]],
-                    model=selected_model,
-                    api_key=openai_api_key,
-                    ignore_cache=True
-                )
-                auto_extract = True
-            elif selected_model and ("nllb" in selected_model.lower() or "facebook" in selected_model.lower()):
-                logger.info(f"Using local Meta NLLBTranslator (model: {selected_model})")
-                translator = NLLBTranslator(
-                    lang_in=LANGUAGE_CODES[session["source_lang"]],
-                    lang_out=LANGUAGE_CODES[session["target_lang"]],
-                    model_name=selected_model,
-                    ignore_cache=True
-                )
-                auto_extract = False
-            else:
-                logger.info("Using local MarianMTTranslator (offline, no API key required)")
-                translator = MarianMTTranslator(
-                    lang_in=LANGUAGE_CODES[session["source_lang"]],
-                    lang_out=LANGUAGE_CODES[session["target_lang"]],
-                    ignore_cache=True
-                )
-                auto_extract = False
-            
-            # Configure translation
-            config = TranslationConfig(
-                translator=translator,
-                input_file=session["input_path"],
+    session = _job_session(session_id)
+    # Compatibility for existing SSE clients: start once, then only observe.
+    _schedule_job(session)
+
+    async def observe():
+        cursor = 0
+        while True:
+            for event in _job_events_after(session, cursor):
+                yield f"data: {json.dumps(event)}\n\n"
+                cursor = max(cursor, event["event_id"])
+            if session["status"] in _terminal_states:
+                return
+            await asyncio.sleep(0.05)
+
+    return StreamingResponse(observe(), media_type="text/event-stream", headers={
+        "Cache-Control": "no-cache", "X-Accel-Buffering": "no",
+    })
+
+
+async def _translation_events(session):
+    """Generate SSE events for translation progress"""
+    try:
+        # Update session status
+        session["status"] = "processing"
+
+        # Send initial event
+        yield f"data: {json.dumps({'type': 'init', 'message': 'Starting translation...'})}\n\n"
+
+        # Create translator
+        selected_model = session.get("model", "nllb")
+        openai_api_key = os.getenv("OPENAI_API_KEY")
+
+        if selected_model and selected_model.startswith("gpt") and openai_api_key:
+            logger.info(f"Using OpenAITranslator with model {selected_model}")
+            translator = OpenAITranslator(
                 lang_in=LANGUAGE_CODES[session["source_lang"]],
                 lang_out=LANGUAGE_CODES[session["target_lang"]],
-                output_dir=session["output_directory"],
-                doc_layout_model=None,
-                pages=None,
-                skip_clean=False,
-                auto_extract_glossary=auto_extract,
+                model=selected_model,
+                api_key=openai_api_key,
+                ignore_cache=True
             )
-            
-            # Process translation and stream progress
-            translate_result = None
-            async for event in async_translate(config):
-                event_type = event.get("type", "unknown")
-                
-                if event_type == "stage_summary":
-                    # Send stage information
-                    stages = event.get("stages", [])
-                    stage_info = [
-                        {
-                            "name": s["name"],
-                            "display_name": get_display_stage_name(s["name"]),
-                            "percent": round(s["percent"] * 100, 1)
-                        }
-                        for s in stages
-                    ]
-                    yield f"data: {json.dumps({'type': 'stage_summary', 'stages': stage_info})}\n\n"
-                
-                elif event_type == "progress_start":
-                    stage = event.get("stage", "Unknown")
-                    display_name = get_display_stage_name(stage)
-                    session["stage"] = display_name
-                    
-                    progress_event = {
-                        "type": "progress_start",
-                        "stage": stage,
-                        "display_name": display_name,
-                        "stage_progress": 0,
-                        "stage_current": event.get("stage_current", 0),
-                        "stage_total": event.get("stage_total", 0),
-                        "overall_progress": event.get("overall_progress", 0),
-                        "part_index": event.get("part_index", 1),
-                        "total_parts": event.get("total_parts", 1),
-                    }
-                    yield f"data: {json.dumps(progress_event)}\n\n"
-                
-                elif event_type == "progress_update":
-                    stage = event.get("stage", "Unknown")
-                    display_name = get_display_stage_name(stage)
-                    overall_progress = event.get("overall_progress", 0)
-                    
-                    session["stage"] = display_name
-                    session["progress"] = overall_progress
-                    
-                    progress_event = {
-                        "type": "progress_update",
-                        "stage": stage,
-                        "display_name": display_name,
-                        "stage_progress": round(event.get("stage_progress", 0), 1),
-                        "stage_current": event.get("stage_current", 0),
-                        "stage_total": event.get("stage_total", 0),
-                        "overall_progress": round(overall_progress, 1),
-                        "part_index": event.get("part_index", 1),
-                        "total_parts": event.get("total_parts", 1),
-                    }
-                    yield f"data: {json.dumps(progress_event)}\n\n"
-                
-                elif event_type == "progress_end":
-                    stage = event.get("stage", "Unknown")
-                    display_name = get_display_stage_name(stage)
-                    overall_progress = event.get("overall_progress", 0)
-                    
-                    session["progress"] = overall_progress
-                    
-                    progress_event = {
-                        "type": "progress_end",
-                        "stage": stage,
-                        "display_name": display_name,
-                        "stage_progress": 100,
-                        "stage_current": event.get("stage_total", 0),
-                        "stage_total": event.get("stage_total", 0),
-                        "overall_progress": round(overall_progress, 1),
-                        "part_index": event.get("part_index", 1),
-                        "total_parts": event.get("total_parts", 1),
-                    }
-                    yield f"data: {json.dumps(progress_event)}\n\n"
-                
-                elif event_type == "finish":
-                    translate_result = event.get("translate_result")
-                    session["status"] = "completed"
-                    session["progress"] = 100
-                    session["result"] = translate_result
-                    
-                    # Find output files (both mono and dual side-by-side)
-                    mono_pdf = None
-                    dual_pdf = None
-                    output_directory = Path(session["output_directory"])
-                    
-                    if translate_result:
-                        if hasattr(translate_result, 'mono_pdf_path') and translate_result.mono_pdf_path:
-                            mono_pdf = translate_result.mono_pdf_path
-                        elif hasattr(translate_result, 'no_watermark_mono_pdf_path') and translate_result.no_watermark_mono_pdf_path:
-                            mono_pdf = translate_result.no_watermark_mono_pdf_path
+            auto_extract = True
+        elif selected_model and ("nllb" in selected_model.lower() or "facebook" in selected_model.lower()):
+            logger.info(f"Using local Meta NLLBTranslator (model: {selected_model})")
+            translator = NLLBTranslator(
+                lang_in=LANGUAGE_CODES[session["source_lang"]],
+                lang_out=LANGUAGE_CODES[session["target_lang"]],
+                model_name=selected_model,
+                ignore_cache=True
+            )
+            auto_extract = False
+        else:
+            logger.info("Using local MarianMTTranslator (offline, no API key required)")
+            translator = MarianMTTranslator(
+                lang_in=LANGUAGE_CODES[session["source_lang"]],
+                lang_out=LANGUAGE_CODES[session["target_lang"]],
+                ignore_cache=True
+            )
+            auto_extract = False
 
-                        if hasattr(translate_result, 'dual_pdf_path') and translate_result.dual_pdf_path:
-                            dual_pdf = translate_result.dual_pdf_path
-                        elif hasattr(translate_result, 'no_watermark_dual_pdf_path') and translate_result.no_watermark_dual_pdf_path:
-                            dual_pdf = translate_result.no_watermark_dual_pdf_path
-                    
-                    # Fallback to searching output directory
-                    if not mono_pdf or not Path(mono_pdf).exists():
-                        monos = list(output_directory.glob("*.mono.pdf"))
-                        if monos:
-                            mono_pdf = str(monos[0])
-                        else:
-                            all_pdfs = [p for p in output_directory.glob("*.pdf") if not p.name.endswith(".dual.pdf")]
-                            if all_pdfs:
-                                mono_pdf = str(all_pdfs[0])
+        # Configure translation
+        config = TranslationConfig(
+            translator=translator,
+            input_file=session["input_path"],
+            lang_in=LANGUAGE_CODES[session["source_lang"]],
+            lang_out=LANGUAGE_CODES[session["target_lang"]],
+            output_dir=session["output_directory"],
+            doc_layout_model=None,
+            pages=None,
+            skip_clean=False,
+            auto_extract_glossary=auto_extract,
+        )
 
-                    if not dual_pdf or not Path(dual_pdf).exists():
-                        duals = list(output_directory.glob("*.dual.pdf"))
-                        if duals:
-                            dual_pdf = str(duals[0])
-                    
-                    session["mono_output_path"] = str(mono_pdf) if mono_pdf and Path(mono_pdf).exists() else None
-                    session["dual_output_path"] = str(dual_pdf) if dual_pdf and Path(dual_pdf).exists() else None
-                    session["output_path"] = session["mono_output_path"] or session["dual_output_path"]
-                    
-                    if session["output_path"]:
-                        finish_payload = {
-                            "type": "finish",
-                            "overall_progress": 100,
-                            "message": "Translation completed!",
-                            "has_mono": bool(session["mono_output_path"]),
-                            "has_dual": bool(session["dual_output_path"])
-                        }
-                        yield f"data: {json.dumps(finish_payload)}\n\n"
+        # Process translation and stream progress
+        translate_result = None
+        finish_seen = False
+        async for event in async_translate(config):
+            event_type = event.get("type", "unknown")
+            if finish_seen and event_type == "error" and event.get("error") is asyncio.CancelledError:
+                # ProgressMonitor.on_finish emits this class as a completion sentinel.
+                continue
+
+            if event_type == "stage_summary":
+                # Send stage information
+                stages = event.get("stages", [])
+                stage_info = [
+                    {
+                        "name": s["name"],
+                        "display_name": get_display_stage_name(s["name"]),
+                        "percent": round(s["percent"] * 100, 1)
+                    }
+                    for s in stages
+                ]
+                yield f"data: {json.dumps({'type': 'stage_summary', 'stages': stage_info})}\n\n"
+
+            elif event_type == "progress_start":
+                stage = event.get("stage", "Unknown")
+                display_name = get_display_stage_name(stage)
+                session["stage"] = display_name
+
+                progress_event = {
+                    "type": "progress_start",
+                    "stage": stage,
+                    "display_name": display_name,
+                    "stage_progress": 0,
+                    "stage_current": event.get("stage_current", 0),
+                    "stage_total": event.get("stage_total", 0),
+                    "overall_progress": event.get("overall_progress", 0),
+                    "part_index": event.get("part_index", 1),
+                    "total_parts": event.get("total_parts", 1),
+                }
+                yield f"data: {json.dumps(progress_event)}\n\n"
+
+            elif event_type == "progress_update":
+                stage = event.get("stage", "Unknown")
+                display_name = get_display_stage_name(stage)
+                overall_progress = event.get("overall_progress", 0)
+
+                session["stage"] = display_name
+                session["progress"] = overall_progress
+
+                progress_event = {
+                    "type": "progress_update",
+                    "stage": stage,
+                    "display_name": display_name,
+                    "stage_progress": round(event.get("stage_progress", 0), 1),
+                    "stage_current": event.get("stage_current", 0),
+                    "stage_total": event.get("stage_total", 0),
+                    "overall_progress": round(overall_progress, 1),
+                    "part_index": event.get("part_index", 1),
+                    "total_parts": event.get("total_parts", 1),
+                }
+                yield f"data: {json.dumps(progress_event)}\n\n"
+
+            elif event_type == "progress_end":
+                stage = event.get("stage", "Unknown")
+                display_name = get_display_stage_name(stage)
+                overall_progress = event.get("overall_progress", 0)
+
+                session["progress"] = overall_progress
+
+                progress_event = {
+                    "type": "progress_end",
+                    "stage": stage,
+                    "display_name": display_name,
+                    "stage_progress": 100,
+                    "stage_current": event.get("stage_total", 0),
+                    "stage_total": event.get("stage_total", 0),
+                    "overall_progress": round(overall_progress, 1),
+                    "part_index": event.get("part_index", 1),
+                    "total_parts": event.get("total_parts", 1),
+                }
+                yield f"data: {json.dumps(progress_event)}\n\n"
+
+            elif event_type == "finish":
+                finish_seen = True
+                translate_result = event.get("translate_result")
+                session["result"] = translate_result
+
+                # Find output files (both mono and dual side-by-side)
+                mono_pdf = None
+                dual_pdf = None
+                output_directory = Path(session["output_directory"])
+
+                if translate_result:
+                    if hasattr(translate_result, 'mono_pdf_path') and translate_result.mono_pdf_path:
+                        mono_pdf = translate_result.mono_pdf_path
+                    elif hasattr(translate_result, 'no_watermark_mono_pdf_path') and translate_result.no_watermark_mono_pdf_path:
+                        mono_pdf = translate_result.no_watermark_mono_pdf_path
+
+                    if hasattr(translate_result, 'dual_pdf_path') and translate_result.dual_pdf_path:
+                        dual_pdf = translate_result.dual_pdf_path
+                    elif hasattr(translate_result, 'no_watermark_dual_pdf_path') and translate_result.no_watermark_dual_pdf_path:
+                        dual_pdf = translate_result.no_watermark_dual_pdf_path
+
+                # Fallback to searching output directory
+                if not mono_pdf or not Path(mono_pdf).exists():
+                    monos = list(output_directory.glob("*.mono.pdf"))
+                    if monos:
+                        mono_pdf = str(monos[0])
                     else:
-                        yield f"data: {json.dumps({'type': 'error', 'error': 'Translation completed but output file not found'})}\n\n"
-                    
-                    break
-                
-                elif event_type == "error":
-                    error_msg = str(event.get("error", "Unknown error"))
+                        all_pdfs = [p for p in output_directory.glob("*.pdf") if not p.name.endswith(".dual.pdf")]
+                        if all_pdfs:
+                            mono_pdf = str(all_pdfs[0])
+
+                if not dual_pdf or not Path(dual_pdf).exists():
+                    duals = list(output_directory.glob("*.dual.pdf"))
+                    if duals:
+                        dual_pdf = str(duals[0])
+
+                session["mono_output_path"] = str(mono_pdf) if mono_pdf and Path(mono_pdf).exists() else None
+                session["dual_output_path"] = str(dual_pdf) if dual_pdf and Path(dual_pdf).exists() else None
+                session["output_path"] = session["mono_output_path"] or session["dual_output_path"]
+
+                if session["output_path"]:
+                    finish_payload = {
+                        "type": "finish",
+                        "overall_progress": 100,
+                        "message": "Translation completed!",
+                        "has_mono": bool(session["mono_output_path"]),
+                        "has_dual": bool(session["dual_output_path"])
+                    }
+                    yield f"data: {json.dumps(finish_payload)}\n\n"
+                else:
                     session["status"] = "error"
-                    session["error"] = error_msg
-                    yield f"data: {json.dumps({'type': 'error', 'error': error_msg})}\n\n"
-                    break
-                
-                # Small delay to prevent overwhelming the client
-                await asyncio.sleep(0.05)
-            
-        except Exception as e:
-            logger.error(f"Translation error: {str(e)}", exc_info=True)
-            session["status"] = "error"
-            session["error"] = str(e)
-            yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
-    
-    return StreamingResponse(
-        event_generator(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        }
-    )
+                    session["error"] = "Translation completed but output file not found"
+                    yield f"data: {json.dumps({'type': 'error', 'error': 'Translation completed but output file not found'})}\n\n"
+
+                # Drain the engine after its finish event.
+
+            elif event_type == "error":
+                error_msg = str(event.get("error", "Unknown error"))
+                session["status"] = "error"
+                session["error"] = error_msg
+                yield f"data: {json.dumps({'type': 'error', 'error': error_msg})}\n\n"
+                break
+
+            # Small delay to prevent overwhelming the client
+            await asyncio.sleep(0.05)
+
+    except Exception as e:
+        logger.error(f"Translation error: {str(e)}", exc_info=True)
+        session["status"] = "error"
+        session["error"] = str(e)
+        yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
+
 
 
 @app.get("/translate/download/{session_id}")

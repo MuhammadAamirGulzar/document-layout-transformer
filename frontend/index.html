@@ -1033,7 +1033,7 @@
 
         let selectedFile = null;
         let currentSessionId = null;
-        let eventSource = null;
+        let pollStopped = false;
         let completedStages = new Set();
         let allStages = [];
 
@@ -1226,16 +1226,9 @@
             await startTranslation(selectedFile, sourceLang, targetLang);
         });
 
-        // Cancel button
-        cancelBtn.addEventListener('click', () => {
-            if (eventSource) {
-                eventSource.close();
-                eventSource = null;
-            }
-            hideProgress();
-            translateBtn.disabled = false;
-            showError('Translation cancelled');
-        });
+        // A disconnected browser no longer cancels the background job.
+        cancelBtn.disabled = true;
+        cancelBtn.title = 'This job runs on the server. Cancellation will be enabled separately.';
 
         // Model Selection
         function selectModel(modelKey) {
@@ -1296,7 +1289,7 @@
                 currentSessionId = session_id;
 
                 // Step 2: Connect to progress stream
-                connectToProgressStream(session_id);
+                await startJobAndPoll(session_id);
 
             } catch (error) {
                 console.error('Translation error:', error);
@@ -1306,18 +1299,19 @@
             }
         }
 
-        function connectToProgressStream(sessionId) {
-            eventSource = new EventSource(`${API_BASE_URL}/translate/progress/${sessionId}`);
-
+        async function startJobAndPoll(sessionId) {
+            pollStopped = false;
+            const started = await fetch(`${API_BASE_URL}/translate/run/${sessionId}`, { method: 'POST' });
+            if (!started.ok && started.status !== 409) {
+                const body = await started.json();
+                throw new Error(body.detail || 'Could not run translation');
+            }
+            let cursor = 0;
             let currentActiveStage = null;
-
-            eventSource.onmessage = (event) => {
-                try {
-                    const data = JSON.parse(event.data);
-                    
+            function renderEvent(data) {
                     switch (data.type) {
                         case 'init':
-                            updateCurrentStage('⏳ Initializing translation...', 0, 0, 0);
+                            updateCurrentStage(data.message || 'Initializing translation...', 0, 0, 0);
                             break;
 
                         case 'stage_summary':
@@ -1376,8 +1370,7 @@
                             stageSpinner.style.display = 'none';
                             currentStageName.textContent = '✅ Translation Complete!';
                             
-                            eventSource.close();
-                            eventSource = null;
+                            pollStopped = true;
 
                             configureDownloadButtons(data);
                             
@@ -1388,31 +1381,45 @@
                             break;
 
                         case 'error':
-                            eventSource.close();
-                            eventSource = null;
+                            pollStopped = true;
                             hideProgress();
                             showError(data.error || 'An error occurred during translation');
                             translateBtn.disabled = false;
                             break;
                     }
-                } catch (e) {
-                    console.error('Error parsing progress event:', e);
+            }
+            async function poll() {
+                if (pollStopped) return;
+                try {
+                    const response = await fetch(`${API_BASE_URL}/translate/status/${sessionId}?after=${cursor}`);
+                    if (!response.ok) {
+                        if (response.status === 404) {
+                            pollStopped = true;
+                            hideProgress();
+                            showError('Job not found. The server may have restarted.');
+                            translateBtn.disabled = false;
+                            return;
+                        }
+                        throw new Error('Status temporarily unavailable');
+                    }
+                    const state = await response.json();
+                    for (const event of state.events) {
+                        renderEvent(event);
+                        cursor = Math.max(cursor, event.event_id || 0);
+                    }
+                    cursor = Math.max(cursor, state.next_event_id || 0);
+                    if (state.status === 'error' && !pollStopped) {
+                        pollStopped = true;
+                        hideProgress();
+                        showError(state.error || 'Translation failed');
+                        translateBtn.disabled = false;
+                    }
+                } catch (error) {
+                    console.warn('Retrying status request; job remains on the server.', error);
                 }
-            };
-
-            eventSource.onerror = (error) => {
-                console.error('EventSource error:', error);
-                if (eventSource) {
-                    eventSource.close();
-                    eventSource = null;
-                }
-                // Don't show error if translation completed
-                if (!resultContainer.classList.contains('active')) {
-                    hideProgress();
-                    showError('Connection lost. Please try again.');
-                    translateBtn.disabled = false;
-                }
-            };
+                if (!pollStopped) setTimeout(poll, 1000);
+            }
+            await poll();
         }
 
         function updateCurrentStage(name, progress, current, total) {
