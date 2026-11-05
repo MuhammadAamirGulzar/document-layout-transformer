@@ -867,7 +867,7 @@
         <div class="model-selection">
             <label>Translation AI Engine:</label>
             <div class="model-toggle-group">
-                <div class="model-card active" data-model="nllb-3.3b" onclick="selectModel('nllb-3.3b')">
+                <div class="model-card" data-model="nllb-3.3b" onclick="selectModel('nllb-3.3b')">
                     <div class="model-card-header">
                         <div class="model-card-left">
                             <div class="model-radio-custom"></div>
@@ -878,7 +878,7 @@
                     <div class="model-desc">Meta's flagship 3.3B parameter model with 8-bit GPU acceleration. Highest accuracy Arabic translation (~3.5 GB VRAM).</div>
                 </div>
 
-                <div class="model-card" data-model="nllb" onclick="selectModel('nllb')">
+                <div class="model-card active" data-model="nllb" onclick="selectModel('nllb')">
                     <div class="model-card-header">
                         <div class="model-card-left">
                             <div class="model-radio-custom"></div>
@@ -911,7 +911,7 @@
                     <div class="model-desc">Deep document context & formatting preservation (requires OPENAI_API_KEY).</div>
                 </div>
             </div>
-            <input type="hidden" id="selectedModel" value="nllb-3.3b">
+            <input type="hidden" id="selectedModel" value="nllb">
         </div>
 
         <div class="layout-selection">
