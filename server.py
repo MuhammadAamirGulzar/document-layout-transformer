@@ -168,6 +168,12 @@ async def get_supported_languages():
     }
 
 
+def _display_name(name):
+    """Name shown to the user. It is never used as a path on disk."""
+    cleaned = (name or "").replace("\\", "/").split("/")[-1].strip()
+    return cleaned or "document.pdf"
+
+
 @app.post("/translate/start")
 async def start_translation(
     file: UploadFile = File(...),
@@ -197,7 +203,7 @@ async def start_translation(
     session_dir = TEMP_DIR / session_id
     session_dir.mkdir(exist_ok=True)
     
-    input_path = session_dir / file.filename
+    input_path = session_dir / "input.pdf"
     output_directory = session_dir / "output"
     output_directory.mkdir(exist_ok=True)
     
@@ -213,7 +219,7 @@ async def start_translation(
         "source_lang": source_lang,
         "target_lang": target_lang,
         "model": model,
-        "filename": file.filename,
+        "filename": _display_name(file.filename),
         "progress": 0,
         "stage": "Initializing",
         "result": None,
@@ -536,7 +542,7 @@ async def translate_document(
     session_dir = TEMP_DIR / session_id
     session_dir.mkdir(exist_ok=True)
     
-    input_path = session_dir / file.filename
+    input_path = session_dir / "input.pdf"
     output_directory = session_dir / "output"
     output_directory.mkdir(exist_ok=True)
     
