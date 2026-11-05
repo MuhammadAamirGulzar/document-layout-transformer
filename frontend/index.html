@@ -999,6 +999,7 @@
             <div class="result-icon">🎉</div>
             <div class="result-text">Translation Completed!</div>
             <div class="result-subtext">Your document has been translated with preserved layout. Choose your preferred format to download:</div>
+            <div id="untranslatedNote" class="result-subtext" style="display:none; background:#fffbeb; border:1px solid #fcd34d; color:#92400e; border-radius:8px; padding:10px 12px;"></div>
             
             <div class="download-action-grid" id="downloadActionGrid">
                 <button class="download-btn download-btn-dual" id="downloadDualBtn">
@@ -1429,6 +1430,7 @@
                         cursor = Math.max(cursor, event.event_id || 0);
                     }
                     cursor = Math.max(cursor, state.next_event_id || 0);
+                    updateUntranslatedNote(state.untranslated_count || 0);
                     if (['error', 'cancelled', 'timed_out'].includes(state.status) && !pollStopped) {
                         pollStopped = true;
                         hideProgress();
@@ -1517,6 +1519,18 @@
 
         function hideProgress() {
             progressContainer.classList.remove('active');
+        }
+
+        function updateUntranslatedNote(count) {
+            const note = document.getElementById('untranslatedNote');
+            if (!note) return;
+            const n = Number(count) || 0;
+            if (n > 0) {
+                note.textContent = n + (n === 1 ? ' text block' : ' text blocks') + ' could not be translated and was left in the original language. Please check the downloaded file.';
+                note.style.display = 'block';
+            } else {
+                note.style.display = 'none';
+            }
         }
 
         function showResult() {

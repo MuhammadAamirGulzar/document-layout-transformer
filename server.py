@@ -558,6 +558,7 @@ async def translation_job_status(session_id: str, after: int = 0):
         "error": session.get("error"),
         "has_mono": bool(session.get("mono_output_path")),
         "has_dual": bool(session.get("dual_output_path")),
+        "untranslated_count": int(session.get("untranslated_count", 0)),
         "events": _job_events_after(session, after),
         "next_event_id": session.get("_event_id", 0),
     }
@@ -582,6 +583,15 @@ async def get_translation_progress(session_id: str):
     return StreamingResponse(observe(), media_type="text/event-stream", headers={
         "Cache-Control": "no-cache", "X-Accel-Buffering": "no",
     })
+
+
+def _untranslated_count(config):
+    """How many text blocks the engine could not translate. Never raises."""
+    try:
+        value = getattr(getattr(config, "translator", None), "untranslated_count", 0)
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 0
 
 
 async def _translation_events(session):
@@ -725,6 +735,7 @@ async def _translation_events(session):
                 finish_seen = True
                 translate_result = event.get("translate_result")
                 session["result"] = translate_result
+                session["untranslated_count"] = _untranslated_count(config)
 
                 # Find output files (both mono and dual side-by-side)
                 mono_pdf = None

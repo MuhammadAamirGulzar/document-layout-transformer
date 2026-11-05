@@ -410,6 +410,7 @@ class BaseTranslator(ABC):
 
         self.translate_call_count = 0
         self.translate_cache_call_count = 0
+        self.untranslated_count = 0  # text blocks the engine could not translate
 
     def __del__(self):
         with contextlib.suppress(Exception):
@@ -823,6 +824,7 @@ class MarianMTTranslator(BaseTranslator):
             return translation
         except Exception as e:
             logger.error(f"Error during MarianMT translation: {e}")
+            self.untranslated_count = getattr(self, "untranslated_count", 0) + 1
             return cleaned_text
 
     def do_llm_translate(self, text, rate_limit_params: dict = None):
@@ -1006,6 +1008,7 @@ class NLLBTranslator(BaseTranslator):
             return translation
         except Exception as e:
             logger.error(f"Error during NLLB translation: {e}")
+            self.untranslated_count = getattr(self, "untranslated_count", 0) + 1
             return cleaned_text
 
     def do_llm_translate(self, text, rate_limit_params: dict = None):

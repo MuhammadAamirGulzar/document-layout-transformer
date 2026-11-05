@@ -1570,10 +1570,12 @@ Now, please carefully read the following text to be translated and directly outp
             except ContentFilterError as e:
                 logger.warning(f"ContentFilterError: {e.message}")
                 self.add_content_filter_hint(page, paragraph)
+                self.translate_engine.untranslated_count = getattr(self.translate_engine, "untranslated_count", 0) + 1
                 return
             except Exception as e:
                 logger.exception(
                     f"Error translating paragraph. Paragraph: {paragraph.debug_id} ({paragraph.unicode}). Error: {e}. ",
                 )
+                self.translate_engine.untranslated_count = getattr(self.translate_engine, "untranslated_count", 0) + 1
                 # ignore error and continue
                 return
