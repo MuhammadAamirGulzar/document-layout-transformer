@@ -1131,10 +1131,12 @@
 
         // Find and update stage by matching name
         function findAndUpdateStage(stageName, displayName, status) {
-            const stageEls = stagesContainer.children;
+            const exactId = 'stage-' + String(stageName || '').replace(/\s+/g, '-');
+            const exactStageEl = Array.from(stagesContainer.children).find(el => el.id === exactId) || null;
+            const stageEls = exactStageEl ? [exactStageEl] : stagesContainer.children;
             for (const stageEl of stageEls) {
                 const nameEl = stageEl.querySelector('.stage-name');
-                if (nameEl && (
+                if (nameEl && (stageEl === exactStageEl ||
                     nameEl.textContent === displayName ||
                     nameEl.textContent.includes(stageName) ||
                     stageName.toLowerCase().includes(nameEl.textContent.split(' ').pop()?.toLowerCase() || '')
