@@ -1322,6 +1322,7 @@
             let cursor = 0;
             let currentActiveStage = null;
             function renderEvent(data) {
+                updateModelLoadingHint(data);
                     switch (data.type) {
                         case 'init':
                             updateCurrentStage(data.message || 'Initializing translation...', 0, 0, 0);
@@ -1454,6 +1455,27 @@
             } else {
                 stageProgressText.textContent = progress > 0 ? `${Math.round(progress)}%` : 'Starting...';
             }
+        }
+
+        // Hint for the wait before the first paragraph is done (model load or slow first paragraph).
+        function updateModelLoadingHint(data) {
+            let hint = document.getElementById('modelLoadingHint');
+            const stage = String((data && data.stage) || '');
+            const current = Number(data && data.stage_current) || 0;
+            const waiting = !!data
+                && (data.type === 'progress_start' || data.type === 'progress_update')
+                && stage.includes('Translate Paragraphs')
+                && current === 0;
+            if (!hint) {
+                if (!waiting || !stageProgressText || !stageProgressText.parentElement) return;
+                hint = document.createElement('div');
+                hint.id = 'modelLoadingHint';
+                hint.className = 'result-subtext';
+                hint.style.cssText = 'background:#eff6ff; border:1px solid #93c5fd; color:#1e40af; border-radius:8px; padding:10px 12px; margin-top:10px;';
+                hint.textContent = 'Loading the translation model. First use can take several minutes. This is not stuck.';
+                stageProgressText.parentElement.insertAdjacentElement('afterend', hint);
+            }
+            hint.style.display = waiting ? 'block' : 'none';
         }
 
         function updateOverallProgress(progress) {
