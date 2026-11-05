@@ -124,8 +124,7 @@ async def root():
             "endpoints": {
                 "health": "/health",
                 "languages": "/languages",
-                "translate": "/translate",
-                "translate_stream": "/translate/stream"
+                "translate": "/translate"
             }
         })
 
