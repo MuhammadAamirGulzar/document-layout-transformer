@@ -1524,15 +1524,23 @@ Now, please carefully read the following text to be translated and directly outp
                 logger.info(f"[{lbl}] Translating paragraph {paragraph.debug_id}: {text[:80] if text else ''}")
                 llm_translate_tracker = tracker.new_llm_translate_tracker()
                 # Perform translation
-                direct_contact_translation = (
-                    self._translate_contact_field_directly(
-                        source_unicode or text
-                    )
-                    if "contact_card" in lbl.lower()
-                    else None
-                )
-                if direct_contact_translation is not None:
-                    translated_text = direct_contact_translation
+                direct_translation = None
+                if "contact_card" in lbl.lower():
+                    direct_translation = self._translate_contact_field_directly(source_unicode or text)
+                elif (
+                    not self.support_llm_translate
+                    and "table_cell" in lbl.lower()
+                    and (self.translation_config.lang_out or "").lower().rsplit("-", 1)[-1]
+                    in {"ar", "ara", "arabic"}
+                ):
+                    # Standalone payment labels otherwise look like BICs to the
+                    # generic protection rule. Keep real banking codes protected.
+                    direct_translation = {
+                        "INCOMING": "\u0627\u0644\u0648\u0627\u0631\u062f\u0629",
+                        "OUTGOING": "\u0627\u0644\u0635\u0627\u062f\u0631\u0629",
+                    }.get(text.strip().upper())
+                if direct_translation is not None:
+                    translated_text = direct_translation
                 elif self.support_llm_translate:
                     llm_prompt = self.generate_prompt_for_llm(
                         text,
