@@ -33,9 +33,9 @@ Relevant implementation: `server.py`; UI upload and progress code: `frontend/ind
 | Async cancellation and timeout | **VERIFIED:** cooperative cancel via `POST /translate/cancel/{id}`, `JOB_TIMEOUT_SECONDS` default 3600, engine slot released only after the worker really stops (`8c727f1`). | **VERIFIED:** cancel and timeout are cooperative, not a hard kill. |
 | Remote fetching | Asset download and layout RPC code exists under `babeldoc/assets/` and `babeldoc/docvision/rpc_doclayout*.py`. | Verify hosts are fixed/admin-configured and no user-controlled URL can reach private network services. Exploitability is NOT VERIFIED. |
 
-**VERIFIED — G4 batch-2 validation (`8c727f1`):** 199 passed + 106 subtests; a 600M smoke run on the 2-paragraph file took 63 s with 0 errors; a browser cancel was seen working. **NOT VERIFIED:** a normal browser finish plus download after batch 2.
+**VERIFIED - G4 batch-2 validation (`8c727f1`):** 199 passed + 106 subtests; a 600M smoke run on the 2-paragraph file took 63 s with 0 errors; a browser cancel was seen working. **VERIFIED by the user's report:** normal finish plus download of both PDFs after batch 2.
 
-**VERIFIED — still open:** B-35, the model-loading message, B-21, B-34, B-17 and B-18. **NOT VERIFIED — still open:** B-26.
+**VERIFIED - still open:** B-35, model-loading hint (shown at 0/2 VERIFIED by the user's report; hiding at 1/N NOT VERIFIED), B-21, B-34, B-17, B-18 and B-37. B-26: fixed, confirmed in a web run. B-36: fixed, browser look NOT VERIFIED.
 
 ## Repository visibility and input guard
 
@@ -76,7 +76,7 @@ Project metadata declares AGPL-3.0 (`pyproject.toml:5`) and a `LICENSE` file is 
 - [ ] Enforce upload page limits.
 - [ ] **NOT VERIFIED:** Starlette 0.27 probably spools the whole upload before the size cap runs; the deployment proxy must also cap body size.
 - [x] **VERIFIED:** browser cancel seen working; cancel and timeout are cooperative, not a hard kill.
-- [ ] **NOT VERIFIED:** normal browser finish plus download after batch 2.
+- [x] **VERIFIED by the user's report:** normal finish plus download of both PDFs after batch 2.
 - [ ] Test malformed PDFs, path-like names, unauthorized session IDs and download isolation.
 - [ ] Test cancellation, browser disconnect, timeout, worker restart and temp cleanup.
 - [ ] Select supported CPU/GPU model matrix and concurrency limits.

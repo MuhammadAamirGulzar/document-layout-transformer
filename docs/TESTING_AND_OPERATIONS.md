@@ -4,7 +4,9 @@ This page describes the current repository layout and available commands. Comman
 
 **VERIFIED - B-35 (841e0db):** 212 passed + 106 subtests; real 600M smoke OK (UNTRANSLATED 0). A real forced-failure run and a browser check of the note are NOT VERIFIED.
 
-**VERIFIED - model-loading hint (7f905b1):** 217 passed + 106 subtests (190.83 s). How it looks in a real browser is NOT VERIFIED.
+**VERIFIED - model-loading hint (7f905b1):** 217 passed + 106 subtests (190.83 s). VERIFIED by the user's report: the hint was seen at 0/2. The hint disappearing at 1/N is NOT VERIFIED (no screenshot).
+
+**VERIFIED - B-26 (a68b370):** 225 passed + 106 subtests (179.49 s).
 
 ## Environment and dependencies
 
@@ -26,6 +28,8 @@ This page describes the current repository layout and available commands. Comman
 | `tests/test_stage_labels.py` | VERIFIED implementation evidence: 17 stage-label tests; browser verification is NOT VERIFIED and B-01 stays open |
 | `tests/test_untranslated_count.py` | 13 tests for B-35 |
 | `tests/test_model_loading_hint.py` | 5 static tests |
+| `tests/test_stage_row_match.py` | 6 tests |
+| `tests/test_single_pdf_write.py` | 2 tests |
 
 **VERIFIED — current test approach:** `TestClient` is broken here with Starlette 0.27.0 + httpx 0.28.1, so tests use `httpx.ASGITransport` inside `asyncio.run`.
 
@@ -35,10 +39,18 @@ This page describes the current repository layout and available commands. Comman
 - **VERIFIED — G4 batch 1 (`3ed2c50`):** jobs run in the background; the page polls `GET /translate/status/{id}`; explicit `POST /translate/run/{id}`; duplicate run returns 409; one engine job at a time per server process. B-04 is done for the new route.
 - **VERIFIED — G4 batch 2 (`8c727f1`):** cooperative cancel via `POST /translate/cancel/{id}`; `JOB_TIMEOUT_SECONDS` default 3600; `SESSION_TTL_SECONDS` default 86400 with a 60 s sweep; the engine slot is released only after the worker really stops.
 - **VERIFIED — results:** 199 passed + 106 subtests; a 600M smoke run on the 2-paragraph file took 63 s with 0 errors; a browser cancel was seen working.
-- **NOT VERIFIED:** a normal browser finish plus download after batch 2.
+- **VERIFIED by the user's report:** normal finish plus download of both PDFs after batch 2.
 - **VERIFIED — limits:** cancel and timeout are cooperative, not a hard kill. The semaphore works within one process only; sessions and tasks are in memory and lost on restart. UUID check is not authentication.
 - **NOT VERIFIED — upload spooling:** Starlette 0.27 probably spools the whole upload before the size cap runs, so the deployment proxy must also cap body size.
-- **VERIFIED - still open:** B-35, model-loading hint (built, browser check pending), B-21 (old `POST /translate` bypasses job controls), B-17 and B-18. **NOT VERIFIED - still open:** B-26. B-34 is decided: keep the cache off on the web path; no code change.
+- **VERIFIED - still open:** B-35, model-loading hint (shown at 0/2 VERIFIED by the user's report; hiding at 1/N NOT VERIFIED), B-21 (old `POST /translate` bypasses job controls), B-17, B-18 and B-37. B-26: fixed, confirmed in a web run. B-36: fixed, browser look NOT VERIFIED. B-34 is decided: keep the cache off on the web path; no code change.
+
+## Recorded browser run
+
+- **VERIFIED by the user's report:** normal finish plus download of both PDFs after batch 2.
+- The hint was seen at 0/2. The wait before the first paragraph was 63 s (first 0/N at 32 s, first 1/N at 95 s).
+- **NOT VERIFIED:** the hint disappearing at 1/N (no screenshot).
+- **NOT VERIFIED:** the amber untranslated note (the count was 0, so it stayed hidden).
+- **2026-11-06 web run:** VERIFIED dual PDF download (200 OK in the server log). The mono download is NOT VERIFIED for this run because it does not appear in that log.
 
 ## Git handoff
 

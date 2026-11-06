@@ -6,6 +6,8 @@ This file records repository changes by release or reviewed change. It does not 
 
 - `841e0db`: the page shows how many text blocks were left untranslated.
 - `7f905b1`: the page shows a hint while the translation model loads.
+- `66842b1`: the progress page highlights the correct stage row.
+- `a68b370`: removed the duplicate PDF write. The recorded web run showed progress drops falling from 4 to 0. The duplicate pass spanned about 16 s in the old recording.
 
 ### G3/G4 and Git handoff — 2026-11-05
 
