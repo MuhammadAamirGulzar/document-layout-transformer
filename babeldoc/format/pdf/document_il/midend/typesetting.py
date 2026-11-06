@@ -2072,7 +2072,8 @@ class Typesetting:
         Translation can expand text beyond the extraction box, so a box-only
         preflight cannot prove visual safety.  Inspect the actual generated
         glyphs and, for non-table prose, push the lower-priority block below
-        the collision.  Headings always win; tables remain immutable.
+        the collision. Separate source rows keep their reading order; heading
+        priority breaks ties when the source boxes already overlap.
         """
         page_key = id(page)
         if page_key in self._rendered_collision_resolved_pages:
@@ -2083,6 +2084,13 @@ class Typesetting:
             if not self._is_fixed_table_paragraph(paragraph)
             and self._rendered_text_box(paragraph) is not None
         ]
+        source_lanes = {
+            id(paragraph): (paragraph.box.y, paragraph.box.y2)
+            for paragraph in paragraphs
+            if paragraph.box is not None
+            and paragraph.box.y is not None
+            and paragraph.box.y2 is not None
+        }
         moved = 0
         for _ in range(max(1, len(paragraphs))):
             changed = False
@@ -2105,7 +2113,13 @@ class Typesetting:
                     if horizontal_overlap < min_width * 0.25 or vertical_overlap <= 0.25:
                         continue
 
-                    if self._is_heading_paragraph(first):
+                    first_lane = source_lanes.get(id(first))
+                    second_lane = source_lanes.get(id(second))
+                    if first_lane and second_lane and first_lane[0] >= second_lane[1]:
+                        blocker, mover = first, second
+                    elif first_lane and second_lane and second_lane[0] >= first_lane[1]:
+                        blocker, mover = second, first
+                    elif self._is_heading_paragraph(first):
                         blocker, mover = first, second
                     elif self._is_heading_paragraph(second):
                         blocker, mover = second, first
@@ -2115,7 +2129,9 @@ class Typesetting:
                         blocker, mover = second, first
                     blocker_box = rendered[id(blocker)]
                     mover_box = rendered[id(mover)]
-                    gap = 5.0 if self._is_heading_paragraph(blocker) else 3.0
+                    gap = 5.0 if (
+                        self._is_heading_paragraph(blocker) or self._is_heading_paragraph(mover)
+                    ) else 3.0
                     shift = max(0.0, mover_box.y2 - (blocker_box.y - gap))
                     if shift <= 0.01:
                         # The geometric order is inverted, but there is still

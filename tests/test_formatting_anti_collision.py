@@ -740,6 +740,45 @@ class TestFormattingAntiCollision(unittest.TestCase):
         ts._expand_structured_text_boxes(page)
         self.assertGreaterEqual(heading.box.x2 - heading.box.x, 500.0)
 
+    def test_repeated_unmapped_list_markers_split_rows_but_keep_wrapped_text(self):
+        finder = ParagraphFinder(self.cfg_ar)
+        self.cfg_ar.split_short_lines = False
+
+        def line(text, y, marker_font=None):
+            chars = []
+            if marker_font:
+                box = Box(74, y, 78, y + 12)
+                chars.append(PdfCharacter(
+                    char_unicode="(cid:136)", box=box, visual_bbox=VisualBbox(box=box),
+                    pdf_style=PdfStyle(font_id=marker_font, font_size=10),
+                ))
+            for i, char in enumerate(text):
+                x = 84 + i * 5
+                box = Box(x, y, x + 5, y + 12)
+                chars.append(PdfCharacter(
+                    char_unicode=char, box=box, visual_bbox=VisualBbox(box=box),
+                    pdf_style=PdfStyle(font_id="body", font_size=10),
+                ))
+            return finder.create_line(chars)
+
+        for font_id, expected in (("symbol", 2), ("body", 1)):
+            with self.subTest(marker_font=font_id):
+                paragraphs = [PdfParagraph(
+                    layout_label="plain text",
+                    pdf_paragraph_composition=[
+                        line("First item", 100, font_id),
+                        line("continues here", 85),
+                        line("Second item", 70, font_id),
+                    ],
+                )]
+                finder.process_independent_paragraphs(paragraphs, median_width=150)
+
+                self.assertEqual(len(paragraphs), expected)
+                if expected == 2:
+                    self.assertEqual(len(paragraphs[0].pdf_paragraph_composition), 2)
+                    self.assertIn("continues here", paragraphs[0].unicode)
+                    self.assertIn("Second item", paragraphs[1].unicode)
+
     def test_contact_card_stays_in_its_closed_frame(self):
         ts = Typesetting(self.cfg_ar)
         page = Page(cropbox=Cropbox(box=Box(0, 0, 600, 800)))
@@ -807,6 +846,36 @@ class TestFormattingAntiCollision(unittest.TestCase):
         body_box = ts._rendered_text_box(body)
         self.assertLessEqual(body_box.y2, heading_box.y - 5.0)
         self.assertEqual((heading_box.y, heading_box.y2), (400.0, 420.0))
+
+    def test_rendered_heading_does_not_move_a_preceding_bullet_below_it(self):
+        ts = Typesetting(self.cfg_ar)
+        page = Page(cropbox=Cropbox(box=Box(0, 0, 600, 800)))
+        bullet = PdfParagraph(
+            box=Box(100, 543, 230, 556),
+            layout_label="plain text",
+            pdf_paragraph_composition=[
+                PdfParagraphComposition(pdf_character=PdfCharacter(
+                    char_unicode="Resume parsing", box=Box(420, 547, 520, 556),
+                )),
+            ],
+        )
+        heading = PdfParagraph(
+            box=Box(100, 522, 245, 534),
+            layout_label="title",
+            pdf_paragraph_composition=[
+                PdfParagraphComposition(pdf_character=PdfCharacter(
+                    char_unicode="Error Production Method", box=Box(410, 523, 520, 552),
+                )),
+            ],
+        )
+        page.pdf_paragraph = [heading, bullet]
+
+        ts._resolve_rendered_text_collisions(page)
+
+        bullet_box = ts._rendered_text_box(bullet)
+        heading_box = ts._rendered_text_box(heading)
+        self.assertEqual((bullet_box.y, bullet_box.y2), (547, 556))
+        self.assertLessEqual(heading_box.y2, bullet_box.y - 5)
 
     def test_acronym_token_deduplication(self):
         """

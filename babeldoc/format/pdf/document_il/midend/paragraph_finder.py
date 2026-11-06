@@ -1650,6 +1650,36 @@ class ParagraphFinder:
                 paragraph.debug_id,
             )
 
+    @staticmethod
+    def _repeated_unmapped_list_rows(
+        compositions: list[PdfParagraphComposition],
+    ) -> set[int]:
+        """Find aligned list markers whose embedded font has no Unicode mapping."""
+        rows_by_marker: dict[tuple[str, str, int], list[int]] = {}
+        for index, composition in enumerate(compositions):
+            if not composition.pdf_line:
+                continue
+            visible = (
+                char for char in composition.pdf_line.pdf_character
+                if char.char_unicode and char.char_unicode.strip()
+            )
+            marker = next(visible, None)
+            if not marker or not re.fullmatch(r"\(cid:\d+\)", marker.char_unicode):
+                continue
+            body = next(visible, None)
+            if (
+                not body or not body.char_unicode[0].isascii()
+                or not body.char_unicode[0].isalnum()
+                or not marker.pdf_style or not body.pdf_style
+                or marker.pdf_style.font_id == body.pdf_style.font_id
+                or not marker.box or not body.box
+                or body.box.x <= marker.box.x2
+            ):
+                continue
+            key = (marker.pdf_style.font_id, marker.char_unicode, round(marker.box.x))
+            rows_by_marker.setdefault(key, []).append(index)
+        return {index for rows in rows_by_marker.values() if len(rows) > 1 for index in rows}
+
     def process_independent_paragraphs(
         self,
         paragraphs: list[PdfParagraph],
@@ -1663,6 +1693,9 @@ class ParagraphFinder:
                 i += 1
                 continue
 
+            unmapped_list_rows = self._repeated_unmapped_list_rows(
+                paragraph.pdf_paragraph_composition
+            )
             j = 1
             while j < len(paragraph.pdf_paragraph_composition):
                 prev_composition = paragraph.pdf_paragraph_composition[j - 1]
@@ -1716,7 +1749,9 @@ class ParagraphFinder:
                 first_char = next(
                     (c.char_unicode for c in current_chars if not c.char_unicode.isspace()), ""
                 )
-                is_bullet = bool(current_chars and is_bullet_or_list_marker(current_chars))
+                is_bullet = j in unmapped_list_rows or bool(
+                    current_chars and is_bullet_or_list_marker(current_chars)
+                )
 
                 curr_line = curr_comp.pdf_line if curr_comp and curr_comp.pdf_line else None
                 prev_is_bold = is_line_bold(prev_line, font_dict)
@@ -1732,9 +1767,10 @@ class ParagraphFinder:
 
                 is_hyphen_or_continuation = (
                     not is_style_boundary
+                    and not is_bullet
                     and (
                         prev_text.rstrip().endswith(("-", "\u2010", "\u00ad"))
-                        or (first_char and first_char.isalpha() and first_char.islower() and not is_bullet)
+                        or (first_char and first_char.isalpha() and first_char.islower())
                     )
                 )
 
