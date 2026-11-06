@@ -740,6 +740,44 @@ class TestFormattingAntiCollision(unittest.TestCase):
         ts._expand_structured_text_boxes(page)
         self.assertGreaterEqual(heading.box.x2 - heading.box.x, 500.0)
 
+    def test_contact_card_stays_in_its_closed_frame(self):
+        ts = Typesetting(self.cfg_ar)
+        page = Page(cropbox=Cropbox(box=Box(0, 0, 600, 800)))
+        page.pdf_curve = [
+            PdfCurve(box=Box(100, 200, 100.5, 300)),
+            PdfCurve(box=Box(410, 200, 410.5, 300)),
+            PdfCurve(box=Box(100.5, 199.5, 410, 200)),
+            PdfCurve(box=Box(100.5, 300, 410, 300.5)),
+        ]
+        row = PdfParagraph(
+            layout_label="contact_card", box=Box(110, 270, 290, 284)
+        )
+        page.pdf_paragraph = [row]
+
+        ts._expand_structured_text_boxes(page)
+
+        self.assertGreater(row.box.x, 100.5)
+        self.assertLess(row.box.x2, 410)
+        self.assertEqual((row.box.y, row.box.y2), (270, 284))
+        self.assertEqual(ts._calculate_rtl_margin_shift(row, page), 0)
+
+    def test_contact_card_without_closed_frame_keeps_a_wide_lane(self):
+        ts = Typesetting(self.cfg_ar)
+        page = Page(cropbox=Cropbox(box=Box(0, 0, 600, 800)))
+        page.pdf_curve = [
+            PdfCurve(box=Box(100, 200, 100.5, 300)),
+            PdfCurve(box=Box(410, 200, 410.5, 300)),
+            PdfCurve(box=Box(100.5, 199.5, 410, 200)),
+        ]
+        row = PdfParagraph(
+            layout_label="contact_card", box=Box(110, 270, 290, 284)
+        )
+        page.pdf_paragraph = [row]
+
+        ts._expand_structured_text_boxes(page)
+
+        self.assertGreater(row.box.x2 - row.box.x, 500)
+
     def test_rendered_glyph_collision_moves_body_not_heading(self):
         """The final audit must use character boxes, not stale paragraph boxes."""
         ts = Typesetting(self.cfg_ar)

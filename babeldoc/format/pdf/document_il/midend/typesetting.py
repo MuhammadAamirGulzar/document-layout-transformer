@@ -949,6 +949,52 @@ class Typesetting:
         # multiplier of a noisy source style, so every body paragraph matches.
         return target_size
 
+    @staticmethod
+    def _contact_frame_bounds(
+        paragraph: il_version_1.PdfParagraph, page: il_version_1.Page
+    ) -> tuple[float, float] | None:
+        """Find the inside edges of a drawn frame enclosing a contact row."""
+        row = paragraph.box
+        if row is None or "contact_card" not in (paragraph.layout_label or "").lower():
+            return None
+
+        tolerance = 2.0
+        edges = [
+            curve.box for curve in page.pdf_curve
+            if curve.box is not None and curve.xobj_id == paragraph.xobj_id
+        ]
+        sides = [
+            edge for edge in edges
+            if edge.x2 - edge.x <= tolerance
+            and edge.y <= row.y + tolerance
+            and edge.y2 >= row.y2 - tolerance
+            and edge.y2 - edge.y > 2 * tolerance
+        ]
+        rules = [
+            edge for edge in edges
+            if edge.y2 - edge.y <= tolerance and edge.x2 - edge.x > 2 * tolerance
+        ]
+        frames = []
+        for left in sides:
+            if left.x2 > row.x + tolerance:
+                continue
+            for right in sides:
+                if right.x < row.x2 - tolerance or right.x - left.x2 <= 8:
+                    continue
+                if abs(left.y - right.y) > tolerance or abs(left.y2 - right.y2) > tolerance:
+                    continue
+                if all(
+                    any(
+                        abs(rule.x - left.x2) <= tolerance
+                        and abs(rule.x2 - right.x) <= tolerance
+                        and abs((rule.y + rule.y2) / 2 - height) <= tolerance
+                        for rule in rules
+                    )
+                    for height in (left.y, left.y2)
+                ):
+                    frames.append((left.x2, right.x))
+        return min(frames, key=lambda bounds: bounds[1] - bounds[0], default=None)
+
     def _expand_structured_text_boxes(self, page: il_version_1.Page) -> None:
         """Provide full-width lanes for structured records and short headings.
 
@@ -979,6 +1025,9 @@ class Typesetting:
             if not (is_structured or is_narrow_heading):
                 continue
             if self._is_fixed_table_paragraph(paragraph) and "table" in label:
+                continue
+            if self._is_arabic_output() and (frame := self._contact_frame_bounds(paragraph, page)):
+                paragraph.box = Box(frame[0] + 4, paragraph.box.y, frame[1] - 4, paragraph.box.y2)
                 continue
             paragraph.box = Box(
                 min(paragraph.box.x, content_left),
@@ -2344,6 +2393,10 @@ class Typesetting:
         box = paragraph.box
         page_box = page.cropbox.box
         
+        # Framed contact rows are already right-aligned within their own lane.
+        if self._is_arabic_output() and self._contact_frame_bounds(paragraph, page):
+            return 0.0
+
         # Symmetrical page-level mirroring for running headers, footers, and page numbers
         if self._is_header_or_footer(paragraph, page):
             orig_right_margin = page_box.x2 - box.x2
