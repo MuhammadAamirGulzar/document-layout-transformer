@@ -377,6 +377,10 @@ class ILTranslator:
         if not text:
             return text
 
+        # In this cover title, DOCUMENT is a word that resembles a BIC.
+        if text.strip() == "STANDARDS DOCUMENT":
+            return "Standards document"
+
         # Financial rates and central banking terms
         text = re.sub(r'\b(?:The\s+)?QMR\s+Lending\s+Rate\b', 'سعر فائدة الإقراض في سوق قطر النقدي', text, flags=re.I)
         text = re.sub(r'\b(?:The\s+)?Repo\s+Rate\b', 'سعر اتفاقيات إعادة الشراء (الريبو)', text, flags=re.I)

@@ -46,7 +46,8 @@ def remove_control_characters(s):
 # Pattern priority (highest-specificity first to avoid partial matches):
 _NUMERAL_PATTERN = re.compile(
     # 1. Parenthetical mixed tokens: (2018=100), (QCBRR), (NDS3), (QR-mn), (281211210/97 =62)
-    r'(\([^)]*\d[^)]*\))|'
+    # Length notes contain prose; shield the number below, leaving the words visible.
+    r'(\((?!\s*\d+\s+(?i:characters?\s+for)\b)[^)]*\d[^)]*\))|'
     # 2. Arithmetic division / equations: 281211210/97 = 62, 502560126/97 = 22, 221000/97= 34
     r'(\b\d+\s*[/÷]\s*\d+\s*(?:=\s*\d+)?\b)|'
     # 3. Arithmetic operations with equals: 98-34=64, 2018=100
