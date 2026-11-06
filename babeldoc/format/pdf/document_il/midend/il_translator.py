@@ -449,6 +449,17 @@ class ILTranslator:
         # Pre-translation terminology replacement
         text = self._pre_translate_terminology(text)
 
+        def translate_segment(segment: str) -> str:
+            # List and section numbering is document structure.
+            marker = re.match(r"^[ \t]*\d{1,3}(?:\.\d{1,3})*\.(?:[ \t]+|$)", segment)
+            if marker:
+                label = segment[marker.end():]
+                if not label:
+                    return segment
+                translated = self.translate_engine.translate(label, rate_limit_params=rate_limit_params)
+                return marker.group() + translated
+            return self.translate_engine.translate(segment, rate_limit_params=rate_limit_params)
+
         # Check if text contains Table of Contents (TOC) entries with dotted leader lines
         # e.g. "1. Introduction ................................................................................................. 1306"
         toc_leader_pattern = re.compile(r'^(.*?)\s*(\.{4,})\s*(\d+)\s*$')
@@ -472,10 +483,10 @@ class ILTranslator:
                 toc_match = toc_leader_pattern.match(stripped_line) if stripped_line else None
                 if toc_match:
                     title, dots, page_num = toc_match.group(1).strip(), toc_match.group(2), toc_match.group(3)
-                    tr_title = self.translate_engine.translate(title, rate_limit_params=rate_limit_params) if title else ""
+                    tr_title = translate_segment(title) if title else ""
                     translated_lines.append(f"{tr_title} {dots} {page_num}")
                 elif stripped_line:
-                    tr = self.translate_engine.translate(line, rate_limit_params=rate_limit_params)
+                    tr = translate_segment(line)
                     translated_lines.append(tr)
                 else:
                     translated_lines.append(line)
@@ -486,7 +497,7 @@ class ILTranslator:
                 toc_match = toc_leader_pattern.match(non_empty[0])
                 if toc_match:
                     title, dots, page_num = toc_match.group(1).strip(), toc_match.group(2), toc_match.group(3)
-                    tr_title = self.translate_engine.translate(title, rate_limit_params=rate_limit_params) if title else ""
+                    tr_title = translate_segment(title) if title else ""
                     return f"{tr_title} {dots} {page_num}"
 
             # For flowing body text paragraphs, join soft linebreaks with a space so
@@ -503,12 +514,12 @@ class ILTranslator:
             sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', normalized_text) if s.strip()]
             if len(sentences) > 1 and len(normalized_text) > 150:
                 translated_sentences = [
-                    self.translate_engine.translate(s, rate_limit_params=rate_limit_params)
+                    translate_segment(s)
                     for s in sentences
                 ]
                 return " ".join(translated_sentences)
 
-            return self.translate_engine.translate(normalized_text, rate_limit_params=rate_limit_params)
+            return translate_segment(normalized_text)
 
     @staticmethod
     def _structured_source_lines(paragraph: PdfParagraph) -> str | None:
@@ -1233,6 +1244,9 @@ class ILTranslator:
         if not self.support_llm_translate:
             disable_rich_text_translate = True
         layout_label = (paragraph.layout_label or "").lower()
+        if "table_cell" in layout_label and re.fullmatch(r"[A-Z]", (paragraph.unicode or "").strip()):
+            # Conversion-table letters and marks such as X are literal data.
+            return None, None
         if any(
             marker in layout_label
             for marker in ("contact_card", "procedure_step", "heading")
