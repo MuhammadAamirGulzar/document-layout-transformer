@@ -99,8 +99,13 @@ def _protect_numerals(text: str) -> tuple[str, dict[str, str]]:
     mapping = {}
     counter = [0]
     
-    # Avoid re-protecting already existing placeholders like {0}, {1}
+    # Reserve IDs used by numeric placeholders and by PDF formula/style tags.
+    # A decoder may rewrite {1} as <b1>, so the IDs must stay distinct.
     existing_placeholders = set(re.findall(r'\{\d+\}', text))
+    existing_placeholders.update(
+        f"{{{tag_id}}}"
+        for tag_id in re.findall(r"<\s*/?\s*b\s*([0-9]+)\s*>", text, re.IGNORECASE)
+    )
 
     def _replacer(match):
         original = match.group(0)
