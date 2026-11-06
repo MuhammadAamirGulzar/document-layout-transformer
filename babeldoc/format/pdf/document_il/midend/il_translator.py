@@ -1192,6 +1192,21 @@ class ILTranslator:
 
         return result
 
+    @staticmethod
+    def _is_file_inventory(text: str) -> bool:
+        """Recognize dense directory listings with literal filenames."""
+        files = re.findall(
+            r"(?<![\w.])[a-z0-9_][\w.-]*\.(?:c|cpp|h|hpp|java|txt|md|pdf)(?![\w.])",
+            text,
+            flags=re.IGNORECASE,
+        )
+        directories = re.findall(r"(?<!\S)[\w-]+/(?=\s|$)", text)
+        return (
+            len(files) >= 12
+            and len(directories) >= 2
+            and 2 * (len(files) + len(directories)) >= len(text.split())
+        )
+
     def pre_translate_paragraph(
         self,
         paragraph: PdfParagraph,
@@ -1203,6 +1218,9 @@ class ILTranslator:
         if paragraph.vertical:
             return None, None
         tracker.set_pdf_unicode(paragraph.unicode)
+        if not self.support_llm_translate and self._is_file_inventory(paragraph.unicode or ""):
+            # Keep the original compositions, including filename punctuation.
+            return None, None
         if paragraph.xobj_id in xobj_font_map:
             page_font_map = xobj_font_map[paragraph.xobj_id]
         disable_rich_text_translate = (
