@@ -3382,7 +3382,8 @@ class Typesetting:
                 if not line:
                     continue
 
-                line_str = "".join(u.try_get_unicode() or "" for u in line)
+                line_characters = [unit.try_get_unicode() or "" for unit in line]
+                line_str = "".join(line_characters)
                 
                 # Check if this line is a chronological time-series axis (e.g., sequence of month/year labels)
                 # In charts, timelines progress Left-to-Right even in Arabic contexts to match the chart data curves
@@ -3408,7 +3409,12 @@ class Typesetting:
                     # Keep native LTR character order matching original code, formula, or timeline
                     visual_units = line
                 elif line_str.strip():
-                    bidi_map = get_bidi_indices_and_chars(line_str, base_dir='R')
+                    # Give each layout unit one BiDi position. Opaque units such as
+                    # formulas keep their own glyphs and internal reading order.
+                    bidi_text = "".join(
+                        text if len(text) == 1 else "\ufffc" for text in line_characters
+                    )
+                    bidi_map = get_bidi_indices_and_chars(bidi_text, base_dir='R')
                     visual_units = []
                     visual_indices = []
                     for orig_idx, mirrored_char in bidi_map:
@@ -3427,10 +3433,10 @@ class Typesetting:
                     marker = "\u200e"
                     start = 0
                     while True:
-                        left = line_str.find(marker, start)
+                        left = bidi_text.find(marker, start)
                         if left < 0:
                             break
-                        right = line_str.find(marker, left + 1)
+                        right = bidi_text.find(marker, left + 1)
                         if right < 0:
                             break
                         positions = [
