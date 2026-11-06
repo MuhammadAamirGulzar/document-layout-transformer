@@ -775,6 +775,7 @@ class TestFormattingAntiCollision(unittest.TestCase):
 
                 self.assertEqual(len(paragraphs), expected)
                 if expected == 2:
+                    self.assertEqual([paragraph.layout_label for paragraph in paragraphs], ["list_item"] * 2)
                     self.assertEqual(len(paragraphs[0].pdf_paragraph_composition), 2)
                     self.assertIn("continues here", paragraphs[0].unicode)
                     self.assertIn("Second item", paragraphs[1].unicode)

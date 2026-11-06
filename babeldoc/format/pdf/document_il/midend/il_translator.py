@@ -26,6 +26,7 @@ from babeldoc.format.pdf.document_il import PdfStyle
 from babeldoc.format.pdf.document_il.utils.fontmap import FontMapper
 from babeldoc.format.pdf.document_il.utils.layout_helper import get_char_unicode_string
 from babeldoc.format.pdf.document_il.utils.layout_helper import get_paragraph_unicode
+from babeldoc.format.pdf.document_il.utils.layout_helper import is_bullet_point
 from babeldoc.format.pdf.document_il.utils.layout_helper import is_same_style
 from babeldoc.format.pdf.document_il.utils.layout_helper import (
     is_same_style_except_font,
@@ -438,6 +439,27 @@ class ILTranslator:
         text = re.sub(r'\bQATAR\s+DEVELOPMENT\s+BANK\b', 'بنك قطر للتنمية', text, flags=re.I)
 
         return text
+
+    @staticmethod
+    def _leading_bullet_tag(text: str, translate_input, layout_label: str) -> str:
+        """Identify a leading layout tag backed by a source bullet glyph."""
+        if not text.startswith("<") or not translate_input.placeholders:
+            return ""
+        marker = translate_input.placeholders[0]
+        if not isinstance(marker, FormulaPlaceholder) or not text.startswith(marker.placeholder):
+            return ""
+        glyphs = [
+            char for char in marker.formula.pdf_character
+            if char.char_unicode and char.char_unicode.strip()
+        ]
+        if len(glyphs) != 1:
+            return ""
+        glyph = glyphs[0]
+        if is_bullet_point(glyph) or (
+            layout_label == "list_item" and re.fullmatch(r"\(cid:\d+\)", glyph.char_unicode)
+        ):
+            return marker.placeholder
+        return ""
 
     def _translate_with_line_preservation(
         self, text: str, rate_limit_params: dict, force_preserve_lines: bool = False
@@ -1576,8 +1598,10 @@ Now, please carefully read the following text to be translated and directly outp
                     translated_text = self.shape_arabic_text(translated_text)
                     llm_translate_tracker.set_output(translated_text)
                 else:
+                    marker = self._leading_bullet_tag(text, translate_input, lbl.lower())
+                    body = text[len(marker):].lstrip() if marker else text
                     translated_text = self._translate_with_line_preservation(
-                        text,
+                        body,
                         rate_limit_params={
                             "paragraph_token_count": paragraph_token_count
                         },
@@ -1586,6 +1610,8 @@ Now, please carefully read the following text to be translated and directly outp
                             for marker in ("procedure_step", "contact_card")
                         ),
                     )
+                    if marker:
+                        translated_text = f"{marker} {translated_text}"
                 translated_text = self._normalize_arabic_output(translated_text)
                 translated_text = self.shape_arabic_text(translated_text)
                 # Only collapse repetitive punctuation if not a TOC leader line (\.{4,}\s*\d+)

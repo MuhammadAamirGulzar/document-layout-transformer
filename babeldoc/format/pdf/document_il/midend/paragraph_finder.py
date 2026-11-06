@@ -1696,6 +1696,8 @@ class ParagraphFinder:
             unmapped_list_rows = self._repeated_unmapped_list_rows(
                 paragraph.pdf_paragraph_composition
             )
+            if 0 in unmapped_list_rows:
+                paragraph.layout_label = "list_item"
             j = 1
             while j < len(paragraph.pdf_paragraph_composition):
                 prev_composition = paragraph.pdf_paragraph_composition[j - 1]
@@ -1799,7 +1801,10 @@ class ParagraphFinder:
                         ),
                         unicode="",
                         debug_id=generate_base58_id(),
-                        layout_label="paragraph" if is_style_boundary else paragraph.layout_label,
+                        layout_label=(
+                            "list_item" if j in unmapped_list_rows
+                            else "paragraph" if is_style_boundary else paragraph.layout_label
+                        ),
                         layout_id=paragraph.layout_id,
                     )
                     # æ›´æ–°åŽŸæ®µè½
