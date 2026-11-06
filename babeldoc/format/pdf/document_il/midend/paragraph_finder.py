@@ -1370,19 +1370,14 @@ class ParagraphFinder:
         return lines
 
     def _get_effective_y_bounds(self, char: PdfCharacter) -> tuple[float, float]:
-        """
-        Determines the effective vertical boundaries (y1, y2) for a character.
+        """Use source text boxes to find rows in horizontal text."""
+        # Font-specific visual offsets can make distinct source rows overlap.
+        # Keep the visual boxes for positioning the glyphs after line splitting.
+        if not char.vertical and char.box is not None and char.box.y2 > char.box.y:
+            return char.box.y, char.box.y2
 
-        It prioritizes the visual bounding box if its Intersection over Union (IoU)
-        with the PDF bounding box is high (>= 0.5), otherwise, it falls back to the
-        PDF bounding box. This helps use more accurate layout information when available.
-        """
         visual_box = char.visual_bbox.box
         return visual_box.y, visual_box.y2
-        pdf_box = char.box
-        if calculate_iou_for_boxes(visual_box, pdf_box) >= 0.5:
-            return visual_box.y, visual_box.y2
-        return pdf_box.y, pdf_box.y2
 
     @staticmethod
     def _compute_collision_counts_histogram(
