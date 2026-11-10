@@ -112,6 +112,8 @@ def _protect_numerals(text: str) -> tuple[str, dict[str, str]]:
         original = match.group(0)
         if original in existing_placeholders:
             return original
+        if _is_plain_caps_word(original):
+            return original
         placeholder = f"{{{counter[0]}}}"
         while placeholder in existing_placeholders:
             counter[0] += 1
@@ -208,7 +210,7 @@ def _restore_numerals(text: str, mapping: dict[str, str]) -> str:
     for original_token, expected_count in expected_counts.items():
         actual_count = text.count(original_token)
         if actual_count < expected_count:
-            is_critical = bool(_SWIFT_BIC_PATTERN.match(original_token) or _IBAN_PATTERN.match(original_token))
+            is_critical = bool(_is_valid_bic(original_token) or _IBAN_PATTERN.match(original_token))
             if is_critical:
                 raise AssertionError(
                     f"Byte-identity check failed! Expected at least {expected_count} occurrence(s) "
@@ -220,7 +222,7 @@ def _restore_numerals(text: str, mapping: dict[str, str]) -> str:
                     f"found {actual_count} in restored text. Preserving translated content."
                 )
         elif actual_count > expected_count and (
-            _SWIFT_BIC_PATTERN.match(original_token) or _IBAN_PATTERN.match(original_token)
+            _is_valid_bic(original_token) or _IBAN_PATTERN.match(original_token)
         ):
             raise AssertionError(
                 f"Byte-identity check failed! Expected exactly {expected_count} occurrence(s) "
@@ -239,6 +241,70 @@ _PURE_PASSTHROUGH_PATTERN = re.compile(
 
 # Explicit SWIFT BIC regex: 4-letter bank code + 2-letter country + 2-char location + opt 3-char branch
 _SWIFT_BIC_PATTERN = re.compile(r'^[A-Z]{4}[A-Z]{2}[A-Z0-9]{2}(?:[A-Z0-9]{3})?$')
+
+# ISO 3166-1 alpha-2 country codes (plus XK, which SWIFT uses for Kosovo).
+# A real BIC has one of these in characters 5-6. Ordinary ALL-CAPS English words that
+# are 8 or 11 letters long (INCOMING, NATIONAL, DEVELOPMENT) do not.
+_ISO_COUNTRY_CODES = frozenset(
+    "AD AE AF AG AI AL AM AO AQ AR AS AT AU AW AX AZ BA BB BD BE BF BG "
+    "BH BI BJ BL BM BN BO BQ BR BS BT BV BW BY BZ CA CC CD CF CG CH CI "
+    "CK CL CM CN CO CR CU CV CW CX CY CZ DE DJ DK DM DO DZ EC EE EG EH "
+    "ER ES ET FI FJ FK FM FO FR GA GB GD GE GF GG GH GI GL GM GN GP GQ "
+    "GR GS GT GU GW GY HK HM HN HR HT HU ID IE IL IM IN IO IQ IR IS IT "
+    "JE JM JO JP KE KG KH KI KM KN KP KR KW KY KZ LA LB LC LI LK LR LS "
+    "LT LU LV LY MA MC MD ME MF MG MH MK ML MM MN MO MP MQ MR MS MT MU "
+    "MV MW MX MY MZ NA NC NE NF NG NI NL NO NP NR NU NZ OM PA PE PF PG "
+    "PH PK PL PM PN PR PS PT PW PY QA RE RO RS RU RW SA SB SC SD SE SG "
+    "SH SI SJ SK SL SM SN SO SR SS ST SV SX SY SZ TC TD TF TG TH TJ TK "
+    "TL TM TN TO TR TT TV TW TZ UA UG UM US UY UZ VA VC VE VG VI VN VU "
+    "WF WS XK YE YT ZA ZM ZW "
+    .split()
+)
+
+
+def _is_valid_bic(token: str) -> bool:
+    """BIC-shaped token whose characters 5-6 are a real country code."""
+    return bool(_SWIFT_BIC_PATTERN.match(token)) and token[4:6] in _ISO_COUNTRY_CODES
+
+
+def _is_plain_caps_word(token: str) -> bool:
+    """All-letter 8/11 character caps word that only looks like a BIC."""
+    return (
+        token.isalpha()
+        and bool(_SWIFT_BIC_PATTERN.match(token))
+        and token[4:6] not in _ISO_COUNTRY_CODES
+    )
+
+
+def _is_code_like(word: str) -> bool:
+    """Known code, 11-character BIC, or 8-character BIC from a known bank ID."""
+    return word in _KNOWN_CODES or (
+        _is_valid_bic(word) and (len(word) == 11 or word[:4] in _KNOWN_CODES)
+    )
+
+
+def _caps_phrase_to_sentence_case(text: str) -> str:
+    """Turn an ALL-CAPS phrase of ordinary words into sentence case.
+
+    Models read 'STANDARDS DOCUMENT' badly, and a word like DOCUMENT has the shape of a
+    BIC. Phrases holding a known code, a BIC from a known bank, or a short acronym are
+    left alone. An 8-letter BIC from an unknown bank inside such a phrase is treated as a
+    word (known limit).
+    """
+    if not text:
+        return text
+    lines = []
+    for line in text.split("\n"):
+        stripped = line.strip()
+        words = stripped.split()
+        if (
+            len(words) >= 2
+            and all(re.fullmatch(r"[A-Z]{4,}", word) for word in words)
+            and not any(_is_code_like(word) for word in words)
+        ):
+            line = line.replace(stripped, stripped.capitalize(), 1)
+        lines.append(line)
+    return "\n".join(lines)
 
 # Full IBAN account pattern: 2-letter country + 2 check digits + up to 30 alphanumeric chars
 _IBAN_PATTERN = re.compile(r'^[A-Z]{2}\d{2}[A-Z0-9]{11,30}$')
@@ -291,7 +357,7 @@ def _is_pure_passthrough(text: str) -> bool:
         return True
 
     # Direct match for SWIFT/BIC, IBAN, Phone numbers, or Modulo algorithm strings
-    if _SWIFT_BIC_PATTERN.match(stripped):
+    if _is_valid_bic(stripped):
         return True
     if _IBAN_PATTERN.match(stripped):
         return True
@@ -318,7 +384,7 @@ def _is_pure_passthrough(text: str) -> bool:
         if clean in _KNOWN_CODES or clean.upper() in _KNOWN_CODES:
             continue
         # Is it a SWIFT BIC code or IBAN string?
-        if _SWIFT_BIC_PATTERN.match(clean) or _IBAN_PATTERN.match(clean):
+        if _is_valid_bic(clean) or _IBAN_PATTERN.match(clean):
             continue
         # A standalone ISO alpha-2 code is structural data.  Longer uppercase
         # words are not assumed to be codes; genuine acronyms and bank IDs are

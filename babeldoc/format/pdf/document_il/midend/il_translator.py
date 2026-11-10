@@ -378,9 +378,9 @@ class ILTranslator:
         if not text:
             return text
 
-        # In this cover title, DOCUMENT is a word that resembles a BIC.
-        if text.strip() == "STANDARDS DOCUMENT":
-            return "Standards document"
+        # An ALL-CAPS phrase of ordinary words reads better to the model in sentence case.
+        from babeldoc.translator.translator import _caps_phrase_to_sentence_case
+        text = _caps_phrase_to_sentence_case(text)
 
         # Financial rates and central banking terms
         text = re.sub(r'\b(?:The\s+)?QMR\s+Lending\s+Rate\b', 'سعر فائدة الإقراض في سوق قطر النقدي', text, flags=re.I)
