@@ -5,7 +5,7 @@ import logging
 import re
 import statistics
 import unicodedata
-from functools import cache
+from functools import cache, partial
 
 import pymupdf
 import regex
@@ -914,10 +914,33 @@ class Typesetting:
         self._heading_clearance_resolved_pages: set[int] = set()
         self._translated_code_band_keys: set[tuple[int, int]] = set()
 
+    def _is_centered_display_text(self, paragraph, page) -> bool:
+        """Recognize large centered titles even when labeled as plain text."""
+        if not self.is_arabic or not page.cropbox or not page.cropbox.box:
+            return False
+        box = paragraph.box
+        style = paragraph.pdf_style
+        label = (paragraph.layout_label or "").lower()
+        if (
+            not box or not style or (style.font_size or 0) < 20
+            or paragraph.vertical or label not in {"title", "heading", "section_heading", "plain text"}
+        ):
+            return False
+        crop = page.cropbox.box
+        width = crop.x2 - crop.x
+        # Use the source text's own box, rather than assuming every large heading is centered.
+        return (
+            0 < box.x2 - box.x < width * 0.85
+            and abs((box.x + box.x2) - (crop.x + crop.x2)) <= width * 0.03
+            and not self._is_inside_table_or_figure_region(box, page)
+        )
+
     def _arabic_publication_font_size(
         self,
         paragraph: il_version_1.PdfParagraph,
         source_size: float,
+        *,
+        centered_display: bool = False,
     ) -> float:
         """Return a stable, readable Arabic type scale for translated text.
 
@@ -934,6 +957,9 @@ class Typesetting:
             return source_size
 
         label = (paragraph.layout_label or "").lower()
+        if centered_display:
+            return min(source_size, paragraph.pdf_style.font_size)
+
         # Preserve the source hierarchy, but keep it narrow and predictable.
         if any(marker in label for marker in ("title", "heading", "section")):
             target_size = 14.0
@@ -1074,6 +1100,7 @@ class Typesetting:
         """Preprocess document - calculate optimal scale for each paragraph and cache the result"""
         all_scales: list[float] = []
         all_paragraphs: list[il_version_1.PdfParagraph] = []
+        centered_display_ids: set[int] = set()
 
         for page in document.page:
             pbar.advance()
@@ -1120,10 +1147,12 @@ class Typesetting:
             # Preprocess each paragraph
             for paragraph in page.pdf_paragraph:
                 all_paragraphs.append(paragraph)
+                if self._is_centered_display_text(paragraph, page):
+                    centered_display_ids.add(id(paragraph))
                 unit_count = 0
                 try:
                     typesetting_units = self._deduplicate_artificial_header_units(
-                        paragraph, page, self.create_typesetting_units(paragraph, fonts)
+                        paragraph, page, self.create_typesetting_units(paragraph, fonts, page=page)
                     )
                     unit_count = len(typesetting_units)
                     for unit in typesetting_units:
@@ -1165,7 +1194,7 @@ class Typesetting:
                     marker in layout_label
                     for marker in ["title", "heading", "caption", "table", "footnote", "fallback_line"]
                 )
-                if not is_hierarchy_exempt:
+                if not is_hierarchy_exempt and id(paragraph) not in centered_display_ids:
                     if (
                         paragraph.optimal_scale is not None
                         and paragraph.optimal_scale > mode_scale
@@ -1360,6 +1389,10 @@ class Typesetting:
 
         box = paragraph.box
         scale = initial_scale
+        layout_units = partial(
+            self._layout_typesetting_units,
+            centered_display=self._is_centered_display_text(paragraph, page),
+        )
         # Arabic needs extra line spacing (1.5) due to diacritical marks above/below letters
         # CJK also needs 1.5 due to character height
         # Other languages use 1.3
@@ -1413,7 +1446,7 @@ class Typesetting:
 
         # Try initial layout at current scale
         try:
-            typeset_units, all_units_fit = self._layout_typesetting_units(
+            typeset_units, all_units_fit = layout_units(
                 typesetting_units,
                 box,
                 scale,
@@ -1441,7 +1474,7 @@ class Typesetting:
                 expanded_box = Box(x=box.x, y=min_avail_y, x2=box.x2, y2=box.y2)
                 box = expanded_box
                 paragraph.box = expanded_box
-                typeset_units, all_units_fit = self._layout_typesetting_units(
+                typeset_units, all_units_fit = layout_units(
                     typesetting_units,
                     box,
                     scale,
@@ -1467,7 +1500,7 @@ class Typesetting:
                 scale = relief_floor
 
             try:
-                typeset_units, all_units_fit = self._layout_typesetting_units(
+                typeset_units, all_units_fit = layout_units(
                     typesetting_units,
                     box,
                     scale,
@@ -1491,7 +1524,7 @@ class Typesetting:
                     expanded_box = Box(x=box.x, y=min_avail_y, x2=box.x2, y2=box.y2)
                     box = expanded_box
                     paragraph.box = expanded_box
-                    typeset_units, all_units_fit = self._layout_typesetting_units(
+                    typeset_units, all_units_fit = layout_units(
                         typesetting_units,
                         box,
                         scale,
@@ -1553,7 +1586,7 @@ class Typesetting:
 
         # Emergency layout at relief_floor with use_english_line_break=False
         try:
-            typeset_units, _ = self._layout_typesetting_units(
+            typeset_units, _ = layout_units(
                 typesetting_units,
                 box,
                 relief_floor,
@@ -1756,11 +1789,15 @@ class Typesetting:
         # Mirror decorative header banners (colored rectangles) horizontally for RTL
         self._mirror_header_decorations(page)
 
+        header_rules = self._find_header_underlines(page)
+
         # Start typesetting layout rendering
         for paragraph in page.pdf_paragraph:
             self.render_paragraph(paragraph, page, fonts)
         self._audit_arabic_font_ownership(page)
         self._resolve_rendered_text_collisions(page)
+        for paragraph, rules in header_rules:
+            self._align_header_underlines(paragraph, rules, page.cropbox.box)
 
     @staticmethod
     def _is_fixed_table_paragraph(paragraph: il_version_1.PdfParagraph) -> bool:
@@ -2243,6 +2280,82 @@ class Typesetting:
             )
 
 
+    def _find_header_underlines(self, page: il_version_1.Page):
+        """Match short, right-aligned filled rules to a header before text moves."""
+        if not self._is_arabic_output() or not page.cropbox or not page.cropbox.box:
+            return []
+        crop = page.cropbox.box
+        mid_x = (crop.x + crop.x2) / 2
+        top = crop.y2 - (crop.y2 - crop.y) * 0.15
+        thin_rules = [
+            curve for curve in page.pdf_curve
+            if curve.box and curve.box.y >= top and curve.box.x >= mid_x
+            and 0 < curve.box.y2 - curve.box.y <= 1.5
+            and curve.fill_background and not curve.stroke_path
+            # The parser marks original PDF paths with 'a'.
+            and curve.debug_info == "a"
+            and not curve.relocation_transform
+            and [part.op for part in curve.pdf_path] == ["m", "l", "l", "l", "h"]
+        ]
+        matches = []
+        for paragraph in page.pdf_paragraph:
+            box = paragraph.box
+            size = paragraph.pdf_style.font_size if paragraph.pdf_style else None
+            label = (paragraph.layout_label or "").lower()
+            if (
+                not box or not size or box.x < mid_x or box.y2 <= top
+                or label not in {"abandon", "plain text", "heading", "header", "page_header"}
+                or self._is_inside_table_or_figure_region(box, page)
+            ):
+                continue
+            rules = sorted((
+                curve for curve in thin_rules
+                if curve.xobj_id == paragraph.xobj_id and curve.box.x2 - curve.box.x >= size * 2.5
+                and curve.box.x >= box.x - 2 and abs(curve.box.x2 - box.x2) <= 2
+                and box.y2 - size * 4 <= curve.box.y <= box.y2 - size * 0.5
+            ), key=lambda curve: -curve.box.y)
+            if 2 <= len(rules) <= 4 and all(
+                first.box.y - second.box.y >= size * 0.75
+                for first, second in zip(rules, rules[1:])
+            ):
+                matches.append((paragraph, rules))
+
+        # Do not move a rule that could belong to more than one text block.
+        rule_counts = {}
+        for _, rules in matches:
+            for rule in rules:
+                rule_counts[id(rule)] = rule_counts.get(id(rule), 0) + 1
+        return [
+            (paragraph, rules) for paragraph, rules in matches
+            if all(rule_counts[id(rule)] == 1 for rule in rules)
+        ]
+
+    @staticmethod
+    def _align_header_underlines(paragraph, rules, crop):
+        """Move original paths under the final lines when the mapping is unambiguous."""
+        right_by_baseline: dict[float, float] = {}
+        for composition in paragraph.pdf_paragraph_composition:
+            char = composition.pdf_character
+            if char and char.box and (char.char_unicode or "").strip():
+                x2, baseline = char.box.x2, round(char.box.y, 2)
+                right_by_baseline[baseline] = max(right_by_baseline.get(baseline, x2), x2)
+        if len(right_by_baseline) != len(rules):
+            return
+
+        placements = []
+        for rule, (baseline, right) in zip(rules, sorted(right_by_baseline.items(), reverse=True)):
+            box = rule.box
+            dx, dy = right - box.x2, baseline - 1.5 - box.y2
+            moved = Box(box.x + dx, box.y + dy, box.x2 + dx, box.y2 + dy)
+            if not (crop.x <= moved.x < moved.x2 <= crop.x2 and crop.y <= moved.y < moved.y2 <= crop.y2):
+                return
+            placements.append((rule, moved, dx, dy))
+
+        for rule, moved, dx, dy in placements:
+            rule.box = moved
+            # The writer uses pdf_original_path, so moving only the box is insufficient.
+            rule.relocation_transform = [1, 0, 0, 1, dx, dy]
+
     def _mirror_header_decorations(self, page: il_version_1.Page):
         """Mirror decorative header vector rectangles horizontally when rendering RTL."""
         if not self._is_arabic_output():
@@ -2409,6 +2522,9 @@ class Typesetting:
         box = paragraph.box
         page_box = page.cropbox.box
         
+        if self._is_centered_display_text(paragraph, page):
+            return 0.0
+
         # Framed contact rows are already right-aligned within their own lane.
         if self._is_arabic_output() and self._contact_frame_bounds(paragraph, page):
             return 0.0
@@ -3133,7 +3249,7 @@ class Typesetting:
         ],
     ):
         typesetting_units = self._deduplicate_artificial_header_units(
-            paragraph, page, self.create_typesetting_units(paragraph, fonts)
+            paragraph, page, self.create_typesetting_units(paragraph, fonts, page=page)
         )
         
         # Check if Arabic output for RTL margin mirroring
@@ -3236,6 +3352,8 @@ class Typesetting:
         line_skip: float,
         paragraph: il_version_1.PdfParagraph,
         use_english_line_break: bool = True,
+        *,
+        centered_display: bool = False,
     ) -> tuple[list[TypesettingUnit], bool]:
         """Layout typesetting units - OPTIMIZED FOR ARABIC RTL"""
         
@@ -3541,6 +3659,8 @@ class Typesetting:
                 # Determine starting X position
                 if is_chronological_axis:
                     line_start_x = box.x
+                elif centered_display:
+                    line_start_x = max(box.x, (box.x + box.x2 - visual_line_w) / 2)
                 elif is_table_content:
                     line_start_x = box.x2 - visual_line_w
                     if line_start_x < box.x:
@@ -3840,10 +3960,13 @@ class Typesetting:
         self,
         paragraph: il_version_1.PdfParagraph,
         fonts: dict[str, il_version_1.PdfFont],
+        *,
+        page: il_version_1.Page | None = None,
     ) -> list[TypesettingUnit]:
         if not paragraph.pdf_paragraph_composition:
             return []
         result = []
+        centered_display = page is not None and self._is_centered_display_text(paragraph, page)
         # Page-level paragraphs are not inside an XObject.  The rest of the
         # pipeline represents that case with -1 (rather than None), while a
         # TypesettingUnit requires a concrete ownership ID for generated text.
@@ -3990,6 +4113,7 @@ class Typesetting:
                     target_font_size = self._arabic_publication_font_size(
                         paragraph,
                         style.font_size * optical_factor,
+                        centered_display=centered_display,
                     )
                     for char_unicode in shaped_text:
                         if char_unicode in "\r\n":
