@@ -48,6 +48,16 @@ from arabic_reshaper import reshape
 
 logger = logging.getLogger(__name__)
 
+_SUBTRACTION_INSTRUCTION = re.compile(
+    r"(?P<step>Step[ \t]+[0-9]+:[ \t]+)?Subtract[ \t]+"
+    r"(?P<amount>the remainder(?: calculated in step [0-9]+)?|[0-9]+)"
+    r"[ \t]+from[ \t]+(?P<start>[0-9]+)"
+    r"(?:(?P<pad> and, if necessary, pad with a leading 0 to make a two[ -]digit number)"
+    r"|(?P<tail> and record the result| to find the checksum))?"
+    r"(?P<punctuation>\.?)",
+    flags=re.IGNORECASE,
+)
+
 
 class RichTextPlaceholder:
     def __init__(
@@ -532,13 +542,29 @@ class ILTranslator:
         def translate_segment(segment: str) -> str:
             # List and section numbering is document structure.
             marker = re.match(r"^[ \t]*\d{1,3}(?:\.\d{1,3})*\.(?:[ \t]+|$)", segment)
-            if marker:
-                label = segment[marker.end():]
-                if not label:
-                    return segment
-                translated = self.translate_engine.translate(label, rate_limit_params=rate_limit_params)
-                return marker.group() + translated
-            return self.translate_engine.translate(segment, rate_limit_params=rate_limit_params)
+            prefix = marker.group() if marker else ""
+            body = segment[len(prefix):]
+            if marker and not body:
+                return segment
+            engine = self.translate_engine
+            if (
+                not is_toc_block
+                and (len(non_empty) == 1 or not is_short_labels)
+                and getattr(engine, "model_name", None) == "facebook/nllb-200-distilled-600M"
+                and getattr(engine, "src_nllb", None) == "eng_Latn"
+                and getattr(engine, "tgt_nllb", None) == "arb_Arab"
+                and (subtraction := _SUBTRACTION_INSTRUCTION.fullmatch(body))
+            ):
+                # Explicit operand order keeps "subtract" from becoming "exclude".
+                body = (
+                    f"{subtraction['step'] or ''}Calculate "
+                    f"{subtraction['start']} minus {subtraction['amount']}"
+                )
+                if subtraction["pad"]:
+                    body += ". If necessary, add a leading 0 so that the result has two digits"
+                body += (subtraction["tail"] or "") + subtraction["punctuation"]
+            translated = engine.translate(body, rate_limit_params=rate_limit_params)
+            return prefix + translated if marker else translated
 
         # Check if text contains Table of Contents (TOC) entries with dotted leader lines
         # e.g. "1. Introduction ................................................................................................. 1306"
