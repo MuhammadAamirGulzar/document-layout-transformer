@@ -461,6 +461,48 @@ class ILTranslator:
             return marker.placeholder
         return ""
 
+    def _split_trailing_index_reference(self, text, source_text, translate_input):
+        """Keep a trailing reference like M[X, a] intact through translation."""
+        source_match = re.search(
+            r"(?<=\S)[ \t]+(?P<reference>(?P<name>[A-Za-z_]\w*)"
+            r"\[(?P<indices>[A-Za-z0-9_]+,[ \t]*[A-Za-z0-9_]+)\])[ \t]*\Z",
+            source_text or "",
+            flags=re.ASCII,
+        )
+        if source_match is None:
+            return text, "", translate_input
+
+        name = re.escape(source_match["name"])
+        indices = re.escape(source_match["indices"])
+        match = re.search(
+            rf"(?<=\S)[ \t]+{name}(\[|<b\d+>){indices}(\]|<b\d+>)[ \t]*\Z",
+            text,
+        )
+        if match is None:
+            return text, "", translate_input
+
+        # Extraction can represent the two brackets as separate formula tags.
+        opening, closing = match.groups()
+        brackets = {
+            item.placeholder: "".join(
+                char.char_unicode or "" for char in item.formula.pdf_character
+            )
+            for item in translate_input.placeholders
+            if isinstance(item, FormulaPlaceholder) and item.placeholder in (opening, closing)
+        }
+        if brackets.get(opening, opening) != "[" or brackets.get(closing, closing) != "]":
+            return text, "", translate_input
+        if brackets:
+            translate_input = self.TranslateInput(
+                translate_input.unicode,
+                [
+                    item for item in translate_input.placeholders
+                    if not isinstance(item, FormulaPlaceholder) or item.placeholder not in brackets
+                ],
+                translate_input.base_style,
+            )
+        return text[:match.start()], source_match["reference"], translate_input
+
     def _translate_with_line_preservation(
         self, text: str, rate_limit_params: dict, force_preserve_lines: bool = False
     ) -> str:
@@ -1565,6 +1607,7 @@ Now, please carefully read the following text to be translated and directly outp
                 llm_translate_tracker = tracker.new_llm_translate_tracker()
                 # Perform translation
                 direct_translation = None
+                index_reference = ""
                 if "contact_card" in lbl.lower():
                     direct_translation = self._translate_contact_field_directly(source_unicode or text)
                 elif (
@@ -1600,6 +1643,9 @@ Now, please carefully read the following text to be translated and directly outp
                 else:
                     marker = self._leading_bullet_tag(text, translate_input, lbl.lower())
                     body = text[len(marker):].lstrip() if marker else text
+                    body, index_reference, translate_input = (
+                        self._split_trailing_index_reference(body, source_unicode, translate_input)
+                    )
                     translated_text = self._translate_with_line_preservation(
                         body,
                         rate_limit_params={
@@ -1617,6 +1663,11 @@ Now, please carefully read the following text to be translated and directly outp
                 # Only collapse repetitive punctuation if not a TOC leader line (\.{4,}\s*\d+)
                 if not re.search(r'\.{4,}\s*\d+', translated_text):
                     translated_text = re.sub(r"[. 。…，]{20,}", ".", translated_text)
+                if index_reference:
+                    language = (self.translation_config.lang_out or "").lower().rsplit("-", 1)[-1]
+                    if language in {"ar", "ara", "arabic"}:
+                        index_reference = f"\u200e{index_reference}\u200e"
+                    translated_text = f"{translated_text.rstrip()} {index_reference}"
 
                 # Attach diagnostic pipeline trace for paragraph routing analysis
                 engine_name = getattr(self.translate_engine, 'name', self.translate_engine.__class__.__name__)
