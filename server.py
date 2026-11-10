@@ -559,6 +559,7 @@ async def translation_job_status(session_id: str, after: int = 0):
         "has_mono": bool(session.get("mono_output_path")),
         "has_dual": bool(session.get("dual_output_path")),
         "untranslated_count": int(session.get("untranslated_count", 0)),
+        "incomplete_count": session.get("incomplete_count", 0),
         "events": _job_events_after(session, after),
         "next_event_id": session.get("_event_id", 0),
     }
@@ -736,6 +737,9 @@ async def _translation_events(session):
                 translate_result = event.get("translate_result")
                 session["result"] = translate_result
                 session["untranslated_count"] = _untranslated_count(config)
+                session["incomplete_count"] = getattr(
+                    getattr(config, "translator", None), "incomplete_count", 0
+                )
 
                 # Find output files (both mono and dual side-by-side)
                 mono_pdf = None

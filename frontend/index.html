@@ -1433,7 +1433,7 @@
                         cursor = Math.max(cursor, event.event_id || 0);
                     }
                     cursor = Math.max(cursor, state.next_event_id || 0);
-                    updateUntranslatedNote(state.untranslated_count || 0);
+                    updateUntranslatedNote(state.untranslated_count || 0, state.incomplete_count || 0);
                     if (['error', 'cancelled', 'timed_out'].includes(state.status) && !pollStopped) {
                         pollStopped = true;
                         hideProgress();
@@ -1545,16 +1545,20 @@
             progressContainer.classList.remove('active');
         }
 
-        function updateUntranslatedNote(count) {
+        function updateUntranslatedNote(count, incompleteCount) {
             const note = document.getElementById('untranslatedNote');
             if (!note) return;
-            const n = Number(count) || 0;
-            if (n > 0) {
-                note.textContent = n + (n === 1 ? ' text block' : ' text blocks') + ' could not be translated and was left in the original language. Please check the downloaded file.';
-                note.style.display = 'block';
-            } else {
-                note.style.display = 'none';
+            const untranslated = Number(count) || 0;
+            const incomplete = Number(incompleteCount) || 0;
+            const messages = [];
+            if (untranslated > 0) {
+                messages.push(untranslated + (untranslated === 1 ? ' text block could not be translated and was left' : ' text blocks could not be translated and were left') + ' in the original language.');
             }
+            if (incomplete > 0) {
+                messages.push(incomplete + (incomplete === 1 ? ' translated text block may be' : ' translated text blocks may be') + ' missing protected numbers or codes.');
+            }
+            note.textContent = messages.length ? messages.join(' ') + ' Please check the downloaded file.' : '';
+            note.style.display = messages.length ? 'block' : 'none';
         }
 
         function showResult() {

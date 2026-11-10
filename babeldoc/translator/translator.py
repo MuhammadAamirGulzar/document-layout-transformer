@@ -527,12 +527,17 @@ class BaseTranslator(ABC):
 
         # Shielding placeholder mechanism applied uniformly across all translation engines
         protected_text, numeral_map = _protect_numerals(cleaned_text)
-        raw_translation = self.do_translate(protected_text, rate_limit_params)
-        translation = _restore_numerals(raw_translation, numeral_map)
+        translation, cacheable = self._translate_protected(
+            protected_text, numeral_map, rate_limit_params
+        )
 
-        if not (self.ignore_cache or ignore_cache):
+        if cacheable and not (self.ignore_cache or ignore_cache):
             self.cache.set(text, translation)
         return translation
+
+    def _translate_protected(self, text, mapping, rate_limit_params):
+        output = self.do_translate(text, rate_limit_params)
+        return _restore_numerals(output, mapping), True
 
     def llm_translate(self, text, ignore_cache=False, rate_limit_params: dict = None):
         """
@@ -971,6 +976,18 @@ class NLLBTranslator(BaseTranslator):
         self._forced_bos_token_id = None
         self.add_cache_impact_parameters("model", self.model_name)
         self.add_cache_impact_parameters("load_in_8bit", str(self.load_in_8bit))
+        self._retry_missing_values = (
+            self.model_name == "facebook/nllb-200-distilled-600M"
+            and self.src_nllb == "eng_Latn"
+            and self.tgt_nllb == "arb_Arab"
+        )
+        self._incomplete_blocks = AtomicInteger()
+        if self._retry_missing_values:
+            self.add_cache_impact_parameters("protected_content_retry", 1)
+
+    @property
+    def incomplete_count(self):
+        return self._incomplete_blocks.value
 
     def _get_device(self):
         if self._device is not None:
@@ -1041,7 +1058,6 @@ class NLLBTranslator(BaseTranslator):
             return cleaned_text
 
         self._load_model()
-        import torch
 
         # Protect numerals from translation (if not already shielded by translate())
         has_placeholders = bool(re.search(r'\{\d+\}', cleaned_text))
@@ -1050,30 +1066,8 @@ class NLLBTranslator(BaseTranslator):
         else:
             protected_text, numeral_map = cleaned_text, {}
 
-        device = self._get_device()
         try:
-            self._tokenizer.src_lang = self.src_nllb
-            inputs = self._tokenizer(
-                [protected_text],
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=self.max_length
-            ).to(device)
-
-            gen_kwargs = {
-                "max_length": self.max_length,
-                "num_beams": 3 if self.load_in_8bit else 4,
-                "no_repeat_ngram_size": 4,
-                "repetition_penalty": 1.1,
-            }
-            if self._forced_bos_token_id is not None:
-                gen_kwargs["forced_bos_token_id"] = self._forced_bos_token_id
-
-            with torch.no_grad():
-                translated_tokens = self._model.generate(**inputs, **gen_kwargs)
-
-            translation = self._tokenizer.batch_decode(translated_tokens, skip_special_tokens=True)[0]
+            translation = self._generate_translation(protected_text)
             # Restore original numerals if shielded locally
             if numeral_map:
                 translation = _restore_numerals(translation.strip(), numeral_map)
@@ -1082,6 +1076,82 @@ class NLLBTranslator(BaseTranslator):
             logger.error(f"Error during NLLB translation: {e}")
             self.untranslated_count = getattr(self, "untranslated_count", 0) + 1
             return cleaned_text
+
+    def _translate_protected(self, text, mapping, rate_limit_params):
+        first, cacheable = super()._translate_protected(text, mapping, rate_limit_params)
+        if not self._retry_missing_values or not mapping:
+            return first, cacheable
+
+        expected = Counter(mapping.values())
+        missing = {
+            value for value, count in expected.items()
+            if self._protected_value_count(first, value) < count
+        }
+        if not missing:
+            return first, cacheable
+
+        # Do not expose full account numbers (including grouped IBANs) or bank codes.
+        literal = {
+            tag: value for tag, value in mapping.items()
+            if value in missing
+            and not (_is_valid_bic(value) or _IBAN_PATTERN.fullmatch(re.sub(r"\s+", "", value)))
+        }
+        if literal:
+            retry_text = re.sub(r"\{\d+\}", lambda match: literal.get(match[0], match[0]), text)
+            remaining = {tag: value for tag, value in mapping.items() if tag not in literal}
+            try:
+                candidate = _restore_numerals(self._generate_translation(retry_text), remaining)
+            except Exception:
+                logger.warning("NLLB protected-content retry failed")
+            else:
+                if re.search(r"[\u0621-\u064A]", candidate) and all(
+                    self._protected_value_count(candidate, value) == count
+                    for value, count in expected.items()
+                ):
+                    return candidate, True
+
+        self._incomplete_blocks.inc()
+        logger.warning("NLLB output is missing protected content. Check the translated block.")
+        return first, False
+
+    @staticmethod
+    def _protected_value_count(text, value):
+        # Allow surrounding Arabic prose, but distinguish IBANX from IBAN and 13 from 3.
+        left = r"(?<![A-Za-z_\d])" if value[0].isalnum() else ""
+        right = r"(?![A-Za-z_\d])" if value[-1].isalnum() else ""
+        if value.isdecimal():
+            # A bare number is also different from part of a decimal or thousands group.
+            text = re.sub(r"\{\s*\d+\s*\}", "", text)
+            left += r"(?<![+\-\u2212])(?<!\d[.,\u066B\u066C])"
+            right += r"(?![.,\u066B\u066C]\d)"
+        return len(re.findall(left + re.escape(value) + right, text))
+
+    def _generate_translation(self, text):
+        import torch
+
+        device = self._get_device()
+        self._tokenizer.src_lang = self.src_nllb
+        inputs = self._tokenizer(
+            [text],
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=self.max_length
+        ).to(device)
+
+        gen_kwargs = {
+            "max_length": self.max_length,
+            "num_beams": 3 if self.load_in_8bit else 4,
+            "no_repeat_ngram_size": 4,
+            "repetition_penalty": 1.1,
+        }
+        if self._forced_bos_token_id is not None:
+            gen_kwargs["forced_bos_token_id"] = self._forced_bos_token_id
+
+        with torch.no_grad():
+            translated_tokens = self._model.generate(**inputs, **gen_kwargs)
+
+        return self._tokenizer.batch_decode(translated_tokens, skip_special_tokens=True)[0]
 
     def do_llm_translate(self, text, rate_limit_params: dict = None):
         raise NotImplementedError("NLLB uses sequence-to-sequence translation, not LLM chat completions.")
