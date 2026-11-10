@@ -438,6 +438,22 @@ class ILTranslator:
         text = re.sub(r'\bBANK\s+BARWA\b', 'بنك بروة', text, flags=re.I)
         text = re.sub(r'\bQATAR\s+DEVELOPMENT\s+BANK\b', 'بنك قطر للتنمية', text, flags=re.I)
 
+        # Clarify the verified dual-digit phrase for the local model.
+        text = re.sub(
+            r"\b(two[ \t]+)(check)([ \t-]+)(digits)\b",
+            lambda match: (
+                match[1]
+                + (
+                    "VERIFICATION" if match[2].isupper()
+                    else "Verification" if match[2][0].isupper()
+                    else "verification"
+                )
+                + match[3] + match[4]
+            ),
+            text,
+            flags=re.I,
+        )
+
         return text
 
     @staticmethod
