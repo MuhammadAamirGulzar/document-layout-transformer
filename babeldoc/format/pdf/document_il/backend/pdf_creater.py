@@ -657,14 +657,10 @@ class PDFCreater:
             return chars
         return chars
 
-    def create_render_units_for_page(
+    def _create_character_render_units(
         self,
         page: il_version_1.Page,
-        translation_config: TranslationConfig,
-    ) -> list[RenderUnit]:
-        """Convert all renderable objects in a page to render units."""
-        render_units = []
-
+    ) -> list[CharacterRenderUnit]:
         # Collect all characters. A paragraph composition can retain a reference
         # to the same source character as page.pdf_character; emitting both was
         # the root of several doubled definition lines. Paragraph ownership wins
@@ -694,12 +690,17 @@ class PDFCreater:
         ]
         chars.extend(paragraph_chars)
 
+        # Source PDF text stores character codes in its original font encoding.
+        # Only our embedded output fonts use glyph indices directly.
         invalid = [
             char for char in chars
             if (
                 char.char_unicode not in (None, "\n")
                 and (
-                    char.pdf_character_id == 0
+                    (
+                        char.pdf_character_id == 0
+                        and getattr(char.pdf_style, "font_id", None) in self.font_mapper.fontid2font
+                    )
                     or (len(char.char_unicode) == 1 and unicodedata.category(char.char_unicode) == "Cc")
                 )
             )
@@ -710,13 +711,26 @@ class PDFCreater:
                 f"PDF glyph preflight failed on page {page.page_number}: {len(invalid)} invalid glyph(s): {sample}"
             )
 
-        # Convert characters to render units
-        for i, char in enumerate(chars):
-            render_order = getattr(char, "render_order", 100)  # Default render order
-            sub_render_order = getattr(char, "sub_render_order", i)
-            render_units.append(
-                CharacterRenderUnit(char, render_order, sub_render_order)
+        return [
+            CharacterRenderUnit(
+                char,
+                getattr(char, "render_order", 100),
+                getattr(char, "sub_render_order", i),
             )
+            for i, char in enumerate(chars)
+        ]
+
+    def create_render_units_for_page(
+        self,
+        page: il_version_1.Page,
+        translation_config: TranslationConfig,
+        *,
+        skip_char: bool = False,
+    ) -> list[RenderUnit]:
+        """Convert the requested page objects to render units."""
+        render_units: list[RenderUnit] = []
+        if not skip_char:
+            render_units.extend(self._create_character_render_units(page))
 
         # Collect forms from formulas within paragraphs
         formula_forms = []
@@ -1582,13 +1596,9 @@ class PDFCreater:
             check_font_exists=check_font_exists,
         )
         # Create render units for all renderable objects
-        render_units = self.create_render_units_for_page(page, translation_config)
-        if skip_char:
-            render_units = [
-                unit
-                for unit in render_units
-                if not isinstance(unit, CharacterRenderUnit)
-            ]
+        render_units = self.create_render_units_for_page(
+            page, translation_config, skip_char=skip_char
+        )
         # Render all units to their appropriate streams
         self.render_units_to_stream(render_units, context, page_op, xobj_draw_ops)
         # Update xobject streams

@@ -328,6 +328,44 @@ def test_render_preflight_rejects_missing_glyphs_and_deduplicates_ownership():
         assert "glyph preflight failed" in str(error)
 
 
+def test_original_font_code_zero_is_preserved_during_export():
+    from babeldoc.format.pdf.document_il.backend.pdf_creater import (
+        CharacterRenderUnit,
+        PDFCreater,
+    )
+
+    cfg = TranslationConfig(
+        translator=DummyTranslator(), input_file="", lang_in="en", lang_out="ar", doc_layout_model=None
+    )
+    char = PdfCharacter(
+        char_unicode="=", pdf_character_id=0,
+        pdf_style=PdfStyle(font_id="F1", font_size=10.0), xobj_id=-1,
+    )
+    page = Page(pdf_character=[char])
+    creator = PDFCreater("", Document(page=[page]), cfg, {})
+
+    units = creator.create_render_units_for_page(page, cfg)
+
+    assert len(units) == 1
+    assert isinstance(units[0], CharacterRenderUnit)
+    assert units[0].char is char
+    assert units[0].char.pdf_character_id == 0
+
+
+def test_scan_preview_skips_character_preflight():
+    from babeldoc.format.pdf.document_il.backend.pdf_creater import PDFCreater
+
+    cfg = TranslationConfig(
+        translator=DummyTranslator(), input_file="", lang_in="en", lang_out="ar", doc_layout_model=None
+    )
+    page = Page(pdf_character=[
+        PdfCharacter(char_unicode="=", pdf_character_id=0, pdf_style=PdfStyle(font_id="base"))
+    ])
+    creator = PDFCreater("", Document(page=[page]), cfg, {})
+
+    assert creator.create_render_units_for_page(page, cfg, skip_char=True) == []
+
+
 if __name__ == "__main__":
     import sys
     if hasattr(sys.stdout, 'reconfigure'):
