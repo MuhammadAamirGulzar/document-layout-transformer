@@ -44,7 +44,17 @@ def remove_control_characters(s):
 #   - Inverting modulo algorithms (MOD 97-10) or dropping phone numbers (+974 44456371)
 #
 # Pattern priority (highest-specificity first to avoid partial matches):
+_CITATION_SURNAME = r"[A-ZÀ-ÖØ-Þ][^\W\d_]*(?:[-'’][^\W\d_]+)*"
+_CITATION_AUTHORS = rf"{_CITATION_SURNAME}(?:\s+et\s+al\.|\s+(?:and|&)\s+{_CITATION_SURNAME})?"
+_CITATION_YEAR = r"(?:18|19|20)\d{2}[a-z]?"
+_CITATION_ENTRY = rf"{_CITATION_AUTHORS},\s*{_CITATION_YEAR}"
+AUTHOR_YEAR_CITATION = re.compile(
+    rf"\({_CITATION_ENTRY}(?:;\s*{_CITATION_ENTRY})*\)"
+    rf"|\b{_CITATION_SURNAME}\s+et\s+al\.\s*\({_CITATION_YEAR}\)",
+)
+
 _NUMERAL_PATTERN = re.compile(
+    rf"({AUTHOR_YEAR_CITATION.pattern})|"
     # 1. Parenthetical mixed tokens: (2018=100), (NDS3), (281211210/97 =62), (Chart 7-1)
     # Exclude prose parentheticals with lowercase words such as (First 4 character of BIC),
     # (e.g. QA00 for QATAR), or (29 characters for QATAR) so their text is translated while

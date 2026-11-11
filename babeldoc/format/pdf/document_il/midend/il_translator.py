@@ -42,6 +42,7 @@ from babeldoc.format.pdf.document_il.utils.paragraph_helper import (
 )
 from babeldoc.format.pdf.document_il.utils.style_helper import GRAY80
 from babeldoc.format.pdf.translation_config import TranslationConfig
+from babeldoc.translator.translator import AUTHOR_YEAR_CITATION
 from babeldoc.translator.translator import BaseTranslator, _is_pure_passthrough
 from babeldoc.utils.priority_thread_pool_executor import PriorityThreadPoolExecutor
 from arabic_reshaper import reshape
@@ -793,7 +794,17 @@ class ILTranslator:
             # When a flowing paragraph contains multiple sentences (e.g. > 150 chars),
             # translate sentence-by-sentence to prevent Seq2Seq models (NLLB/Marian)
             # from truncating sentences at the tail of long paragraphs.
-            sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', normalized_text) if s.strip()]
+            # Periods in an author–year reference do not end a sentence.
+            citations = [match.span() for match in AUTHOR_YEAR_CITATION.finditer(normalized_text)]
+            cuts = [match.span() for match in re.finditer(r"(?<=[.!?])\s+", normalized_text)
+                    if not any(start < match.start() < end for start, end in citations)]
+            sentences = []
+            start = 0
+            for left, right in cuts:
+                sentences.append(normalized_text[start:left].strip())
+                start = right
+            sentences.append(normalized_text[start:].strip())
+            sentences = [sentence for sentence in sentences if sentence]
             if len(sentences) > 1 and len(normalized_text) > 150:
                 translated_sentences = [
                     translate_segment(s)
@@ -998,6 +1009,11 @@ class ILTranslator:
         # records that were intentionally preserved above.
         text = re.sub(r'[^\S\r\n]{2,}', ' ', text).strip()
 
+        # Keep the entire Latin citation together during RTL line layout.
+        text = AUTHOR_YEAR_CITATION.sub(
+            lambda match: "\u200e" + "\u00a0".join(match[0].split()) + "\u200e",
+            text,
+        )
         return text
 
     def calc_token_count(self, text: str) -> int:
