@@ -3628,21 +3628,44 @@ class Typesetting:
                     # Keep native LTR character order matching original code, formula, or timeline
                     visual_units = line
                 elif line_str.strip():
-                    # Give each layout unit one BiDi position. Opaque units such as
-                    # formulas keep their own glyphs and internal reading order.
-                    bidi_text = "".join(
-                        text if len(text) == 1 else "\ufffc" for text in line_characters
-                    )
+                    # Give BiDi one position per visible text unit and one atomic
+                    # position per consecutive formula run. A technical expression
+                    # is commonly extracted as several one-character PdfFormula
+                    # objects (W, =, {, w1, ...). Reordering those objects separately
+                    # reverses the expression inside an Arabic line.
+                    bidi_atoms = []
+                    for unit, text in zip(line, line_characters):
+                        if unit.formular:
+                            if bidi_atoms and bidi_atoms[-1]["is_formula"]:
+                                bidi_atoms[-1]["units"].append(unit)
+                            else:
+                                bidi_atoms.append(
+                                    {"text": "\ufffc", "units": [unit], "is_formula": True}
+                                )
+                        else:
+                            bidi_atoms.append(
+                                {
+                                    "text": text if len(text) == 1 else "\ufffc",
+                                    "units": [unit],
+                                    "is_formula": False,
+                                }
+                            )
+
+                    bidi_text = "".join(atom["text"] for atom in bidi_atoms)
                     bidi_map = get_bidi_indices_and_chars(bidi_text, base_dir='R')
                     visual_units = []
                     visual_indices = []
                     for orig_idx, mirrored_char in bidi_map:
-                        if orig_idx < len(line):
-                            unit = copy.copy(line[orig_idx])
+                        if orig_idx >= len(bidi_atoms):
+                            continue
+                        atom = bidi_atoms[orig_idx]
+                        atom_units = [copy.copy(unit) for unit in atom["units"]]
+                        if not atom["is_formula"] and len(atom_units) == 1:
+                            unit = atom_units[0]
                             if mirrored_char and unit.unicode and unit.unicode != mirrored_char:
                                 unit.unicode = mirrored_char
-                            visual_units.append(unit)
-                            visual_indices.append(orig_idx)
+                        visual_units.extend(atom_units)
+                        visual_indices.extend([orig_idx] * len(atom_units))
 
                     # LRM-delimited formulas/codes are semantic LTR islands.
                     # Unicode BiDi correctly places the island in an Arabic
@@ -3664,9 +3687,14 @@ class Typesetting:
                         ]
                         if len(positions) > 1:
                             ordered = sorted(
-                                (visual_indices[pos], visual_units[pos]) for pos in positions
+                                (
+                                    visual_indices[pos],
+                                    sequence,
+                                    visual_units[pos],
+                                )
+                                for sequence, pos in enumerate(positions)
                             )
-                            for pos, (source_index, unit) in zip(positions, ordered):
+                            for pos, (source_index, _sequence, unit) in zip(positions, ordered):
                                 visual_indices[pos] = source_index
                                 visual_units[pos] = unit
                         start = right + 1

@@ -50,3 +50,37 @@ def test_vertical_character_keeps_visual_y_bounds():
     char.vertical = True
     finder = object.__new__(ParagraphFinder)
     assert finder._get_effective_y_bounds(char) == (2, 14)
+
+
+def test_row_split_keeps_subscript_and_superscript_with_their_own_rows():
+    def bounded_glyph(text, x, source_y, visual_y):
+        return PdfCharacter(
+            char_unicode=text,
+            box=Box(x, source_y[0], x + 5, source_y[1]),
+            visual_bbox=VisualBbox(box=Box(x, visual_y[0], x + 5, visual_y[1])),
+        )
+
+    # The font boxes of the two script glyphs overlap across the row gap.
+    # The ink of each glyph overlaps the ordinary text on its own row.
+    chars = [
+        bounded_glyph("A", 0, (15, 26), (15, 22)),
+        bounded_glyph("1", 5, (12, 18), (12, 17)),
+        bounded_glyph("B", 0, (0, 11), (0, 8)),
+        bounded_glyph("2", 5, (7, 13), (7, 10)),
+    ]
+    paragraph = PdfParagraph(
+        pdf_paragraph_composition=[PdfParagraphComposition(pdf_character=char) for char in chars]
+    )
+    finder = object.__new__(ParagraphFinder)
+    finder._split_paragraph_into_lines(paragraph, set())
+
+    assert [
+        "".join(char.char_unicode for char in composition.pdf_line.pdf_character)
+        for composition in paragraph.pdf_paragraph_composition
+    ] == ["A1", "B2"]
+
+
+def test_disjoint_visual_bounds_fall_back_to_source_bounds():
+    char = glyph("A", 0, 0, visual_shift=20)
+    finder = object.__new__(ParagraphFinder)
+    assert finder._get_effective_y_bounds(char) == (0, 12)

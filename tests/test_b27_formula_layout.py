@@ -59,3 +59,78 @@ def test_arabic_contact_line_keeps_phone_number_in_order(suffix):
     assert fits
     assert visual_text.count(number) == 1, f"Rendered left to right: {visual_text!r}"
     assert visual_text.count("\u0627") == 1 + suffix.count("\u0627"), visual_text
+
+
+def formula_unit(text):
+    characters = [source_character(character, index * 6) for index, character in enumerate(text)]
+    return TypesettingUnit(
+        formular=PdfFormula(
+            box=Box(x=0, y=0, x2=len(text) * 6, y2=12),
+            pdf_character=characters,
+            x_offset=0,
+            y_offset=0,
+            x_advance=len(text) * 6,
+        )
+    )
+
+
+def render_left_to_right(units):
+    typesetter = object.__new__(Typesetting)
+    typesetter.translation_config = SimpleNamespace(lang_out="ar")
+    typesetter.font_mapper = SimpleNamespace(
+        base_font=SimpleNamespace(char_lengths=lambda text, size: [6 for _ in text])
+    )
+    paragraph = PdfParagraph(
+        box=Box(x=0, y=0, x2=500, y2=80),
+        layout_label="plain text",
+    )
+    placed, fits = typesetter._layout_typesetting_units(
+        units,
+        paragraph.box,
+        scale=1.0,
+        line_skip=1.2,
+        paragraph=paragraph,
+    )
+    assert fits
+    characters = [character for unit in placed for character in unit.render()[0]]
+    return "".join(
+        character.char_unicode
+        for character in sorted(characters, key=lambda character: character.box.x)
+    )
+
+
+def test_adjacent_formula_objects_remain_one_ltr_expression():
+    units = [TypesettingUnit(char=source_character(character, 0)) for character in "\u064a\u062d\u0633\u0628 "]
+    units.extend(
+        formula_unit(text)
+        for text in ("W", "=", "{", "w1", ",", "w2", "}")
+    )
+    units.extend(
+        TypesettingUnit(char=source_character(character, 0))
+        for character in " \u0628\u0639\u062f \u0627\u0644\u062a\u062f\u0631\u064a\u0628"
+    )
+
+    assert "W={w1,w2}" in render_left_to_right(units)
+
+
+def test_multiple_inline_math_islands_keep_internal_order():
+    units = [
+        TypesettingUnit(char=source_character(character, 0))
+        for character in "\u0627\u0644\u0646\u0645\u0648\u0630\u062c "
+    ]
+    units.append(formula_unit("M"))
+    units.extend(
+        TypesettingUnit(char=source_character(character, 0))
+        for character in " \u064a\u062d\u062a\u0648\u064a \u0639\u0644\u0649 "
+    )
+    units.append(formula_unit("L"))
+    units.extend(
+        TypesettingUnit(char=source_character(character, 0))
+        for character in " \u0637\u0628\u0642\u0627\u062a "
+    )
+    units.extend(formula_unit(text) for text in ("{", "l1", ",", "l2", "}"))
+
+    rendered = render_left_to_right(units)
+    assert "{l1,l2}" in rendered
+    assert rendered.count("M") == 1
+    assert rendered.count("L") == 1
