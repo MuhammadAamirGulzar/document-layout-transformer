@@ -2,6 +2,7 @@ import logging
 import random
 import re
 import statistics
+from dataclasses import replace
 
 import numpy as np
 
@@ -10,10 +11,13 @@ from babeldoc.format.pdf.document_il import Box
 from babeldoc.format.pdf.document_il import Document
 from babeldoc.format.pdf.document_il import Page
 from babeldoc.format.pdf.document_il import PdfCharacter
+from babeldoc.format.pdf.document_il import PdfCurve
+from babeldoc.format.pdf.document_il import PdfFormula
 from babeldoc.format.pdf.document_il import PdfLine
 from babeldoc.format.pdf.document_il import PdfParagraph
 from babeldoc.format.pdf.document_il import PdfParagraphComposition
 from babeldoc.format.pdf.document_il import PdfRectangle
+from babeldoc.format.pdf.document_il import VisualBbox
 from babeldoc.format.pdf.document_il.utils.fontmap import FontMapper
 from babeldoc.format.pdf.document_il.utils.formular_helper import (
     collect_page_formula_font_ids,
@@ -472,10 +476,131 @@ class ParagraphFinder:
         # ç¬¬å…­æ­¥ï¼šå¯¹æ¯ä¸€è¡Œçš„å­—ç¬¦è¿›è¡ŒæŽ’åº
         # self._sort_characters_in_lines(page)
 
+        if (
+            (getattr(self.translation_config, "lang_out", "") or "").lower().rsplit("-", 1)[-1]
+            in {"ar", "ara", "arabic"}
+            and "AR" not in (self.translation_config.lang_in or "").upper()
+            and not self.translation_config.ocr_workaround
+        ):
+            self._attach_drawn_list_bullets(page)
         self.add_debug_info(page)
 
         # æ–°é˜¶æ®µï¼šè®¾ç½®æ®µè½çš„ renderorder ä¸ºæ‰€æœ‰ç»„æˆéƒ¨åˆ†ä¸­ renderorder æœ€å°çš„
         self._set_paragraph_render_order(page)
+
+    def _attach_drawn_list_bullets(self, page: Page) -> None:
+        """Give repeated vector bullets the same ownership as their list text."""
+        protected = [
+            region.box for region in page.page_layout or []
+            if region.box and any(
+                name in (region.class_name or "").lower()
+                for name in ("figure", "image", "chart", "table", "formula", "algorithm")
+            )
+        ]
+        dots = [
+            curve for curve in page.pdf_curve
+            if self._is_drawn_bullet(curve)
+            and not any(self.bbox_overlap(curve.box, region) for region in protected)
+        ]
+        if not dots:
+            return
+
+        groups = {}
+        for paragraph in page.pdf_paragraph:
+            if paragraph.vertical or (paragraph.layout_label or "").lower() not in {
+                "plain text", "text", "paragraph", "body_text", "fallback_line", "heading", "list_item",
+            }:
+                continue
+            for index, composition in enumerate(paragraph.pdf_paragraph_composition):
+                line = composition.pdf_line
+                if not line or not line.box:
+                    continue
+                first = next(
+                    (char for char in line.pdf_character if (char.char_unicode or "").strip()), None
+                )
+                if not first or not first.box or not first.pdf_style or is_bullet_point(first):
+                    continue
+                height = line.box.y2 - line.box.y
+                if height <= 0:
+                    continue
+                candidates = [
+                    dot for dot in dots
+                    if (dot.xobj_id or 0) == (paragraph.xobj_id or 0)
+                    and 1 <= line.box.x - dot.box.x2 <= 1.5 * height
+                    and 0.12 <= (dot.box.y2 - dot.box.y) / height <= 0.6
+                    and abs((dot.box.y + dot.box.y2) - (line.box.y + line.box.y2)) <= height * 0.6
+                ]
+                if len(candidates) == 1:
+                    dot = candidates[0]
+                    key = (dot.xobj_id or 0, round((dot.box.x + dot.box.x2) / 6))
+                    groups.setdefault(key, []).append((paragraph, index, dot, first))
+
+        matches = {}
+        for group in groups.values():
+            identities = {id(dot) for _, _, dot, _ in group}
+            # Isolated or ambiguous shapes stay in the source drawing.
+            if len(identities) >= 2 and len(identities) == len(group):
+                for paragraph, index, dot, first in group:
+                    matches.setdefault(id(paragraph), {})[index] = (dot, first)
+        if not matches:
+            return
+
+        paragraphs = []
+        moved_dots = set()
+        for paragraph in page.pdf_paragraph:
+            markers = matches.get(id(paragraph))
+            if not markers:
+                paragraphs.append(paragraph)
+                continue
+            compositions = paragraph.pdf_paragraph_composition
+            boundaries = sorted({0, len(compositions), *markers})
+            for start, end in zip(boundaries, boundaries[1:]):
+                item = replace(
+                    paragraph, pdf_paragraph_composition=compositions[start:end],
+                    debug_id=paragraph.debug_id if start == 0 else generate_base58_id(),
+                )
+                if start in markers:
+                    dot, first = markers[start]
+                    # Anchor the original drawing to the item's text baseline.
+                    box = Box(dot.box.x, first.box.y, dot.box.x2, first.box.y2)
+                    marker = PdfCharacter(
+                        char_unicode="\u2022", box=box, visual_bbox=VisualBbox(box=replace(box)),
+                        pdf_style=first.pdf_style, xobj_id=first.xobj_id,
+                        render_order=dot.render_order,
+                    )
+                    item.pdf_paragraph_composition.insert(0, PdfParagraphComposition(
+                        pdf_formula=PdfFormula(
+                            box=replace(box),
+                            pdf_character=[marker],
+                            pdf_curve=[dot],
+                            x_offset=0.0,
+                            y_offset=0.0,
+                            x_advance=box.x2 - box.x,
+                            line_id=0,
+                        ),
+                    ))
+                    item.layout_label = "list_item"
+                    moved_dots.add(id(dot))
+                self.update_paragraph_data(item, update_unicode=True)
+                paragraphs.append(item)
+
+        page.pdf_paragraph[:] = paragraphs
+        page.pdf_curve[:] = [dot for dot in page.pdf_curve if id(dot) not in moved_dots]
+
+    @staticmethod
+    def _is_drawn_bullet(curve: PdfCurve) -> bool:
+        box = curve.box
+        if not box or not curve.fill_background or curve.stroke_path:
+            return False
+        width, height = box.x2 - box.x, box.y2 - box.y
+        if not (1 <= height <= 8 and 0.75 * height <= width <= 1.33 * height):
+            return False
+        operators = [path.op for path in curve.pdf_path if path.op]
+        return (
+            len(operators) >= 6
+            and operators[0] == "m" and operators[-1] == "h"
+            and all(operator in {"c", "v", "y"} for operator in operators[1:-1])
+        )
 
     def _set_paragraph_render_order(self, page: Page):
         """

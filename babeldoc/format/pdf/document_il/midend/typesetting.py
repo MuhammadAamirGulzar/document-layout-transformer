@@ -199,6 +199,15 @@ class TypesettingUnit:
             return self.unicode
 
     @property
+    def is_drawn_list_bullet(self) -> bool:
+        return bool(
+            self.formular
+            and self.formular.pdf_curve
+            and len(self.formular.pdf_character) == 1
+            and self.formular.pdf_character[0].char_unicode == "\u2022"
+        )
+
+    @property
     def mixed_character_blacklist(self):
         if self.mixed_character_blacklist_cache is None:
             self.mixed_character_blacklist_cache = self.calc_mixed_character_blacklist()
@@ -1305,6 +1314,13 @@ class Typesetting:
         paragraph.pdf_paragraph_composition = []
         code_line_boxes: dict[int, list[Box]] = {}
         for unit in typeset_units:
+            if unit.is_drawn_list_bullet:
+                # The paragraph can still move during margin and collision
+                # handling. Keep the bullet curve owned by its text.
+                paragraph.pdf_paragraph_composition.append(
+                    PdfParagraphComposition(pdf_formula=unit.formular)
+                )
+                continue
             if getattr(unit, "presentation_role", None) == "procedure_code" and unit.box:
                 code_line_boxes.setdefault(getattr(unit, "line_id", -1), []).append(unit.box)
             chars, curves, forms = unit.render()
@@ -2084,6 +2100,18 @@ class Typesetting:
         )
 
     @staticmethod
+    def _translate_rendered_curve(curve: PdfCurve, dx: float = 0.0, dy: float = 0.0) -> None:
+        if curve.box:
+            curve.box.x += dx
+            curve.box.x2 += dx
+            curve.box.y += dy
+            curve.box.y2 += dy
+        transform = list(curve.relocation_transform or [1, 0, 0, 1, 0, 0])
+        transform[4] += dx
+        transform[5] += dy
+        curve.relocation_transform = transform
+
+    @staticmethod
     def _shift_rendered_paragraph_vertically(
         paragraph: il_version_1.PdfParagraph, shift: float
     ) -> None:
@@ -2102,12 +2130,13 @@ class Typesetting:
                     shift_box(char.visual_bbox.box)
             elif composition.pdf_formula:
                 formula = composition.pdf_formula
+                shift_box(formula.box)
                 for char in formula.pdf_character or []:
                     shift_box(char.box)
                     if char.visual_bbox:
                         shift_box(char.visual_bbox.box)
                 for curve in formula.pdf_curve or []:
-                    shift_box(curve.box)
+                    Typesetting._translate_rendered_curve(curve, dy=-shift)
 
     def _resolve_rendered_text_collisions(self, page: il_version_1.Page) -> None:
         """Final export firewall for collisions caused by glyphs escaping source boxes.
@@ -2779,9 +2808,7 @@ class Typesetting:
                         char.visual_bbox.box.x += effective_shift
                         char.visual_bbox.box.x2 += effective_shift
                 for curve in formula.pdf_curve:
-                    if curve.box:
-                        curve.box.x += effective_shift
-                        curve.box.x2 += effective_shift
+                    self._translate_rendered_curve(curve, dx=effective_shift)
                 for form in formula.pdf_form:
                     if form.box:
                         form.box.x += effective_shift
@@ -3476,7 +3503,7 @@ class Typesetting:
                 if u.is_space:
                     tokens.append([u])
                     idx += 1
-                elif BULLET_POINT_PATTERN.match(u_str) or (u_str and 0xE000 <= ord(u_str[0]) <= 0xF8FF):
+                elif u.is_drawn_list_bullet or BULLET_POINT_PATTERN.match(u_str) or (u_str and 0xE000 <= ord(u_str[0]) <= 0xF8FF):
                     # Standalone bullet token: never glue bullet to following word
                     tokens.append([u])
                     idx += 1
@@ -3602,6 +3629,14 @@ class Typesetting:
                 if not line:
                     continue
 
+                # A list marker belongs at the RTL margin even when the
+                # translated item consists entirely of Latin text.
+                bullet_prefix = []
+                if line_idx == 0 and line[0].is_drawn_list_bullet:
+                    prefix_length = 2 if len(line) > 1 and line[1].is_space else 1
+                    bullet_prefix = line[:prefix_length]
+                    line = line[prefix_length:]
+
                 line_characters = [unit.try_get_unicode() or "" for unit in line]
                 line_str = "".join(line_characters)
                 
@@ -3723,6 +3758,9 @@ class Typesetting:
                         start = right + 1
                 else:
                     visual_units = line
+
+                if bullet_prefix:
+                    visual_units = [*visual_units, *reversed(bullet_prefix)]
 
                 # Calculate total line width
                 visual_line_w = sum(u.width * scale for u in visual_units)
