@@ -1758,6 +1758,8 @@ class Typesetting:
                     if para_id == i:
                         continue
                     p_lower = para_map[para_id]
+                    if not self._shares_reflow_layer(p_upper, p_lower):
+                        continue
                     if not (
                         p_lower.box.x2 < p_upper.box.x
                         or p_lower.box.x > p_upper.box.x2
@@ -1798,6 +1800,10 @@ class Typesetting:
         self._resolve_rendered_text_collisions(page)
         for paragraph, rules in header_rules:
             self._align_header_underlines(paragraph, rules, page.cropbox.box)
+
+    def _shares_reflow_layer(self, first, second) -> bool:
+        """Arabic reflow keeps independently painted PDF objects in their own lanes."""
+        return not self.is_arabic or max(first.xobj_id or 0, 0) == max(second.xobj_id or 0, 0)
 
     @staticmethod
     def _is_fixed_table_paragraph(paragraph: il_version_1.PdfParagraph) -> bool:
@@ -2018,7 +2024,7 @@ class Typesetting:
             if not self._is_fixed_table_paragraph(paragraph):
                 required_shift = 0.0
                 for blocker in occupied:
-                    if not blocker.box:
+                    if not blocker.box or not self._shares_reflow_layer(paragraph, blocker):
                         continue
                     horizontal_overlap = max(
                         0.0,
@@ -2137,6 +2143,8 @@ class Typesetting:
                 if first_box is None:
                     continue
                 for second in paragraphs[index + 1:]:
+                    if not self._shares_reflow_layer(first, second):
+                        continue
                     second_box = rendered[id(second)]
                     if second_box is None:
                         continue
@@ -2533,7 +2541,7 @@ class Typesetting:
         if self._is_header_or_footer(paragraph, page):
             orig_right_margin = page_box.x2 - box.x2
             new_x = page_box.x + orig_right_margin
-            return new_x - box.x
+            return self._keep_clear_of_later_images(paragraph, page, new_x - box.x)
 
         # Detect content area boundaries (accounting for sidebars/decorations)
         content_left, content_right = self._get_content_area_bounds(page)
@@ -2565,6 +2573,26 @@ class Typesetting:
             underflow = content_left - new_x_clamped
             shift_x += underflow
         
+        return self._keep_clear_of_later_images(paragraph, page, shift_x)
+
+    def _keep_clear_of_later_images(self, paragraph, page, shift_x: float) -> float:
+        """Keep a source lane when mirroring would hide visible text behind an image."""
+        if not shift_x or paragraph.render_order is None or not self._is_arabic_output():
+            return shift_x
+        box = self._rendered_text_box(paragraph) or paragraph.box
+        for form in page.pdf_form:
+            image = form.box
+            if (
+                form.form_type != "image" or not image
+                or form.xobj_id != paragraph.xobj_id or form.render_order is None
+                or form.render_order <= paragraph.render_order
+                or box.y >= image.y2 or box.y2 <= image.y
+            ):
+                continue
+            source_overlaps = box.x < image.x2 and box.x2 > image.x
+            shifted_overlaps = box.x + shift_x < image.x2 and box.x2 + shift_x > image.x
+            if shifted_overlaps and not source_overlaps:
+                return 0.0
         return shift_x
 
     def _get_content_area_bounds(self, page: il_version_1.Page) -> tuple[float, float]:
@@ -2836,7 +2864,9 @@ class Typesetting:
         
         return False
 
-    def _is_inside_table_or_figure_region(self, para_box: Box, page: il_version_1.Page) -> bool:
+    def _is_inside_table_or_figure_region(
+        self, para_box: Box, page: il_version_1.Page, *, figures_only: bool = False,
+    ) -> bool:
         """Check if a paragraph box is geometrically inside a table or figure region.
         
         Args:
@@ -2850,6 +2880,10 @@ class Typesetting:
         if not hasattr(page, 'page_layout') or not page.page_layout:
             return False
         
+        container_labels = {"figure", "chart", "graph", "diagram", "image"}
+        if not figures_only:
+            container_labels.update(("table", "wired_table", "wireless_table"))
+
         for layout in page.page_layout:
             if not layout.box:
                 continue
@@ -2857,13 +2891,7 @@ class Typesetting:
             # Check if this is a table or figure layout
             layout_name = (layout.class_name or "").lower()
             
-            # Table and figure structure layouts
-            is_container_layout = layout_name in [
-                'table', 'wired_table', 'wireless_table',
-                'figure', 'chart', 'graph', 'diagram', 'image'
-            ]
-            
-            if not is_container_layout:
+            if layout_name not in container_labels:
                 continue
             
             # Check if paragraph is contained within this layout
@@ -2890,11 +2918,11 @@ class Typesetting:
 
     def _is_table_cell(self, paragraph: il_version_1.PdfParagraph, page: il_version_1.Page) -> bool:
         """Check if paragraph is a table cell within a grid table."""
-        if paragraph.layout_label:
-            lbl = paragraph.layout_label.lower()
-            if any(marker in lbl for marker in ['table_cell', 'table_text', 'wired_table_cell', 'wireless_table_cell', 'fallback_line']):
-                if not any(marker in lbl for marker in ['table_caption', 'table_title', 'table_footnote']):
-                    return True
+        label = (paragraph.layout_label or "").lower()
+        is_table_text = any(marker in label for marker in ("table_cell", "table_text"))
+        is_caption = any(marker in label for marker in ("table_caption", "table_title", "table_footnote"))
+        if is_table_text and not is_caption:
+            return True
         # Check if inside a table layout region
         if paragraph.box and hasattr(page, 'page_layout') and page.page_layout:
             for layout in page.page_layout:
@@ -2908,7 +2936,11 @@ class Typesetting:
                         overlap_area = (overlap_x2 - overlap_x1) * (overlap_y2 - overlap_y1)
                         if para_area > 0 and (overlap_area / para_area) > 0.5:
                             return True
-        return False
+        # Fallback text inside a figure belongs to that drawing's coordinates.
+        return (
+            "fallback_line" in label and not is_caption and paragraph.box is not None
+            and not self._is_inside_table_or_figure_region(paragraph.box, page, figures_only=True)
+        )
 
     def _cluster_table_cells_into_rows(self, page: il_version_1.Page) -> list[list[il_version_1.PdfParagraph]]:
         """Cluster table cell paragraphs on a page into rows based on vertical overlap."""
