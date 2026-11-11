@@ -134,3 +134,17 @@ def test_multiple_inline_math_islands_keep_internal_order():
     assert "{l1,l2}" in rendered
     assert rendered.count("M") == 1
     assert rendered.count("L") == 1
+
+
+@pytest.mark.parametrize("base, subscript", [("x", "k"), ("r", "2")])
+def test_formula_subscript_stays_after_its_plain_text_base(base, subscript):
+    def text_units(text):
+        return [TypesettingUnit(char=source_character(character, 0)) for character in text]
+
+    units = text_units("\u0627\u0644\u0645\u062a\u063a\u064a\u0631 " + base)
+    units.append(formula_unit(subscript))
+    units.extend(text_units(" \u0641\u064a \u0627\u0644\u0646\u0645\u0648\u0630\u062c"))
+
+    rendered = render_left_to_right(units)
+    assert base + subscript in rendered
+    assert subscript + base not in rendered

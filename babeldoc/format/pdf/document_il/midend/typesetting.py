@@ -3651,6 +3651,28 @@ class Typesetting:
                                 }
                             )
 
+                    # A formula can contain just the subscript of an identifier
+                    # whose base is a separate text unit. A neutral object in
+                    # that position can move ahead of the base in an RTL line.
+                    for index, atom in enumerate(bidi_atoms):
+                        if not atom["is_formula"]:
+                            continue
+                        neighbors = bidi_atoms[max(0, index - 1):index] + bidi_atoms[index + 1:index + 2]
+                        if not any(
+                            not item["is_formula"]
+                            and unicodedata.bidirectional(item["text"]) in {"L", "EN"}
+                            for item in neighbors
+                        ):
+                            continue
+                        directions = {
+                            unicodedata.bidirectional(glyph)
+                            for unit in atom["units"]
+                            for char in unit.formular.pdf_character
+                            for glyph in char.char_unicode or ""
+                        }
+                        if directions & {"L", "EN"} and not directions & {"R", "AL", "AN"}:
+                            atom["text"] = "L"
+
                     bidi_text = "".join(atom["text"] for atom in bidi_atoms)
                     bidi_map = get_bidi_indices_and_chars(bidi_text, base_dir='R')
                     visual_units = []
