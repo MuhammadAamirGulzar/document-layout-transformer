@@ -1348,12 +1348,26 @@ class ILTranslator:
         patterns = []
         placeholder_patterns = []
         placeholder_map = {}
+        missing_formulas = []
 
         for placeholder in input_text.placeholders:
             if isinstance(placeholder, FormulaPlaceholder):
                 # è½¬ä¹‰ç‰¹æ®Šå­—ç¬¦
                 # pattern = re.escape(placeholder.placeholder)
                 pattern = placeholder.regex_pattern
+                if not re.search(pattern, output, flags=re.IGNORECASE):
+                    tag = re.fullmatch(r"<b([0-9]+)>", placeholder.placeholder)
+                    if tag:
+                        # Local models can transliterate the tag's b as Arabic beh.
+                        # Match only this expected ID, including shaped forms of beh.
+                        alias = rf"<\s*[\u0628\ufe8f-\ufe92]\s*{tag[1]}\s*>"
+                        if (
+                            not re.search(alias, input_text.unicode)
+                            and len(re.findall(alias, output)) == 1
+                        ):
+                            output = re.sub(alias, placeholder.placeholder, output, count=1)
+                    if not re.search(pattern, output, flags=re.IGNORECASE):
+                        missing_formulas.append(placeholder.placeholder)
                 patterns.append(f"({pattern})")
                 placeholder_patterns.append(f"({pattern})")
                 placeholder_map[placeholder.placeholder] = placeholder
@@ -1364,6 +1378,11 @@ class ILTranslator:
                 placeholder_patterns.append(f"({left})")
                 placeholder_patterns.append(f"({right})")
                 placeholder_map[placeholder.left_placeholder] = placeholder
+        if missing_formulas:
+            logger.warning(
+                "Missing PDF formula placeholders after translation: %s",
+                ", ".join(missing_formulas),
+            )
         all_match = True
         for pattern in patterns:
             if not re.search(pattern, output, flags=re.IGNORECASE):
