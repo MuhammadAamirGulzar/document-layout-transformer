@@ -45,9 +45,11 @@ def remove_control_characters(s):
 #
 # Pattern priority (highest-specificity first to avoid partial matches):
 _NUMERAL_PATTERN = re.compile(
-    # 1. Parenthetical mixed tokens: (2018=100), (QCBRR), (NDS3), (QR-mn), (281211210/97 =62)
-    # Length notes contain prose; shield the number below, leaving the words visible.
-    r'(\((?!\s*\d+\s+(?i:characters?\s+for)\b)[^)]*\d[^)]*\))|'
+    # 1. Parenthetical mixed tokens: (2018=100), (NDS3), (281211210/97 =62), (Chart 7-1)
+    # Exclude prose parentheticals with lowercase words such as (First 4 character of BIC),
+    # (e.g. QA00 for QATAR), or (29 characters for QATAR) so their text is translated while
+    # inner numbers and codes remain shielded by rules 2-14.
+    r'(\(\s*(?:(?:Chart|Table|Fig(?:ure)?)\s+)?[A-Z0-9\s,.\-+±×÷=/%$€£¥٪\u2013\u2014:;_]*\d[A-Z0-9\s,.\-+±×÷=/%$€£¥٪\u2013\u2014:;_]*\))|'
     # 2. Arithmetic division / equations: 281211210/97 = 62, 502560126/97 = 22, 221000/97= 34
     r'(\b\d+\s*[/÷]\s*\d+\s*(?:=\s*\d+)?\b)|'
     # 3. Arithmetic operations with equals: 98-34=64, 2018=100

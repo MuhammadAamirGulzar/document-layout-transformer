@@ -431,6 +431,7 @@ class ParagraphFinder:
                             key=self._get_char_sort_key
                         )
                         self.update_line_data(composition.pdf_line)
+                self._deduplicate_artificial_header_characters(paragraph, page)
 
         for paragraph in paragraphs:
             fixed_table_box = (
@@ -1370,10 +1371,16 @@ class ParagraphFinder:
         return lines
 
     def _get_effective_y_bounds(self, char: PdfCharacter) -> tuple[float, float]:
-        """Use source text boxes to find rows in horizontal text."""
-        # Font-specific visual offsets can make distinct source rows overlap.
-        # Keep the visual boxes for positioning the glyphs after line splitting.
+        """Use the overlap of source and visible glyph bounds to find rows."""
         if not char.vertical and char.box is not None and char.box.y2 > char.box.y:
+            # Font boxes can fill a row gap that the visible ink leaves open.
+            # Clipping to the source box also keeps shifted ink out of adjacent rows.
+            visual_box = char.visual_bbox.box if char.visual_bbox else None
+            if visual_box is not None:
+                lower = max(char.box.y, visual_box.y)
+                upper = min(char.box.y2, visual_box.y2)
+                if upper > lower:
+                    return lower, upper
             return char.box.y, char.box.y2
 
         visual_box = char.visual_bbox.box
@@ -2428,10 +2435,42 @@ class ParagraphFinder:
                 ):
                     continue
                 candidate.unicode = f"{lead_text} {candidate_text}"
-                candidate.pdf_paragraph_composition = (
-                    list(lead.pdf_paragraph_composition or [])
-                    + list(candidate.pdf_paragraph_composition or [])
-                )
+                lead_comps = list(lead.pdf_paragraph_composition or [])
+                cand_comps = list(candidate.pdf_paragraph_composition or [])
+                if lead_comps and cand_comps:
+                    from babeldoc.format.pdf.document_il.il_version_1 import VisualBbox
+
+                    source_chars = (
+                        ParagraphFinder._paragraph_source_characters(lead)
+                        + ParagraphFinder._paragraph_source_characters(candidate)
+                    )
+                    space_style = next(
+                        (char.pdf_style for char in source_chars if char.pdf_style),
+                        lead.pdf_style or candidate.pdf_style,
+                    )
+                    space_x = lead.box.x2
+                    space_width = max(1.5, min(4.0, max(horizontal_gap, 1.5)))
+                    space_box = Box(
+                        space_x,
+                        lead.box.y,
+                        space_x + space_width,
+                        lead.box.y2,
+                    )
+                    space_comp = PdfParagraphComposition(
+                        pdf_character=PdfCharacter(
+                            char_unicode=" ",
+                            box=space_box,
+                            visual_bbox=VisualBbox(box=space_box),
+                            vertical=False,
+                            xobj_id=lead.xobj_id,
+                            pdf_style=space_style,
+                        )
+                    )
+                    candidate.pdf_paragraph_composition = (
+                        lead_comps + [space_comp] + cand_comps
+                    )
+                else:
+                    candidate.pdf_paragraph_composition = lead_comps + cand_comps
                 candidate.box = Box(
                     min(lead.box.x, candidate.box.x),
                     min(lead.box.y, candidate.box.y),
@@ -2443,6 +2482,91 @@ class ParagraphFinder:
                 break
             if not merged:
                 index += 1
+
+    def _deduplicate_artificial_header_characters(
+        self, paragraph: PdfParagraph, page: Page
+    ) -> None:
+        """Collapse doubled running-header glyph streams before translation."""
+        if not paragraph.pdf_paragraph_composition:
+            return
+        label = (paragraph.layout_label or "").lower()
+        is_header_band = label in {"header", "footer", "page_header", "page_footer", "abandon"}
+        if not is_header_band and paragraph.box and page and page.cropbox and page.cropbox.box:
+            page_box = page.cropbox.box
+            page_h = max(1.0, page_box.y2 - page_box.y)
+            if (
+                paragraph.box.y >= page_box.y2 - page_h * 0.12
+                or paragraph.box.y2 <= page_box.y + page_h * 0.10
+            ):
+                is_header_band = True
+
+        for composition in paragraph.pdf_paragraph_composition:
+            line = composition.pdf_line
+            if not line or not line.pdf_character or len(line.pdf_character) < 6:
+                continue
+            raw_text = "".join(c.char_unicode or "" for c in line.pdf_character)
+            compact_probe = re.sub(r"([A-Za-z])\1", r"\1", raw_text)
+            looks_like_iban_banner = bool(
+                re.search(r"IBAN\s*Standards|IBAN.*Ver", compact_probe, re.I)
+            )
+            if not is_header_band and not looks_like_iban_banner:
+                continue
+
+            chars = list(line.pdf_character)
+            if looks_like_iban_banner:
+                collapsed: list[PdfCharacter] = []
+                for ch in chars:
+                    val = ch.char_unicode or ""
+                    if (
+                        collapsed
+                        and val
+                        and val == (collapsed[-1].char_unicode or "")
+                        and not val.isalpha()
+                    ):
+                        continue
+                    collapsed.append(ch)
+                chars = collapsed
+
+            latin_count = sum(
+                (c.char_unicode or "").isascii() and (c.char_unicode or "").isalpha()
+                for c in chars
+            )
+            if not latin_count:
+                continue
+            paired = 0
+            idx = 0
+            while idx < len(chars):
+                end = idx + 1
+                ch_val = chars[idx].char_unicode or ""
+                while end < len(chars) and (chars[end].char_unicode or "") == ch_val:
+                    end += 1
+                run_len = end - idx
+                if ch_val.isascii() and ch_val.isalpha() and run_len >= 2 and run_len % 2 == 0:
+                    paired += run_len
+                idx = end
+            if paired / latin_count < 0.70 and not looks_like_iban_banner:
+                continue
+
+            deduped: list[PdfCharacter] = []
+            idx = 0
+            while idx < len(chars):
+                ch_val = chars[idx].char_unicode or ""
+                if not (ch_val.isascii() and ch_val.isalpha()):
+                    deduped.append(chars[idx])
+                    idx += 1
+                    continue
+                end = idx + 1
+                while end < len(chars) and (chars[end].char_unicode or "") == ch_val:
+                    end += 1
+                run_len = end - idx
+                if run_len >= 2 and run_len % 2 == 0:
+                    deduped.extend(chars[idx:end:2])
+                else:
+                    deduped.extend(chars[idx:end])
+                idx = end
+            if len(deduped) != len(line.pdf_character):
+                line.pdf_character = deduped
+                self.update_line_data(line)
 
     def _sort_characters_in_lines(self, page: Page):
         """Sort characters in each line from left to right, top to bottom."""

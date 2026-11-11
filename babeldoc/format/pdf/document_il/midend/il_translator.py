@@ -388,9 +388,128 @@ class ILTranslator:
         if not text:
             return text
 
+        # Collapse doubled running-header banner glyphs before translation so
+        # NLLB never receives raw doubled character streams ("IIBBAANN...").
+        text = re.sub(
+            r'I+B+A+N+\s+S+t+a+n+d+a+r+d+s+\s+V+e+r+\.+\s*2+\.+\s*0+\s*[-–—]+\s*Q+A+T+A+R+',
+            'IBAN Standards Ver. 2.0 - QATAR',
+            text,
+            flags=re.I,
+        )
+
+        # Repair common PDF extraction word-fusion artefacts before translation.
+        text = re.sub(r'\bAllbanks\b', 'All banks', text, flags=re.I)
+        text = re.sub(r'\blotof\b', 'lot of', text, flags=re.I)
+        text = re.sub(r'\bindeep\b', 'in deep', text, flags=re.I)
+
+        # Strip English ordinal suffixes on calendar dates before month names
+        # ("as of 23rd June 2013" -> "as of 23 June 2013") so numeric shielding
+        # protects the plain day number without failing on untranslated "rd"/"th".
+        text = re.sub(
+            r'\b(\d{1,2})(?:st|nd|rd|th)(?:\s*<b\d+>)?\s+(?=(?:of\s+)?(?:January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)\b)',
+            r'\1 ',
+            text,
+            flags=re.I,
+        )
+
         # An ALL-CAPS phrase of ordinary words reads better to the model in sentence case.
         from babeldoc.translator.translator import _caps_phrase_to_sentence_case
         text = _caps_phrase_to_sentence_case(text)
+
+        # Standalone month + year cover/header dates (e.g. "JULY 2013" -> "يوليو 2013")
+        _months_ar = {
+            "january": "يناير", "february": "فبراير", "march": "مارس",
+            "april": "أبريل", "may": "مايو", "june": "يونيو",
+            "july": "يوليو", "august": "أغسطس", "september": "سبتمبر",
+            "october": "أكتوبر", "november": "نوفمبر", "december": "ديسمبر",
+        }
+        m_date = re.fullmatch(
+            r'\s*(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{4})\s*',
+            text,
+            flags=re.I,
+        )
+        if m_date:
+            return f"{_months_ar[m_date.group(1).lower()]} {m_date.group(2)}"
+
+        # Standardized QCB / IBAN technical headings & locked phrases
+        text = re.sub(
+            r'\bIBAN\s+Standards\s+Ver\.?\s*2\.?\s*0\s*[-–—]\s*QATAR\b',
+            'معايير IBAN الإصدار 2.0 - قطر',
+            text,
+            flags=re.I,
+        )
+        text = re.sub(r'\bQatar\s+Central\s+Bank\b', 'مصرف قطر المركزي', text, flags=re.I)
+        text = re.sub(
+            r'\bQatar\s+Automated\s+Clearing\s+House\b',
+            'غرفة المقاصة الآلية القطرية',
+            text,
+            flags=re.I,
+        )
+        text = re.sub(
+            r'\bCheck\s+Digit\s+Generation\s+and\s+Validation\b',
+            'توليد رقم التحقق والتحقق من صحته',
+            text,
+            flags=re.I,
+        )
+        text = re.sub(
+            r'\bCheck\s+Digit\s+Validation\b',
+            'التحقق من صحة رقم التحقق',
+            text,
+            flags=re.I,
+        )
+        text = re.sub(
+            r'\bCheck\s+Digit\s+Generation\b',
+            'توليد رقم التحقق',
+            text,
+            flags=re.I,
+        )
+        text = re.sub(
+            r'\bGeneration\s+of\s+IBAN\b',
+            'إنشاء رقم IBAN',
+            text,
+            flags=re.I,
+        )
+        text = re.sub(
+            r'\bSwift\s+Code\s+and\s+Identifier\b',
+            'رمز سويفت (SWIFT) ومعرّف البنك',
+            text,
+            flags=re.I,
+        )
+        text = re.sub(
+            r'\(\s*First\s+4\s+characters?\s+of\s+BIC\s*\)',
+            '(أول 4 أحرف من رمز BIC)',
+            text,
+            flags=re.I,
+        )
+        text = re.sub(
+            r'\(\s*e\.?g\.?\s+QA00\s+for\s+QATAR\s*\)',
+            '(مثل QA00 لدولة قطر)',
+            text,
+            flags=re.I,
+        )
+        text = re.sub(
+            r'\(\s*29\s+characters?\s+for\s+QATAR\s*\)',
+            '(29 حرفاً لدولة قطر)',
+            text,
+            flags=re.I,
+        )
+        text = re.sub(
+            r'\bStraight\s+Through\s+Processing\b',
+            'المعالجة المباشرة دون تدخل يدوي',
+            text,
+            flags=re.I,
+        )
+        text = re.sub(r'\bActing\s+Director\b', 'مدير بالإنابة', text, flags=re.I)
+        text = re.sub(r'\bPictorial\s+Flow\b', 'المخطط التوضيحي للتدفق', text, flags=re.I)
+        text = re.sub(r'\bUpdate\s+History\b', 'سجل التحديثات', text, flags=re.I)
+        text = re.sub(r'\bPresentation\s+Format\b', 'صيغة العرض', text, flags=re.I)
+        text = re.sub(r'\bInternational\s+Envelope\b', 'الغلاف الدولي', text, flags=re.I)
+        text = re.sub(r'\bFirst\s+Edition\b', 'الطبعة الأولى', text, flags=re.I)
+        text = re.sub(r'^\s*(\d+(?:\.\d+)*\.?\s+)Validation\s*$', r'\1التحقق من الصحة', text, flags=re.I)
+        if re.fullmatch(r'\s*Validation\s*', text, flags=re.I):
+            return 'التحقق من الصحة'
+        if re.fullmatch(r'\s*Edition\s*', text, flags=re.I):
+            return 'الطبعة'
 
         # Financial rates and central banking terms
         text = re.sub(r'\b(?:The\s+)?QMR\s+Lending\s+Rate\b', 'سعر فائدة الإقراض في سوق قطر النقدي', text, flags=re.I)
@@ -540,6 +659,11 @@ class ILTranslator:
         text = self._pre_translate_terminology(text)
 
         def translate_segment(segment: str) -> str:
+            contact_fn = getattr(self, "_translate_contact_field_directly", None)
+            if contact_fn is not None:
+                direct_contact = contact_fn(segment)
+                if direct_contact is not None:
+                    return direct_contact
             # List and section numbering is document structure.
             marker = re.match(r"^[ \t]*\d{1,3}(?:\.\d{1,3})*\.(?:[ \t]+|$)", segment)
             prefix = marker.group() if marker else ""
@@ -725,10 +849,45 @@ class ILTranslator:
         text = re.sub(r'(\d+(?:[,.]\d+)?)\s*QR\b', r'\1 ريال قطري', text)
         text = re.sub(r'\bمليارات\s+الدولارات\b', 'مليارات الريالات القطرية', text)
 
-        # 7. Financial unit mistranslations cleanup
+        # 7. Financial & QCB IBAN technical mistranslations cleanup
         text = re.sub(r'\bبيليومتر\b', 'برميل', text)
         text = re.sub(r'\bنقاط\s+(?:أوروبية|أرضية|أوراق)\b', 'نقطة أساس', text)
         text = re.sub(r'\bإعادة\s+التأمين\b', 'سعر الريبو', text)
+        text = re.sub(r'\bالبنك\s+المركزي\s+القطري\b', 'مصرف قطر المركزي', text)
+        text = re.sub(r'\bمركز\s+تصفية\s+قطر\s+الآلي\b', 'غرفة المقاصة الآلية القطرية', text)
+        text = re.sub(r'\bتطهير(ها|ه)\s+من\s+خلال\s+QATCH\b', r'مقاصت\1 عبر QATCH', text)
+        text = re.sub(r'\bالتحقق\s+من\s+تصحيح\s+الأرقام\b', 'التحقق من صحة رقم التحقق', text)
+        text = re.sub(r'\bالتحقق\s+من\s+الرقم\s+المالي\b', 'التحقق من صحة رقم التحقق', text)
+        text = re.sub(r'\bتوليد\s+الرقم\s+المالي\b', 'توليد رقم التحقق', text)
+        text = re.sub(r'(?<![\u0621-\u064A])([وبلكف]?)رقمي\s+الشيك\b', r'\1رقمي التحقق', text)
+        text = re.sub(r'(?<![\u0621-\u064A])([وبلكف]?)رقما\s+الشيك\b', r'\1رقما التحقق', text)
+        text = re.sub(r'(?<![\u0621-\u064A])([وبلكف]?)أرقام\s+الشيك(?:ات)?\b', r'\1أرقام التحقق', text)
+        text = re.sub(r'(?<![\u0621-\u064A])([وبلكف]?)رقم\s+الشيك\b', r'\1رقم التحقق', text)
+        text = re.sub(r'\bجيل\s+IBAN\b', 'إنشاء رقم IBAN', text)
+        text = re.sub(r'\bالرمز\s+السريع\s+وتعريف\s+سريع\b', 'رمز سويفت (SWIFT) ومعرّف البنك', text)
+        text = re.sub(r'\bالرمز\s+السريع\b', 'رمز سويفت (SWIFT)', text)
+        text = re.sub(r'\bتعريف\s+سريع\b', 'معرّف البنك', text)
+        text = re.sub(r'\bالتحقق\s+من\s+المصادقة\b', 'التحقق من الصحة', text)
+        text = re.sub(r'\b(?:استبعاد|استبعد|طرح)\s+الباقي\s+من\s+(\d+)\b', r'اطرح الباقي من \1', text)
+        text = re.sub(r'\b(?:الصفر|الأصفار)\s+الرائدة\b', 'الأصفار البادئة', text)
+        text = re.sub(r'\bالصفحة\s+اليسرى\s+مع\s+الصفر\b', 'تُملأ من اليسار بأصفار', text)
+        text = re.sub(r'\bرقم\s+متكامل\s+موقع\b', 'عدد صحيح ذو إشارة', text)
+        text = re.sub(r'\bالطلب\s+المصرفي\s+الرئيسي\b', 'النظام المصرفي الأساسي', text)
+        text = re.sub(r'\bرقم\s+الحساب\s+المصري\b', 'رقم الحساب المصرفي', text)
+        text = re.sub(r'\bحرف[اً]*\s+ألف[اً]*\s+للأرقام\b', 'حرفاً من الحروف والأرقام', text)
+        text = re.sub(r'\b(\d+\s+أو\s+\d+)\s+الأوراق\b', r'\1 رقماً', text)
+        text = re.sub(r'\bمسؤولية\s+البنك\s+الوحيد\b', 'المسؤولية الحصرية للبنك', text)
+        text = re.sub(r'\bمباشرة\s+من\s+خلال\s+المعالجة\b', 'المعالجة المباشرة دون تدخل يدوي', text)
+        text = re.sub(r'\bنائب\s+مدير\b', 'مدير بالإنابة', text)
+        text = re.sub(r'\bالتدفق\s+الرسمي\b', 'المخطط التوضيحي للتدفق', text)
+        text = re.sub(r'\bتحديث\s+التاريخ\b', 'سجل التحديثات', text)
+        text = re.sub(r'\bنموذج\s+العرض\b', 'صيغة العرض', text)
+        text = re.sub(r'\bالملف\s+الدولي\b', 'الغلاف الدولي', text)
+
+        # Strip leaked English ordinal suffixes ("5th - 29th" -> "5 - 29") when
+        # surrounded by Arabic prose so RTL layout does not detach "th"/"rd".
+        if re.search(r'[\u0600-\u06FF]', text):
+            text = re.sub(r'\b(\d+)(?:st|nd|rd|th)\b', r'\1', text, flags=re.I)
 
         # 8. Structural reference preservation (Chart / Chapter / Table)
         text = re.sub(r'\b(?:الشريط|شريط)\s+(\d+[-–—]\d+)', r'المخطط \1', text)
@@ -756,12 +915,12 @@ class ILTranslator:
             r'\bAll(?=(?:[\s\u200e\u200f])+' + ar_letters + r')',
             'جميع', text, flags=re.IGNORECASE,
         )
-        # Isolate banking formulas and code chains as LTR runs inside Arabic.
-        # This protects the visual order of "MOD 97", division signs and
+        # Isolate banking formulas, slash dates, and code chains as LTR runs inside Arabic.
+        # This protects the visual order of "MOD 97", "14/8/2013", division signs and
         # equals signs without translating or reordering their operands.
         ltr_formula = re.compile(
             r'(?<![A-Za-z0-9])(?:[A-Z]{2}\d{2}[A-Z0-9]{11,30}|[A-Z]{2}\d{2}|'
-            r'[A-Z0-9]{12,35}|(?:\d+\s*[/÷+*×]\s*\d+|\d{2,}\s*-\s*\d+)(?:\s*=\s*\d+)?|'
+            r'[A-Z0-9]{12,35}|(?:\d+\s*[/÷+*×]\s*\d+(?:\s*[/÷+*×]\s*\d+)*|\d{2,}\s*-\s*\d+)(?:\s*=\s*\d+)?|'
             r'MOD\s*\d+(?:-\d+)?)(?![A-Za-z0-9])'
         )
         text = ltr_formula.sub(lambda match: f"\u200E{match.group(0)}\u200E", text)
@@ -1389,21 +1548,26 @@ class ILTranslator:
 
     def _translate_contact_field_directly(self, text: str) -> str | None:
         """Translate a contact-field label while preserving its value exactly."""
-        if not (self.translation_config.lang_out or "").upper().startswith("AR"):
+        cfg = getattr(self, "translation_config", None)
+        if cfg is None or not (cfg.lang_out or "").upper().startswith("AR"):
             return None
         match = re.match(
-            r"^\s*(tel(?:ephone)?|fax|e[ -]?mail|email)\s*[:：]\s*(.*?)\s*$",
+            r"^\s*(tel(?:ephone)?|fax|e[ -]?mail|email|الهاتف|الفاكس|البريد الإلكتروني)\s*[:：]\s*(.*?)\s*$",
             text,
             re.IGNORECASE | re.DOTALL,
         )
         if not match:
             return None
-        key = re.sub(r"[ -]", "", match.group(1).lower())
+        raw_key = match.group(1).strip()
+        key = re.sub(r"[ -]", "", raw_key.lower())
         label = {
             "tel": "الهاتف",
             "telephone": "الهاتف",
             "fax": "الفاكس",
             "email": "البريد الإلكتروني",
+            "الهاتف": "الهاتف",
+            "الفاكس": "الفاكس",
+            "البريدالإلكتروني": "البريد الإلكتروني",
         }[key]
         value = match.group(2)
         return f"{label}: {value}" if value else f"{label}:"

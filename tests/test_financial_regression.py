@@ -47,6 +47,7 @@ def translator_helper():
         _pre_translate_terminology = ILTranslator._pre_translate_terminology
         _normalize_arabic_output = ILTranslator._normalize_arabic_output
         _translate_with_line_preservation = ILTranslator._translate_with_line_preservation
+        _translate_contact_field_directly = ILTranslator._translate_contact_field_directly
     return DummyIL()
 
 
@@ -317,6 +318,64 @@ def test_swift_bic_codes_byte_identity_roundtrip():
         assert swift_code in res, f"Translator did not preserve BIC {swift_code}: {res}"
 
 
+# 11. QCB Annex 193 QA report regression tests
+def test_qcb_annex193_qa_report_fixes(translator_helper):
+    # A. Prose parentheticals with numbers/codes must not be swallowed whole as {0}
+    for phrase in [
+        "Bank Identifier (First 4 character of BIC)",
+        "Check digits (e.g. QA00 for QATAR)",
+        "IBAN length (29 characters for QATAR)",
+    ]:
+        protected, mapping = _protect_numerals(phrase)
+        assert not any(v.startswith("(") for v in mapping.values()), (
+            f"Prose parenthetical was swallowed as atomic placeholder in {phrase}: {mapping}"
+        )
+
+    assert "(أول 4 أحرف من رمز BIC)" in translator_helper._pre_translate_terminology(
+        "Bank Identifier (First 4 character of BIC)"
+    )
+    assert "(مثل QA00 لدولة قطر)" in translator_helper._pre_translate_terminology(
+        "(e.g. QA00 for QATAR)"
+    )
+    assert "(29 حرفاً لدولة قطر)" in translator_helper._pre_translate_terminology(
+        "(29 characters for QATAR)"
+    )
+
+    # B. Doubled running-header banner and extraction word-fusion repair
+    raw_banner = "IIBBAANN SSttaannddaarrddss VVeerr.. 22..00 -- QQAATTAARR"
+    assert translator_helper._pre_translate_terminology(raw_banner) == "معايير IBAN الإصدار 2.0 - قطر"
+    assert "All banks" in translator_helper._pre_translate_terminology("Allbanks are required")
+    assert "lot of" in translator_helper._pre_translate_terminology("a lotof errors")
+
+    # C. Dates, ordinals, and atomic multi-slash date LRM wrapping
+    assert translator_helper._pre_translate_terminology("JULY 2013") == "يوليو 2013"
+    assert "23 June 2013" in translator_helper._pre_translate_terminology("as of 23rd June 2013")
+    norm_date = translator_helper._normalize_arabic_output("التعميم رقم (66/2013) بتاريخ 14/8/2013.")
+    assert "\u200e14/8/2013\u200e" in norm_date
+    assert "\u200e66/2013\u200e" in norm_date
+
+    # D. Strip leaked English ordinal suffixes in Arabic output while keeping English untouched
+    assert translator_helper._normalize_arabic_output("يمتد من الموضع 5th - 29th في الحساب") == "يمتد من الموضع 5 - 29 في الحساب"
+
+    # E. QCB banking and MOD-97 terminology normalization
+    terminology_cases = [
+        ("توليد رقم الشيك والتحقق من رقم الشيك", "توليد رقم التحقق والتحقق من رقم التحقق"),
+        ("استخدام رقمي الشيك في جيل IBAN", "استخدام رقمي التحقق في إنشاء رقم IBAN"),
+        ("الخطوة 12: استبعاد الباقي من 98", "الخطوة 12: اطرح الباقي من 98"),
+        ("الرمز السريع وتعريف سريع للبنك", "رمز سويفت (SWIFT) ومعرّف البنك للبنك"),
+        ("البنك المركزي القطري ومركز تصفية قطر الآلي", "مصرف قطر المركزي وغرفة المقاصة الآلية القطرية"),
+        ("تطهيرها من خلال QATCH", "مقاصتها عبر QATCH"),
+        ("التحقق من المصادقة على الصفر الرائدة", "التحقق من الصحة على الأصفار البادئة"),
+        ("الصفحة اليسرى مع الصفر ورقم متكامل موقع", "تُملأ من اليسار بأصفار وعدد صحيح ذو إشارة"),
+        ("الطلب المصرفي الرئيسي ورقم الحساب المصري", "النظام المصرفي الأساسي ورقم الحساب المصرفي"),
+        ("29 حرفاً ألفاً للأرقام أو 9 أو 18 الأوراق", "29 حرفاً من الحروف والأرقام أو 9 أو 18 رقماً"),
+        ("مسؤولية البنك الوحيد ومباشرة من خلال المعالجة", "المسؤولية الحصرية للبنك والمعالجة المباشرة دون تدخل يدوي"),
+    ]
+    for raw_ar, expected_ar in terminology_cases:
+        actual_ar = translator_helper._normalize_arabic_output(raw_ar)
+        assert actual_ar == expected_ar, f"Expected [{expected_ar}], got [{actual_ar}]"
+
+
 if __name__ == "__main__":
     import inspect
     import sys
@@ -340,6 +399,7 @@ if __name__ == "__main__":
         ("test_typesetting_rigid_body_shift", lambda: test_typesetting_rigid_body_shift()),
         ("test_chronological_axis_detection", lambda: test_chronological_axis_detection()),
         ("test_swift_bic_codes_byte_identity_roundtrip", lambda: test_swift_bic_codes_byte_identity_roundtrip()),
+        ("test_qcb_annex193_qa_report_fixes", lambda: test_qcb_annex193_qa_report_fixes(helper)),
     ]
     passed = 0
     for name, fn in tests:

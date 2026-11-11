@@ -518,6 +518,35 @@ class StylesAndFormulas:
                 )
             )
 
+            # Superscripted English ordinal suffixes (1st, 2nd, 3rd, 4th, 23rd, 29th)
+            # in Word-generated PDFs use smaller font sizes (< 0.79x), which would
+            # otherwise be misclassified as mathematical corner-mark formulas (<b1>).
+            if is_corner_mark and (char.char_unicode or "").isascii() and (char.char_unicode or "").isalpha():
+                prev_u = (previous_char.char_unicode or "") if previous_char else ""
+                next_u = (next_char.char_unicode or "") if next_char else ""
+                prev2_u = (
+                    (line.pdf_character[i - 2].char_unicode or "")
+                    if i >= 2 and line.pdf_character[i - 2]
+                    else ""
+                )
+                after_next_u = (
+                    (line.pdf_character[i + 2].char_unicode or "")
+                    if i + 2 < len(line.pdf_character) and line.pdf_character[i + 2]
+                    else ""
+                )
+                pair_start = (char.char_unicode + next_u).lower()
+                pair_end = (prev_u + char.char_unicode).lower()
+                if (
+                    prev_u.isdigit()
+                    and pair_start in {"st", "nd", "rd", "th"}
+                    and (not after_next_u or not after_next_u.isalpha())
+                ) or (
+                    prev2_u.isdigit()
+                    and pair_end in {"st", "nd", "rd", "th"}
+                    and (not next_u or not next_u.isalpha())
+                ):
+                    is_corner_mark = False
+
             is_formula = is_formula or is_corner_mark
 
             if char.char_unicode == " ":
@@ -971,7 +1000,10 @@ class StylesAndFormulas:
         text = "".join(char.char_unicode for char in formula.pdf_character)
         if formula.y_offset > 0.1:
             return False
-        return bool(re.match(r"^[0-9, .]+$", text))
+        return bool(
+            re.match(r"^\+?[0-9, .\-()]+$", text)
+            and any(ch.isdigit() for ch in text)
+        )
 
     def should_split_formula(self, formula: PdfFormula) -> bool:
         """判断公式是否需要按逗号拆分（包含逗号且有其他特殊符号）"""
