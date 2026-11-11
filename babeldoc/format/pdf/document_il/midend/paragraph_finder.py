@@ -35,6 +35,7 @@ from babeldoc.format.pdf.document_il.utils.layout_helper import (
     is_character_in_formula_layout,
 )
 from babeldoc.format.pdf.document_il.utils.layout_helper import is_text_layout
+from babeldoc.format.pdf.document_il.utils.paragraph_helper import NUMERIC_PATTERN
 from babeldoc.format.pdf.document_il.utils.paragraph_helper import is_cid_paragraph
 from babeldoc.format.pdf.document_il.utils.style_helper import INDIGO
 from babeldoc.format.pdf.document_il.utils.style_helper import WHITE
@@ -938,6 +939,11 @@ class ParagraphFinder:
             if not cell_rows:
                 continue
 
+            # Some tables draw rules only between groups of numeric columns.
+            # Keep each already-isolated value in its original source position.
+            if not self.translation_config.ocr_workaround:
+                self._preserve_numeric_table_values(page, paragraphs, table_box)
+
             source_paragraphs = []
             owned: dict[int, tuple[PdfCharacter, int, int]] = {}
             for paragraph in list(paragraphs):
@@ -1031,6 +1037,31 @@ class ParagraphFinder:
                     # alignment use the complete ruled cell.
                     paragraph.box = destination_box
                     paragraphs.append(paragraph)
+
+    def _preserve_numeric_table_values(
+        self, page: Page, paragraphs: list[PdfParagraph], table_box: Box
+    ) -> None:
+        remaining = []
+        page_glyphs = {id(char) for char in page.pdf_character}
+        for paragraph in paragraphs:
+            box = paragraph.box
+            compositions = paragraph.pdf_paragraph_composition or []
+            if (
+                box
+                and table_box.x <= box.x <= box.x2 <= table_box.x2
+                and table_box.y <= box.y <= box.y2 <= table_box.y2
+                and len(compositions) == 1
+                and compositions[0].pdf_line
+            ):
+                chars = compositions[0].pdf_line.pdf_character
+                if NUMERIC_PATTERN.fullmatch(get_char_unicode_string(chars).strip()):
+                    for char in chars:
+                        if id(char) not in page_glyphs:
+                            page.pdf_character.append(char)
+                            page_glyphs.add(id(char))
+                    continue
+            remaining.append(paragraph)
+        paragraphs[:] = remaining
 
     def _remove_trailing_hyphen(self, paragraph: PdfParagraph):
         """Remove trailing hyphen or soft-hyphen from paragraph composition."""
