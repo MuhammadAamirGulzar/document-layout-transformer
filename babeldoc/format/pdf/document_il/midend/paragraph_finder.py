@@ -380,6 +380,9 @@ class ParagraphFinder:
 
         self.process_independent_paragraphs(paragraphs, median_width, font_dict=font_dict)
 
+        if not self.translation_config.ocr_workaround:
+            self._preserve_pseudocode_regions(page, paragraphs)
+
         # Fallback line detection intentionally favors small text regions. In a
         # ruled table that can collapse several adjacent cells into one line.
         # Recover the original cells from the table's vector grid before any
@@ -808,6 +811,66 @@ class ParagraphFinder:
             elif composition.pdf_character:
                 characters.append(composition.pdf_character)
         return characters
+
+    def _preserve_pseudocode_regions(
+        self, page: Page, paragraphs: list[PdfParagraph]
+    ) -> None:
+        """Keep numbered pseudocode at source coordinates when its region is identifiable."""
+        control = re.compile(
+            r"^(?:(?:function|procedure|def)\s+\w+\s*\(|"
+            r"(?:for|while)\b.+\bdo\b|if\b.+\bthen\b|end\s+(?:if|for|while|function|procedure)\b)",
+            re.IGNORECASE,
+        )
+        assignment = re.compile(r"←|:=|^\w+\s*=(?!=)")
+        number_prefix = re.compile(r"^(\d+)\s*[:.]\s*(?!\d)")
+        preserved_ids = set()
+        page_glyph_ids = {id(char) for char in page.pdf_character}
+        for region in page.page_layout or []:
+            box = region.box
+            if not box or (region.class_name or "").lower() not in {
+                "table", "wired_table", "wireless_table", "algorithm", "pseudocode", "code",
+            }:
+                continue
+            members = []
+            line_numbers = set()
+            control_rows = set()
+            assignment_rows = set()
+            gutter_right = box.x + (box.x2 - box.x) * 0.10
+            for paragraph in paragraphs:
+                bounds = paragraph.box
+                if (
+                    id(paragraph) in preserved_ids
+                    or not bounds
+                    or not (box.x - 2 <= bounds.x <= bounds.x2 <= box.x2 + 2)
+                    or not (box.y - 2 <= bounds.y <= bounds.y2 <= box.y2 + 2)
+                ):
+                    continue
+                members.append(paragraph)
+                for composition in paragraph.pdf_paragraph_composition or []:
+                    line = composition.pdf_line
+                    if not line or not line.box:
+                        continue
+                    text = get_char_unicode_string(line.pdf_character).strip()
+                    marker = number_prefix.match(text) if line.box.x <= gutter_right else None
+                    if marker:
+                        line_numbers.add(int(marker[1]))
+                        text = text[marker.end():]
+                    if control.match(text):
+                        control_rows.add(round(line.box.y))
+                    if assignment.search(text):
+                        assignment_rows.add(round(line.box.y))
+            has_sequence = any(n + 1 in line_numbers and n + 2 in line_numbers for n in line_numbers)
+            if not has_sequence or len(control_rows) < 2 or not assignment_rows:
+                continue
+            for paragraph in members:
+                preserved_ids.add(id(paragraph))
+                for char in self._paragraph_source_characters(paragraph):
+                    # Synthetic whitespace has no source glyph to draw.
+                    if char.pdf_character_id is not None and id(char) not in page_glyph_ids:
+                        page.pdf_character.append(char)
+                        page_glyph_ids.add(id(char))
+        if preserved_ids:
+            paragraphs[:] = [p for p in paragraphs if id(p) not in preserved_ids]
 
     @staticmethod
     def _cluster_coordinates(values: list[float], tolerance: float = 2.0) -> list[float]:
