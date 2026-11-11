@@ -648,6 +648,58 @@ class ILTranslator:
             )
         return text[:match.start()], source_match["reference"], translate_input
 
+    def _split_trailing_document_reference(self, text, source_text, translate_input):
+        """Recover a bracketed reference even when PDF formula tags split it."""
+        pattern = re.compile(
+            r"(?P<open>[\[(])\s*(?:sections?|chapters?|tables?|figures?|appendi(?:x|ces))\s+"
+            r"(?:[0-9]+(?:\.[0-9]+)*[a-z]?|[a-z](?:\.[0-9]+)*)\s*(?P<close>[\])])\s*\Z",
+            re.IGNORECASE,
+        )
+        source_match = pattern.search(source_text or "")
+        if source_match is None or source_match["close"] != {"[": "]", "(": ")"}[source_match["open"]]:
+            return text, "", translate_input
+
+        formulas = {
+            item.placeholder: "".join(char.char_unicode or "" for char in item.formula.pdf_character)
+            for item in translate_input.placeholders
+            if isinstance(item, FormulaPlaceholder)
+        }
+        # Map expanded reference boundaries back to the prepared text. Each
+        # formula is indivisible, so a match cannot consume only part of it.
+        expanded = []
+        boundaries = {0: 0}
+        position = 0
+        for piece in re.finditer(r"<b[0-9]+>|.", text, re.DOTALL):
+            value = formulas.get(piece[0], piece[0])
+            if not value:
+                return text, "", translate_input
+            expanded.append(value)
+            position += len(value)
+            boundaries[position] = piece.end()
+
+        prepared_match = pattern.search("".join(expanded))
+        if (
+            prepared_match is None
+            or prepared_match.start() not in boundaries
+            or prepared_match[0].split() != source_match[0].split()
+        ):
+            return text, "", translate_input
+
+        boundary = boundaries[prepared_match.start()]
+        prefix = text[:boundary].rstrip()
+        consumed = set(re.findall(r"<b[0-9]+>", text[boundary:])) & formulas.keys()
+        if any(tag in prefix for tag in consumed):
+            return text, "", translate_input
+        remaining = [
+            item for item in translate_input.placeholders
+            if not isinstance(item, FormulaPlaceholder) or item.placeholder not in consumed
+        ]
+        # A no-break space keeps the label and number on the same RTL line.
+        reference = "\u00a0".join(source_match[0].split())
+        return prefix, reference, self.TranslateInput(
+            translate_input.unicode, remaining, translate_input.base_style,
+        )
+
     def _translate_with_line_preservation(
         self, text: str, rate_limit_params: dict, force_preserve_lines: bool = False
     ) -> str:
@@ -1871,6 +1923,11 @@ Now, please carefully read the following text to be translated and directly outp
                     body, index_reference, translate_input = (
                         self._split_trailing_index_reference(body, source_unicode, translate_input)
                     )
+                    language = (self.translation_config.lang_out or "").lower().rsplit("-", 1)[-1]
+                    if not index_reference and language in {"ar", "ara", "arabic"}:
+                        body, index_reference, translate_input = self._split_trailing_document_reference(
+                            body, source_unicode, translate_input,
+                        )
                     translated_text = self._translate_with_line_preservation(
                         body,
                         rate_limit_params={
