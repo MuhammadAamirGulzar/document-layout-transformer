@@ -49,6 +49,8 @@ from arabic_reshaper import reshape
 
 logger = logging.getLogger(__name__)
 
+_INLINE_LIST_MARKER = re.compile(r"(?<!\S)\(([1-9][0-9]?)\)(?=\s)")
+
 _SUBTRACTION_INSTRUCTION = re.compile(
     r"(?P<step>Step[ \t]+[0-9]+:[ \t]+)?Subtract[ \t]+"
     r"(?P<amount>the remainder(?: calculated in step [0-9]+)?|[0-9]+)"
@@ -701,6 +703,35 @@ class ILTranslator:
             translate_input.unicode, remaining, translate_input.base_style,
         )
 
+    @staticmethod
+    def _inline_numbered_list(text: str) -> tuple[str, list[tuple[str, str, str]]] | None:
+        """Recognize a consecutive inline enumeration with prose in each item."""
+        markers = list(_INLINE_LIST_MARKER.finditer(text))
+        if len(markers) < 3 or any(
+            int(marker[1]) != index for index, marker in enumerate(markers, 1)
+        ):
+            return None
+
+        heading = text[:markers[0].start()].strip()
+        if heading and not heading.endswith(":"):
+            return None
+
+        items = []
+        for index, marker in enumerate(markers):
+            next_marker = markers[index + 1] if index + 1 < len(markers) else None
+            end = next_marker.start() if next_marker else len(text)
+            body = text[marker.end():end].strip()
+            separator = ""
+            if next_marker:
+                separator = body[-1:]
+                if separator not in {",", ";"}:
+                    return None
+                body = body[:-1].rstrip()
+            if not re.search(r"[^\W\d_]{2}", body):
+                return None
+            items.append((marker[0], body, separator))
+        return heading.removesuffix(":").rstrip(), items
+
     def _translate_with_line_preservation(
         self, text: str, rate_limit_params: dict, force_preserve_lines: bool = False
     ) -> str:
@@ -740,7 +771,19 @@ class ILTranslator:
                 if subtraction["pad"]:
                     body += ". If necessary, add a leading 0 so that the result has two digits"
                 body += (subtraction["tail"] or "") + subtraction["punctuation"]
-            translated = engine.translate(body, rate_limit_params=rate_limit_params)
+            inline_list = self._inline_numbered_list(body)
+            if inline_list:
+                heading, items = inline_list
+                translated_parts = []
+                if heading:
+                    translated_heading = engine.translate(heading, rate_limit_params=rate_limit_params)
+                    translated_parts.append(f"{translated_heading}:")
+                for item_marker, item, separator in items:
+                    translated_item = engine.translate(item, rate_limit_params=rate_limit_params)
+                    translated_parts.append(f"{item_marker} {translated_item}{separator}")
+                translated = " ".join(translated_parts)
+            else:
+                translated = engine.translate(body, rate_limit_params=rate_limit_params)
             return prefix + translated if marker else translated
 
         # Check if text contains Table of Contents (TOC) entries with dotted leader lines

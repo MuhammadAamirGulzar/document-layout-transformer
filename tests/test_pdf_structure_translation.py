@@ -40,9 +40,9 @@ def test_letter_in_body_text_still_goes_to_translation():
     ("source", "expected", "model_input"),
     [
         ("1. Standards Document", "1. translated", "Standards Document"),
-        ("5. Check Digit Generation", "5. translated", "Check Digit Generation"),
-        ("5. Check Digit Generation .... 1312", "5. translated .... 1312", "Check Digit Generation"),
-        ("3.1. Validation", "3.1. translated", "Validation"),
+        ("5. Incident Review", "5. translated", "Incident Review"),
+        ("5. Incident Review .... 1312", "5. translated .... 1312", "Incident Review"),
+        ("3.1. Service Rollout", "3.1. translated", "Service Rollout"),
         ("1.5 billion", "translated", "1.5 billion"),
     ],
 )
