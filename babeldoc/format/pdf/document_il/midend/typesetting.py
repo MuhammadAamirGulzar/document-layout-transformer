@@ -3595,6 +3595,7 @@ class Typesetting:
                     'table_cell', 'table_text', 'wired_table_cell', 'wireless_table_cell'
                 ]):
                     is_table_content = True
+            centered_table_header = paragraph.layout_label == "wired_table_cell_fixed_rtl_centered"
 
             # 3. Layout each line with per-line BiDi
             for line_idx, line in enumerate(lines_tokens):
@@ -3741,7 +3742,7 @@ class Typesetting:
                 # Determine starting X position
                 if is_chronological_axis:
                     line_start_x = box.x
-                elif centered_display:
+                elif centered_display or centered_table_header:
                     line_start_x = max(box.x, (box.x + box.x2 - visual_line_w) / 2)
                 elif is_table_content:
                     line_start_x = box.x2 - visual_line_w

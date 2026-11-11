@@ -1004,8 +1004,16 @@ class ParagraphFinder:
 
             # Some tables draw rules only between groups of numeric columns.
             # Keep each already-isolated value in its original source position.
+            numeric_top = float("inf")
             if not self.translation_config.ocr_workaround:
-                self._preserve_numeric_table_values(page, paragraphs, table_box)
+                numeric_boxes = self._preserve_numeric_table_values(
+                    page, paragraphs, table_box
+                )
+                if numeric_boxes and len(ys) >= 2:
+                    numeric_top = max(box.y2 for box in numeric_boxes)
+                    cell_rows = self._refine_grouped_table_cells(
+                        cell_rows, paragraphs, numeric_boxes, vertical_rules
+                    )
 
             source_paragraphs = []
             owned: dict[int, tuple[PdfCharacter, int, int]] = {}
@@ -1095,16 +1103,131 @@ class ParagraphFinder:
                         debug_id=generate_base58_id(),
                     )
                     self.update_paragraph_data(paragraph, update_unicode=True)
+                    if is_arabic and destination.y > numeric_top and paragraph.box:
+                        source_midpoint = (paragraph.box.x + paragraph.box.x2) / 2
+                        cell_midpoint = (destination.x + destination.x2) / 2
+                        if abs(source_midpoint - cell_midpoint) <= (destination.x2 - destination.x) * 0.1:
+                            paragraph.layout_label += "_centered"
                     # update_paragraph_data derives a tight source-text box;
                     # restore the actual destination cell so wrapping and RTL
                     # alignment use the complete ruled cell.
                     paragraph.box = destination_box
                     paragraphs.append(paragraph)
 
+    def _refine_grouped_table_cells(
+        self,
+        cell_rows: list[list[Box]],
+        paragraphs: list[PdfParagraph],
+        numeric_boxes: list[Box],
+        vertical_rules: list[Box],
+    ) -> list[list[Box]]:
+        """Use numeric alignment to recover cells between widely spaced rules."""
+        value_centers = [
+            ((box.x + box.x2) / 2, (box.y + box.y2) / 2) for box in numeric_boxes
+        ]
+        value_xs = self._cluster_coordinates([x for x, _ in value_centers], tolerance=3)
+        columns = [
+            x for x in value_xs
+            if len(self._cluster_coordinates([
+                y for cx, y in value_centers if abs(cx - x) <= 3
+            ])) >= 2
+        ]
+        rule_xs = self._cluster_coordinates([(box.x + box.x2) / 2 for box in vertical_rules])
+        column_cuts = [(left + right) / 2 for left, right in zip(columns, columns[1:])]
+        column_cuts = [x for x in column_cuts if all(abs(x - rule) >= 4 for rule in rule_xs)]
+        top_value_y = max(y for _, y in value_centers)
+
+        result = []
+        for cells in cell_rows:
+            bottom, top = cells[0].y, cells[0].y2
+            row_values = [(x, y) for x, y in value_centers if bottom < y < top]
+            row_centers = self._cluster_coordinates([y for _, y in row_values])
+            rows = [
+                y for y in row_centers
+                if len(self._cluster_coordinates([
+                    x for x, cy in row_values if abs(cy - y) <= 2
+                ])) >= 2
+            ]
+            label_paragraphs = [
+                paragraph for paragraph in paragraphs
+                if paragraph.box
+                and paragraph.box.x < cells[-1].x2
+                and paragraph.box.x2 > cells[0].x
+                and paragraph.box.y < top
+                and paragraph.box.y2 > bottom
+            ]
+
+            # Two numeric lines in the same ruled band are distinct rows when
+            # the cut also leaves each source label paragraph intact.
+            row_cuts = []
+            label_boxes = [p.box for p in label_paragraphs]
+            for lower, upper in zip(rows, rows[1:]):
+                cut = (lower + upper) / 2
+                below = [box.y2 for box in label_boxes if (box.y + box.y2) / 2 < cut]
+                above = [box.y for box in label_boxes if (box.y + box.y2) / 2 >= cut]
+                if below and above:
+                    lower_edge, upper_edge = max(below), min(above)
+                    gap_center = (lower_edge + upper_edge) / 2
+                    if lower_edge < upper_edge and lower < gap_center < upper:
+                        cut = gap_center
+                if not any(box.y < cut < box.y2 for box in label_boxes):
+                    row_cuts.append(cut)
+
+            if bottom > top_value_y:
+                ink = []
+                for paragraph in label_paragraphs:
+                    for char in self._paragraph_source_characters(paragraph):
+                        if not (char.char_unicode or "").strip():
+                            continue
+                        box = char.visual_bbox.box if char.visual_bbox and char.visual_bbox.box else char.box
+                        if box and bottom < (box.y + box.y2) / 2 < top:
+                            ink.append(box)
+                # A rule drawn in a neighboring row defines a column group.
+                # Establish those groups before inferring individual columns.
+                ruled_slots = [
+                    slot
+                    for cell in cells
+                    for slot in self._split_table_header(cell, ink, rule_xs)
+                ]
+                result.append([
+                    slot
+                    for cell in ruled_slots
+                    for slot in self._split_table_header(cell, ink, column_cuts)
+                ])
+                continue
+
+            boundaries = [bottom, *row_cuts, top]
+            result.extend(
+                [Box(cell.x, y, cell.x2, y2) for cell in cells]
+                for y, y2 in zip(boundaries, boundaries[1:])
+            )
+        return result
+
+    @staticmethod
+    def _split_table_header(cell: Box, ink: list[Box], cuts: list[float]) -> list[Box]:
+        glyphs = [box for box in ink if cell.x < (box.x + box.x2) / 2 < cell.x2]
+        if not glyphs:
+            return [cell]
+        minimum_gap = max(4, 0.65 * statistics.median(box.y2 - box.y for box in glyphs))
+        boundaries = [cell.x]
+        for cut in cuts:
+            if cut - boundaries[-1] < 5 or cell.x2 - cut < 5:
+                continue
+            left = [box.x2 for box in glyphs if boundaries[-1] < (box.x + box.x2) / 2 <= cut]
+            right = [box.x for box in glyphs if (box.x + box.x2) / 2 > cut]
+            if not left or not right:
+                continue
+            left_edge, right_edge = max(left), min(right)
+            if left_edge + 1 <= cut <= right_edge - 1 and right_edge - left_edge >= minimum_gap:
+                boundaries.append(cut)
+        boundaries.append(cell.x2)
+        return [Box(x, cell.y, x2, cell.y2) for x, x2 in zip(boundaries, boundaries[1:])]
+
     def _preserve_numeric_table_values(
         self, page: Page, paragraphs: list[PdfParagraph], table_box: Box
-    ) -> None:
+    ) -> list[Box]:
         remaining = []
+        numeric_boxes = []
         page_glyphs = {id(char) for char in page.pdf_character}
         for paragraph in paragraphs:
             box = paragraph.box
@@ -1118,6 +1241,7 @@ class ParagraphFinder:
             ):
                 chars = compositions[0].pdf_line.pdf_character
                 if NUMERIC_PATTERN.fullmatch(get_char_unicode_string(chars).strip()):
+                    numeric_boxes.append(box)
                     for char in chars:
                         if id(char) not in page_glyphs:
                             page.pdf_character.append(char)
@@ -1125,6 +1249,7 @@ class ParagraphFinder:
                     continue
             remaining.append(paragraph)
         paragraphs[:] = remaining
+        return numeric_boxes
 
     def _remove_trailing_hyphen(self, paragraph: PdfParagraph):
         """Remove trailing hyphen or soft-hyphen from paragraph composition."""
