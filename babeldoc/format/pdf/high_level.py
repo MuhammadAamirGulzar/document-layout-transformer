@@ -803,59 +803,71 @@ def do_translate(
 def migrate_toc(
     translation_config: TranslationConfig, translate_result: TranslateResult
 ):
-    if translation_config.use_alternating_pages_dual:
-        logger.info('skipping TOC migration for "use_alternating_pages_dual" mode')
-        return
-    old_doc = Document(translation_config.input_file)
-    if not old_doc:
-        return
-    try:
-        fix_filter(old_doc)
-        fix_null_xref(old_doc)
-    except Exception:
-        logger.exception("auto fix failed, please check the pdf file")
-
-    toc_data = old_doc.get_toc()
+    with Document(translation_config.input_file) as old_doc:
+        if not old_doc:
+            return
+        try:
+            fix_filter(old_doc)
+            fix_null_xref(old_doc)
+        except Exception:
+            logger.exception("auto fix failed, please check the pdf file")
+        toc_data = old_doc.get_toc()
+        source_pages = range(1, len(old_doc) + 1)
 
     if not toc_data:
         logger.info("No TOC found in the original PDF, skipping migration.")
         return
 
     if translation_config.only_include_translated_page:
-        total_page = set(range(0, len(old_doc)))
-
-        pages_to_translate = {
-            i for i in len(old_doc) if translation_config.should_translate_page(i + 1)
-        }
-
-        should_removed_page = list(total_page - pages_to_translate)
-
-    files = {
-        translate_result.dual_pdf_path,
-        # translate_result.mono_pdf_path,
-        translate_result.no_watermark_dual_pdf_path,
-        # translate_result.no_watermark_mono_pdf_path
-    }
-
-    for f in files:
-        if not f:
+        source_pages = [
+            page for page in source_pages if translation_config.should_translate_page(page)
+        ]
+    page_map = {source: output for output, source in enumerate(source_pages, 1)}
+    output_toc = []
+    kept_levels = []
+    for level, title, page in toc_data:
+        while kept_levels and kept_levels[-1] >= level:
+            kept_levels.pop()
+        if page > 0 and page not in page_map:
             continue
-        mig_toc_temp_input = translation_config.get_working_file_path(
-            "mig_toc_temp.pdf"
-        )
-        shutil.copy(f, mig_toc_temp_input)
-        new_doc = Document(mig_toc_temp_input.as_posix())
-        if not new_doc:
-            continue
+        output_toc.append([len(kept_levels) + 1, title, page_map.get(page, page)])
+        kept_levels.append(level)
 
-        new_doc.set_toc(toc_data)
-        PDFCreater.save_pdf_with_timeout(
-            new_doc,
-            f.as_posix(),
-            translation_config=translation_config,
-            clean=not translation_config.skip_clean,
-            tag="mig_toc",
-        )
+    dual_toc = output_toc
+    dual_pages = len(page_map)
+    if translation_config.use_alternating_pages_dual:
+        first = int(translation_config.dual_translate_first)
+        dual_toc = [
+            [level, title, page * 2 - first if page > 0 else page]
+            for level, title, page in output_toc
+        ]
+        dual_pages *= 2
+
+    exports = (
+        ({translate_result.mono_pdf_path, translate_result.no_watermark_mono_pdf_path},
+         output_toc, len(page_map)),
+        ({translate_result.dual_pdf_path, translate_result.no_watermark_dual_pdf_path},
+         dual_toc, dual_pages),
+    )
+    for paths, bookmarks, expected_pages in exports:
+        for path in paths - {None}:
+            with Document(path) as output:
+                if len(output) != expected_pages:
+                    logger.warning("Skipping bookmark migration for %s: unexpected page count", path)
+                    continue
+                if output.get_toc() == bookmarks:
+                    continue
+            temporary = translation_config.get_working_file_path("mig_toc_temp.pdf")
+            shutil.copy(path, temporary)
+            with Document(temporary) as output:
+                output.set_toc(bookmarks)
+                PDFCreater.save_pdf_with_timeout(
+                    output,
+                    path.as_posix(),
+                    translation_config=translation_config,
+                    clean=not translation_config.skip_clean,
+                    tag="mig_toc",
+                )
 
 
 # mediabox -> '[0 nul 792]'

@@ -969,6 +969,30 @@ class PDFCreater:
                 )
         return dual
 
+    def _create_dual_pdf(
+        self,
+        translated_pdf: pymupdf.Document,
+        dual_out_path: str | Path,
+        translation_config: TranslationConfig,
+        selected_pages: list[int] | None,
+    ) -> pymupdf.Document:
+        original_pdf = pymupdf.open(self.original_pdf_path)
+        try:
+            if selected_pages is not None:
+                original_pdf.select(selected_pages)
+            if translation_config.use_alternating_pages_dual:
+                return self.create_alternating_pages_dual_pdf(
+                    original_pdf, translated_pdf, translation_config,
+                )
+            dual = self.create_side_by_side_dual_pdf(
+                original_pdf, translated_pdf, dual_out_path, translation_config,
+            )
+        except BaseException:
+            original_pdf.close()
+            raise
+        original_pdf.close()
+        return dual
+
     def create_alternating_pages_dual_pdf(
         self,
         original_pdf: pymupdf.Document,
@@ -992,10 +1016,10 @@ class PDFCreater:
         # Rearrange pages to alternate between original and translated
         page_count = translated_pdf.page_count
         for page_id in range(page_count):
-            if translation_config.dual_translate_first:
-                dual.move_page(page_count + page_id, page_id * 2)
-            else:
-                dual.move_page(page_count + page_id, page_id * 2 + 1)
+            current = page_count + page_id
+            target = page_id * 2 + int(not translation_config.dual_translate_first)
+            if current != target:
+                dual.move_page(current, target)
 
         return dual
 
@@ -1407,20 +1431,16 @@ class PDFCreater:
             except Exception:
                 logger.exception("restore media box failed")
 
+            selected_pages = None
             if translation_config.only_include_translated_page:
-                total_page = set(range(0, len(pdf)))
-
-                pages_to_translate = {
+                selected_pages = sorted({
                     page.page_number
                     for page in self.docs.page
                     if self.translation_config.should_translate_page(
                         page.page_number + 1
                     )
-                }
-
-                should_removed_page = list(total_page - pages_to_translate)
-
-                pdf.delete_pages(should_removed_page)
+                })
+                pdf.select(selected_pages)
 
             # Add detailed logging before saving
             if self.detailed_logger:
@@ -1457,37 +1477,27 @@ class PDFCreater:
                     dual_out_path = translation_config.get_output_file_path(
                         f"{basename}{debug_suffix}.{translation_config.lang_out}.dual.pdf",
                     )
-                    if translation_config.use_alternating_pages_dual:
-                        dual = self.create_alternating_pages_dual_pdf(
-                            pymupdf.open(self.original_pdf_path),
-                            pdf,
-                            translation_config,
-                        )
-                    else:
-                        dual = self.create_side_by_side_dual_pdf(
-                            pymupdf.open(self.original_pdf_path),
-                            pdf,
+                    with self._create_dual_pdf(
+                        pdf, dual_out_path, translation_config, selected_pages,
+                    ) as dual:
+                        self.save_pdf_with_timeout(
+                            dual,
                             dual_out_path,
                             translation_config,
+                            garbage=gc_level,
+                            deflate=True,
+                            clean=not translation_config.skip_clean,
+                            deflate_fonts=True,
+                            linear=False,
+                            tag="dual",
                         )
-                    self.save_pdf_with_timeout(
-                        dual,
-                        dual_out_path,
-                        translation_config,
-                        garbage=gc_level,
-                        deflate=True,
-                        clean=not translation_config.skip_clean,
-                        deflate_fonts=True,
-                        linear=False,
-                        tag="dual",
-                    )
-                    if translation_config.debug:
-                        translation_config.raise_if_cancelled()
-                        dual.save(
-                            f"{dual_out_path}.decompressed.pdf",
-                            expand=True,
-                            pretty=True,
-                        )
+                        if translation_config.debug:
+                            translation_config.raise_if_cancelled()
+                            dual.save(
+                                f"{dual_out_path}.decompressed.pdf",
+                                expand=True,
+                                pretty=True,
+                            )
                 pbar.advance()
             
             if self.translation_config.no_mono:
