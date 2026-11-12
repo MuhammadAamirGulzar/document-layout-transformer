@@ -404,6 +404,20 @@ class ILTranslator:
         text = re.sub(r'\bAllbanks\b', 'All banks', text, flags=re.I)
         text = re.sub(r'\blotof\b', 'lot of', text, flags=re.I)
         text = re.sub(r'\bindeep\b', 'in deep', text, flags=re.I)
+        text = re.sub(
+            r'\b(the|previous|next|current|place|person|verb|noun|word|token|layer|model)'
+            r'(city|section|neuron|neurons|layer|layers|model|models)\b',
+            r'\1 \2',
+            text,
+            flags=re.I,
+        )
+        text = re.sub(
+            r'\b([A-Z][a-z]{2,})(Analysis|Research|Network|Networks|Model|Models|Layer|Layers|Neuron|Neurons|Section|Classifier|Classifiers)\b',
+            r'\1 \2',
+            text,
+        )
+        text = re.sub(r'\b(\d+)isa\b', r'\1 is a', text, flags=re.I)
+        text = re.sub(r'\bw\.?r\.?t\.?(?=\s|$|[.,;:)\]])', 'with respect to', text, flags=re.I)
 
         # Strip English ordinal suffixes on calendar dates before month names
         # ("as of 23rd June 2013" -> "as of 23 June 2013") so numeric shielding
@@ -1902,6 +1916,16 @@ Now, please carefully read the following text to be translated and directly outp
                     if marker:
                         translated_text = f"{marker} {translated_text}"
                 translated_text = self._normalize_arabic_output(translated_text)
+                # Source-aware scientific repairs are a separate boundary so
+                # the long-standing one-argument normalization contract stays
+                # compatible with callers and test doubles.
+                from babeldoc.format.pdf.document_il.midend.domain_glossary import (
+                    apply_post_glossary,
+                )
+
+                translated_text = apply_post_glossary(
+                    translated_text, source_text=source_unicode
+                )
                 translated_text = self.shape_arabic_text(translated_text)
                 # Only collapse repetitive punctuation if not a TOC leader line (\.{4,}\s*\d+)
                 if not re.search(r'\.{4,}\s*\d+', translated_text):
@@ -1915,6 +1939,7 @@ Now, please carefully read the following text to be translated and directly outp
                 # Attach diagnostic pipeline trace for paragraph routing analysis
                 engine_name = getattr(self.translate_engine, 'name', self.translate_engine.__class__.__name__)
                 paragraph.pipeline_trace = {
+                    **(paragraph.pipeline_trace or {}),
                     "debug_id": paragraph.debug_id,
                     "layout_label": lbl,
                     "engine": engine_name,

@@ -921,6 +921,7 @@ class Typesetting:
         self._vertical_collision_resolved_pages: set[int] = set()
         self._rendered_collision_resolved_pages: set[int] = set()
         self._heading_clearance_resolved_pages: set[int] = set()
+        self._inline_highlights_anchored_pages: set[int] = set()
         self._translated_code_band_keys: set[tuple[int, int]] = set()
 
     def _is_centered_display_text(self, paragraph, page) -> bool:
@@ -968,6 +969,13 @@ class Typesetting:
         label = (paragraph.layout_label or "").lower()
         if centered_display:
             return min(source_size, paragraph.pdf_style.font_size)
+
+        if "fallback_line" in label or (
+            any(marker in label for marker in ("figure", "chart", "axis", "diagram"))
+            and "caption" not in label
+        ):
+            if 0 < source_size <= 9.5:
+                return round(min(9.5, source_size * 1.05), 2)
 
         # Preserve the source hierarchy, but keep it narrow and predictable.
         if any(marker in label for marker in ("title", "heading", "section")):
@@ -1058,6 +1066,8 @@ class Typesetting:
                 and paragraph.box.x2 - paragraph.box.x < page_width * 0.60
             )
             if not (is_structured or is_narrow_heading):
+                continue
+            if "fallback_line" in label or self._is_inside_table_or_figure_region(paragraph.box, page):
                 continue
             if self._is_fixed_table_paragraph(paragraph) and "table" in label:
                 continue
@@ -1421,7 +1431,15 @@ class Typesetting:
 
         # Role-based minimum scale floors and relief floors to preserve typographic hierarchy
         layout_label = (paragraph.layout_label or "").lower()
-        if "title" in layout_label or "heading" in layout_label:
+        is_figure_or_fallback = (
+            "fallback_line" in layout_label
+            or self._is_inside_table_or_figure_region(box, page, figures_only=True)
+        )
+        if is_figure_or_fallback:
+            line_skip = 1.25
+            min_scale = 0.60
+            relief_floor = 0.52
+        elif "title" in layout_label or "heading" in layout_label:
             min_scale = 0.90  # Headings normal floor
             relief_floor = 0.82  # Relief floor if expansion is blocked
         elif "contact_card" in layout_label:
@@ -1484,30 +1502,32 @@ class Typesetting:
 
         # 1. On overflow, attempt box expansion via get_max_bottom_space FIRST,
         # before any scale reduction — this preserves full-size type for titles/captions when free space exists below.
-        try:
-            min_avail_y = self.get_max_bottom_space(box, page) + safety_margin
-            if min_avail_y < box.y:
-                expanded_box = Box(x=box.x, y=min_avail_y, x2=box.x2, y2=box.y2)
-                box = expanded_box
-                paragraph.box = expanded_box
-                typeset_units, all_units_fit = layout_units(
-                    typesetting_units,
-                    box,
-                    scale,
-                    line_skip,
-                    paragraph,
-                    use_english_line_break,
-                )
-                if typeset_units:
-                    best_typeset_units = typeset_units
-                    best_scale = scale
-                if all_units_fit:
+        if not is_figure_or_fallback:
+            try:
+                min_avail_y = self.get_max_bottom_space(box, page) + safety_margin
+                if min_avail_y < box.y:
+                    expanded_box = Box(x=box.x, y=min_avail_y, x2=box.x2, y2=box.y2)
+                    box = expanded_box
                     if apply_layout:
-                        self._commit_layout_to_paragraph(paragraph, page, typeset_units, scale)
-                        final_typeset_units = typeset_units
-                    return scale, final_typeset_units
-        except Exception as e:
-            logger.debug(f"Error expanding bottom space: {e}")
+                        paragraph.box = expanded_box
+                    typeset_units, all_units_fit = layout_units(
+                        typesetting_units,
+                        box,
+                        scale,
+                        line_skip,
+                        paragraph,
+                        use_english_line_break,
+                    )
+                    if typeset_units:
+                        best_typeset_units = typeset_units
+                        best_scale = scale
+                    if all_units_fit:
+                        if apply_layout:
+                            self._commit_layout_to_paragraph(paragraph, page, typeset_units, scale)
+                            final_typeset_units = typeset_units
+                        return scale, final_typeset_units
+            except Exception as e:
+                logger.debug(f"Error expanding bottom space: {e}")
 
         # 2. Only if expansion is blocked, fall into progressive scale reduction down to relief floor
         while scale > relief_floor:
@@ -1535,27 +1555,29 @@ class Typesetting:
                     return scale, final_typeset_units
 
                 # Re-check bottom space expansion at this reduced scale
-                min_avail_y = self.get_max_bottom_space(box, page) + safety_margin
-                if min_avail_y < box.y:
-                    expanded_box = Box(x=box.x, y=min_avail_y, x2=box.x2, y2=box.y2)
-                    box = expanded_box
-                    paragraph.box = expanded_box
-                    typeset_units, all_units_fit = layout_units(
-                        typesetting_units,
-                        box,
-                        scale,
-                        line_skip,
-                        paragraph,
-                        use_english_line_break,
-                    )
-                    if typeset_units:
-                        best_typeset_units = typeset_units
-                        best_scale = scale
-                    if all_units_fit:
+                if not is_figure_or_fallback:
+                    min_avail_y = self.get_max_bottom_space(box, page) + safety_margin
+                    if min_avail_y < box.y:
+                        expanded_box = Box(x=box.x, y=min_avail_y, x2=box.x2, y2=box.y2)
+                        box = expanded_box
                         if apply_layout:
-                            self._commit_layout_to_paragraph(paragraph, page, typeset_units, scale)
-                            final_typeset_units = typeset_units
-                        return scale, final_typeset_units
+                            paragraph.box = expanded_box
+                        typeset_units, all_units_fit = layout_units(
+                            typesetting_units,
+                            box,
+                            scale,
+                            line_skip,
+                            paragraph,
+                            use_english_line_break,
+                        )
+                        if typeset_units:
+                            best_typeset_units = typeset_units
+                            best_scale = scale
+                        if all_units_fit:
+                            if apply_layout:
+                                self._commit_layout_to_paragraph(paragraph, page, typeset_units, scale)
+                                final_typeset_units = typeset_units
+                            return scale, final_typeset_units
             except Exception:
                 pass
 
@@ -1755,6 +1777,12 @@ class Typesetting:
             for i, p_upper in para_map.items():
                 if not (p_upper.box and p_upper.box.y is not None):
                     continue
+                upper_label = (p_upper.layout_label or "").lower()
+                if (
+                    "fallback_line" in upper_label
+                    or self._is_inside_table_or_figure_region(p_upper.box, page, figures_only=True)
+                ):
+                    continue
 
                 # Calculate paragraph height and set required gap accordingly
                 para_height = p_upper.box.y2 - p_upper.box.y
@@ -1814,6 +1842,7 @@ class Typesetting:
             self.render_paragraph(paragraph, page, fonts)
         self._audit_arabic_font_ownership(page)
         self._resolve_rendered_text_collisions(page)
+        self._anchor_inline_highlight_curves(page)
         self._report_clipped_content(page)
         for paragraph, rules in header_rules:
             self._align_header_underlines(paragraph, rules, page.cropbox.box)
@@ -2016,7 +2045,7 @@ class Typesetting:
         while index < len(units):
             unit = units[index]
             char = unit.try_get_unicode() or ""
-            if not (char.isascii() and char.isalpha()):
+            if not char or char.isspace():
                 result.append(unit)
                 index += 1
                 continue
@@ -2057,6 +2086,9 @@ class Typesetting:
             and all(value is not None for value in (
                 paragraph.box.x, paragraph.box.y, paragraph.box.x2, paragraph.box.y2
             ))
+            and not self._is_inside_table_or_figure_region(
+                paragraph.box, page, figures_only=True
+            )
         ]
         if len(valid) < 2:
             self._vertical_collision_resolved_pages.add(page_key)
@@ -2268,6 +2300,205 @@ class Typesetting:
             logger.warning(
                 "Resolved %d rendered glyph collision(s) on page %s.", moved, page.page_number
             )
+
+    def _anchor_inline_highlight_curves(self, page: il_version_1.Page) -> None:
+        """Relocate inline background highlight rectangles from LTR source lines to RTL rendered lines.
+
+        Scientific figures and heatmaps (e.g., neuron activation visualizations)
+        often paint colored background rectangles behind specific words on 1-2
+        lines. When those sentences are translated into Arabic and laid out RTL,
+        the rendered lines move and right-align. This method deduplicates
+        stacked highlight curves and maps each contiguous highlight span from
+        its cumulative LTR position along the paragraph's source lines to the
+        corresponding cumulative RTL position along the paragraph's rendered
+        Arabic lines.
+        """
+        if not self._is_arabic_output() or not getattr(page, "pdf_curve", None):
+            return
+        page_key = id(page)
+        if page_key in self._inline_highlights_anchored_pages:
+            return
+        self._inline_highlights_anchored_pages.add(page_key)
+
+        candidate_curves = [
+            curve
+            for curve in page.pdf_curve
+            if curve.box is not None
+            and curve.fill_background
+            and not curve.stroke_path
+            and 0.5 <= (curve.box.x2 - curve.box.x) <= 220.0
+            and 3.0 <= (curve.box.y2 - curve.box.y) <= 18.0
+        ]
+        if not candidate_curves:
+            return
+
+        claimed_curve_ids: set[int] = set()
+        duplicate_curve_ids: set[int] = set()
+
+        for paragraph in page.pdf_paragraph or []:
+            trace = paragraph.pipeline_trace or {}
+            source_lines = list(trace.get("source_line_boxes") or [])
+            label = (paragraph.layout_label or "").lower()
+            in_figure = self._is_inside_table_or_figure_region(
+                paragraph.box, page, figures_only=True
+            )
+            if not in_figure and not any(
+                marker in label
+                for marker in ("fallback_line", "figure", "chart", "axis", "diagram")
+            ):
+                continue
+            if not source_lines:
+                if (
+                    paragraph.box is not None
+                    and 3.0 <= (paragraph.box.y2 - paragraph.box.y) <= 18.0
+                ):
+                    source_lines = [
+                        (paragraph.box.x, paragraph.box.y, paragraph.box.x2, paragraph.box.y2)
+                    ]
+                else:
+                    continue
+
+            # Collect rendered character boxes for this paragraph and cluster into visual lines
+            char_boxes: list[Box] = []
+            for comp in paragraph.pdf_paragraph_composition or []:
+                if comp.pdf_character and comp.pdf_character.box:
+                    if (comp.pdf_character.char_unicode or "").strip():
+                        char_boxes.append(comp.pdf_character.box)
+                elif comp.pdf_formula:
+                    for ch in comp.pdf_formula.pdf_character or []:
+                        if ch.box and (ch.char_unicode or "").strip():
+                            char_boxes.append(ch.box)
+            if not char_boxes:
+                continue
+
+            rendered_clusters: list[list[Box]] = []
+            for cbox in sorted(char_boxes, key=lambda b: (-b.y2, b.x)):
+                placed = False
+                ch_h = max(1.0, cbox.y2 - cbox.y)
+                for cluster in rendered_clusters:
+                    ref_y1 = min(b.y for b in cluster)
+                    ref_y2 = max(b.y2 for b in cluster)
+                    ref_h = max(1.0, ref_y2 - ref_y1)
+                    v_ov = min(cbox.y2, ref_y2) - max(cbox.y, ref_y1)
+                    if v_ov >= 0.35 * min(ch_h, ref_h) or abs(cbox.y - ref_y1) <= 3.0:
+                        cluster.append(cbox)
+                        placed = True
+                        break
+                if not placed:
+                    rendered_clusters.append([cbox])
+
+            rendered_lines: list[tuple[float, float, float, float]] = [
+                (
+                    min(b.x for b in cluster),
+                    min(b.y for b in cluster),
+                    max(b.x2 for b in cluster),
+                    max(b.y2 for b in cluster),
+                )
+                for cluster in rendered_clusters
+            ]
+            rendered_lines.sort(key=lambda r: -r[3])
+            if not rendered_lines:
+                continue
+
+            # Match candidate curves to each source line of this paragraph
+            line_curves: dict[int, list[PdfCurve]] = {i: [] for i in range(len(source_lines))}
+            seen_geom: set[tuple[float, float, float, float]] = set()
+            for curve in candidate_curves:
+                if id(curve) in claimed_curve_ids:
+                    continue
+                if curve.xobj_id != paragraph.xobj_id:
+                    continue
+                cbox = curve.box
+                ch_h = max(1.0, cbox.y2 - cbox.y)
+                best_line_idx = None
+                best_ov = 0.0
+                for idx, (sx1, sy1, sx2, sy2) in enumerate(source_lines):
+                    src_h = max(1.0, sy2 - sy1)
+                    v_ov = min(cbox.y2, sy2) - max(cbox.y, sy1)
+                    h_ov = min(cbox.x2, sx2 + 3.0) - max(cbox.x, sx1 - 3.0)
+                    if v_ov >= 0.45 * min(ch_h, src_h) and h_ov > 0.5:
+                        if v_ov > best_ov:
+                            best_ov = v_ov
+                            best_line_idx = idx
+                if best_line_idx is not None:
+                    claimed_curve_ids.add(id(curve))
+                    geom_key = (
+                        round(cbox.x, 1),
+                        round(cbox.y, 1),
+                        round(cbox.x2, 1),
+                        round(cbox.y2, 1),
+                    )
+                    if geom_key in seen_geom:
+                        duplicate_curve_ids.add(id(curve))
+                    else:
+                        seen_geom.add(geom_key)
+                        line_curves[best_line_idx].append(curve)
+
+            if not any(line_curves.values()):
+                continue
+
+            src_widths = [max(1.0, sx2 - sx1) for (sx1, sy1, sx2, sy2) in source_lines]
+            total_src_w = sum(src_widths)
+            dst_widths = [max(1.0, rx2 - rx1) for (rx1, ry1, rx2, ry2) in rendered_lines]
+            total_dst_w = sum(dst_widths)
+
+            for src_idx, curves_on_line in line_curves.items():
+                if not curves_on_line:
+                    continue
+                sx1, sy1, sx2, sy2 = source_lines[src_idx]
+                curves_on_line.sort(key=lambda c: c.box.x)
+
+                # Group horizontally contiguous character highlight curves into word/phrase spans
+                spans: list[list[PdfCurve]] = []
+                for curve in curves_on_line:
+                    if not spans or (curve.box.x - spans[-1][-1].box.x2) > 3.5:
+                        spans.append([curve])
+                    else:
+                        spans[-1].append(curve)
+
+                cum_src_before = sum(src_widths[:src_idx])
+                for span in spans:
+                    span_x1 = min(c.box.x for c in span)
+                    span_x2 = max(c.box.x2 for c in span)
+                    span_y1 = min(c.box.y for c in span)
+                    span_y2 = max(c.box.y2 for c in span)
+                    span_w = span_x2 - span_x1
+                    span_center_x = 0.5 * (span_x1 + span_x2)
+                    span_center_y = 0.5 * (span_y1 + span_y2)
+
+                    rel_src_x = min(max(0.0, span_center_x - sx1), src_widths[src_idx])
+                    u_center = (cum_src_before + rel_src_x) / total_src_w
+                    target_dist = u_center * total_dst_w
+
+                    # Locate the target rendered line and RTL offset along that line
+                    cum_dst = 0.0
+                    dst_idx = len(rendered_lines) - 1
+                    dist_in_line = dst_widths[-1]
+                    for k, dw in enumerate(dst_widths):
+                        if target_dist <= cum_dst + dw or k == len(dst_widths) - 1:
+                            dst_idx = k
+                            dist_in_line = min(max(0.0, target_dist - cum_dst), dw)
+                            break
+                        cum_dst += dw
+
+                    rx1, ry1, rx2, ry2 = rendered_lines[dst_idx]
+                    target_center_x = rx2 - dist_in_line
+                    if span_w >= (rx2 - rx1):
+                        target_x1 = rx1
+                    else:
+                        target_x1 = max(rx1, min(rx2 - span_w, target_center_x - 0.5 * span_w))
+                    target_center_y = 0.5 * (ry1 + ry2)
+
+                    dx = target_x1 - span_x1
+                    dy = target_center_y - span_center_y
+                    if abs(dx) > 0.1 or abs(dy) > 0.1:
+                        for curve in span:
+                            self._translate_rendered_curve(curve, dx=dx, dy=dy)
+
+        if duplicate_curve_ids:
+            page.pdf_curve = [
+                c for c in page.pdf_curve if id(c) not in duplicate_curve_ids
+            ]
 
     @staticmethod
     def _is_arabic_output_character(value: str | None) -> bool:
@@ -3808,8 +4039,8 @@ class Typesetting:
                 # Calculate total line width
                 visual_line_w = sum(u.width * scale for u in visual_units)
 
-                # Check horizontal overflow within table cell
-                if is_table_content and visual_line_w > (box.x2 - box.x) + 0.5:
+                # Check horizontal overflow within paragraph/cell box
+                if visual_line_w > (box.x2 - box.x) + 0.5:
                     all_units_fit = False
 
                 # Hanging indent on wrapped lines (line_idx >= 1) for bullets

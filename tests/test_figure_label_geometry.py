@@ -1,5 +1,6 @@
 from babeldoc.format.pdf.document_il.il_version_1 import (
-    Box, Cropbox, Page, PageLayout, PdfCharacter, PdfForm, PdfParagraph, PdfParagraphComposition,
+    Box, Cropbox, GraphicState, Page, PageLayout, PdfCharacter, PdfCurve,
+    PdfForm, PdfParagraph, PdfParagraphComposition,
 )
 from babeldoc.format.pdf.document_il.midend.typesetting import Typesetting
 from babeldoc.format.pdf.translation_config import TranslationConfig
@@ -78,3 +79,75 @@ def test_mirroring_keeps_text_clear_of_an_image_painted_later():
     image.render_order = 20
     image.xobj_id = 1
     assert ts._calculate_rtl_margin_shift(paragraph, page) == 194
+
+
+def test_inline_figure_highlight_moves_with_reflowed_rtl_text():
+    page = Page(cropbox=Cropbox(box=Box(0, 0, 600, 800)))
+    page.page_layout = [PageLayout(class_name="figure", box=Box(0, 100, 500, 600))]
+    paragraph = PdfParagraph(
+        layout_label="fallback_line",
+        box=Box(20, 300, 280, 314),
+        xobj_id=0,
+        pipeline_trace={"source_line_boxes": [[20, 300, 280, 314]]},
+    )
+    paragraph.pdf_paragraph_composition = [
+        PdfParagraphComposition(
+            pdf_character=PdfCharacter(
+                char_unicode=char,
+                box=Box(200 + index * 8, 300, 207 + index * 8, 314),
+                xobj_id=0,
+            )
+        )
+        for index, char in enumerate("اختبار")
+    ]
+    highlight = PdfCurve(
+        box=Box(40, 302, 80, 312),
+        graphic_state=GraphicState(),
+        fill_background=True,
+        stroke_path=False,
+        xobj_id=0,
+    )
+    duplicate = PdfCurve(
+        box=Box(40, 302, 80, 312),
+        graphic_state=GraphicState(),
+        fill_background=True,
+        stroke_path=False,
+        xobj_id=0,
+    )
+    page.pdf_paragraph = [paragraph]
+    page.pdf_curve = [highlight, duplicate]
+
+    typesetter()._anchor_inline_highlight_curves(page)
+
+    assert highlight.box.x > 200
+    assert len(page.pdf_curve) == 1
+
+
+def test_inline_highlight_in_ordinary_prose_is_not_repositioned():
+    page = Page(cropbox=Cropbox(box=Box(0, 0, 600, 800)))
+    paragraph = PdfParagraph(
+        layout_label="plain text",
+        box=Box(20, 300, 280, 314),
+        xobj_id=0,
+        pipeline_trace={"source_line_boxes": [[20, 300, 280, 314]]},
+        pdf_paragraph_composition=[
+            PdfParagraphComposition(
+                pdf_character=PdfCharacter(
+                    char_unicode="ا", box=Box(240, 300, 248, 314), xobj_id=0
+                )
+            )
+        ],
+    )
+    highlight = PdfCurve(
+        box=Box(40, 302, 80, 312),
+        graphic_state=GraphicState(),
+        fill_background=True,
+        stroke_path=False,
+        xobj_id=0,
+    )
+    page.pdf_paragraph = [paragraph]
+    page.pdf_curve = [highlight]
+
+    typesetter()._anchor_inline_highlight_curves(page)
+
+    assert (highlight.box.x, highlight.box.x2) == (40, 80)

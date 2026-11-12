@@ -5,8 +5,11 @@ import pytest
 from babeldoc.format.pdf.document_il.il_version_1 import (
     Box,
     PdfCharacter,
+    PdfLine,
     PdfParagraph,
     PdfParagraphComposition,
+    Page,
+    Cropbox,
     VisualBbox,
 )
 from babeldoc.format.pdf.document_il.midend.paragraph_finder import ParagraphFinder
@@ -84,3 +87,22 @@ def test_disjoint_visual_bounds_fall_back_to_source_bounds():
     char = glyph("A", 0, 0, visual_shift=20)
     finder = object.__new__(ParagraphFinder)
     assert finder._get_effective_y_bounds(char) == (0, 12)
+
+
+def test_doubled_fallback_stream_collapses_letters_numbers_and_punctuation():
+    text = "TThhee ssyysstteemm ccoossttss $$ 225500,,000000.."
+    chars = [glyph(value, index * 5, 0) for index, value in enumerate(text)]
+    line = PdfLine(pdf_character=chars, box=Box(0, 0, len(chars) * 5, 12))
+    paragraph = PdfParagraph(
+        layout_label="fallback_line",
+        box=Box(0, 0, len(chars) * 5, 12),
+        pdf_paragraph_composition=[PdfParagraphComposition(pdf_line=line)],
+    )
+    page = Page(cropbox=Cropbox(box=Box(0, 0, 600, 800)))
+    finder = object.__new__(ParagraphFinder)
+
+    finder._deduplicate_artificial_header_characters(paragraph, page)
+
+    assert "".join(char.char_unicode for char in line.pdf_character) == (
+        "The system costs $ 250,000."
+    )

@@ -214,9 +214,10 @@ def _restore_numerals(text: str, mapping: dict[str, str]) -> str:
         text = duplicate.sub(original, text)
 
     # Insert space between digits and Arabic-script letters (NOT Latin letters,
-    # to preserve codes like Q1, H2, P6, CHAPTER 03 from being split).
-    text = re.sub(r'(\d)([\u0600-\u06FF])', r'\1 \2', text)
-    text = re.sub(r'([\u0600-\u06FF])(\d)', r'\1 \2', text)
+    # and NOT Arabic percent/decimal punctuation \u0660-\u066D, to preserve
+    # codes like Q1, H2, P6, CHAPTER 03 and percentages like 20٪).
+    text = re.sub(r'(\d)([\u0621-\u064A\u066E-\u06D3\u06D5])', r'\1 \2', text)
+    text = re.sub(r'([\u0621-\u064A\u066E-\u06D3\u06D5])(\d)', r'\1 \2', text)
     # Remove stray spaces before punctuation
     text = re.sub(r'\s+([,.:;!?،؛])', r'\1', text)
     # Collapse any double spaces left by restoration
@@ -1122,6 +1123,7 @@ class NLLBTranslator(BaseTranslator):
             remaining = {tag: value for tag, value in mapping.items() if tag not in literal}
             try:
                 candidate = _restore_numerals(self._generate_translation(retry_text), remaining)
+                candidate = self._canonicalize_literal_values(candidate, literal.values())
             except Exception:
                 logger.warning("NLLB protected-content retry failed")
             else:
@@ -1136,7 +1138,27 @@ class NLLBTranslator(BaseTranslator):
         return first, False
 
     @staticmethod
+    def _canonicalize_literal_values(text: str, values) -> str:
+        """Canonicalize Arabic/spaced percentage and parenthetical forms back to source tokens."""
+        if not text:
+            return text
+        for value in set(values):
+            if value.endswith("%") and value[:-1].replace(".", "", 1).isdigit():
+                num = re.escape(value[:-1])
+                pct_pattern = re.compile(
+                    rf"(?<![A-Za-z_\d])(?:{num}\s*(?:[%\u066A]|في\s+المائة|بالمائة|بالمئة)|[%\u066A]\s*{num})(?![A-Za-z_\d])"
+                )
+                text = pct_pattern.sub(value, text)
+        return text
+
+    @staticmethod
     def _protected_value_count(text, value):
+        if value.endswith("%") and value[:-1].replace(".", "", 1).isdigit():
+            num = re.escape(value[:-1])
+            pct_pattern = re.compile(
+                rf"(?<![A-Za-z_\d])(?:{num}\s*(?:[%\u066A]|في\s+المائة|بالمائة|بالمئة)|[%\u066A]\s*{num})(?![A-Za-z_\d])"
+            )
+            return len(pct_pattern.findall(text))
         # Allow surrounding Arabic prose, but distinguish IBANX from IBAN and 13 from 3.
         left = r"(?<![A-Za-z_\d])" if value[0].isalnum() else ""
         right = r"(?![A-Za-z_\d])" if value[-1].isalnum() else ""

@@ -450,6 +450,23 @@ class ParagraphFinder:
             self.update_paragraph_data(paragraph, update_unicode=True)
             if fixed_table_box is not None:
                 paragraph.box = fixed_table_box
+            source_line_boxes = sorted(
+                [
+                    [
+                        comp.pdf_line.box.x,
+                        comp.pdf_line.box.y,
+                        comp.pdf_line.box.x2,
+                        comp.pdf_line.box.y2,
+                    ]
+                    for comp in (paragraph.pdf_paragraph_composition or [])
+                    if comp.pdf_line and comp.pdf_line.box
+                ],
+                key=lambda values: -values[3],
+            )
+            paragraph.pipeline_trace = {
+                **(paragraph.pipeline_trace or {}),
+                "source_line_boxes": source_line_boxes,
+            }
 
         # Section labels in government and financial PDFs are not reliably
         # bold.  Treat a short numbered label ("3.2 Validation", "2. Scope")
@@ -1093,13 +1110,22 @@ class ParagraphFinder:
                 continue
 
             cell_rows: list[list[Box]] = []
+            rule_xs = self._cluster_coordinates(
+                [(rule.x + rule.x2) / 2.0 for rule in vertical_rules]
+            )
             # Build rows from horizontal rules when they are available.  At a
             # row midpoint, only vertical rules crossing that midpoint are
             # boundaries.  This preserves merged header cells where an inner
             # vertical rule deliberately begins below the header.
-            ys = self._cluster_coordinates(
-                [(rule.y + rule.y2) / 2.0 for rule in horizontal_rules]
-            )
+            raw_ys = [(rule.y + rule.y2) / 2.0 for rule in horizontal_rules]
+            if len(rule_xs) == 1:
+                for idx_a, rule_a in enumerate(vertical_rules):
+                    for rule_b in vertical_rules[idx_a + 1:]:
+                        if abs(rule_a.y - rule_b.y2) <= 2.5:
+                            raw_ys.append((rule_a.y + rule_b.y2) / 2.0)
+                        elif abs(rule_b.y - rule_a.y2) <= 2.5:
+                            raw_ys.append((rule_b.y + rule_a.y2) / 2.0)
+            ys = self._cluster_coordinates(raw_ys)
             if len(ys) >= 2:
                 for y, y2 in zip(ys, ys[1:]):
                     if y2 - y < 3.0:
@@ -1192,6 +1218,13 @@ class ParagraphFinder:
                 continue
             paragraphs[:] = [p for p in paragraphs if p not in source_paragraphs]
 
+            preserve_unruled_matrix = (
+                len(rule_xs) == 1
+                and len(cell_rows) >= 3
+                and not self.translation_config.ocr_workaround
+            )
+            page_glyphs = {id(char) for char in page.pdf_character}
+
             for row_index, cells in enumerate(cell_rows):
                 for cell_index, source_cell in enumerate(cells):
                     chars = [
@@ -1200,6 +1233,17 @@ class ParagraphFinder:
                         if item[1] == row_index and item[2] == cell_index
                     ]
                     if not chars:
+                        continue
+                    if (
+                        preserve_unruled_matrix
+                        and cell_index == 1
+                        and (source_cell.x2 - source_cell.x)
+                        >= (table_box.x2 - table_box.x) * 0.55
+                    ):
+                        for char in chars:
+                            if id(char) not in page_glyphs:
+                                page.pdf_character.append(char)
+                                page_glyphs.add(id(char))
                         continue
                     # The original grid is part of the preserved base PDF
                     # operations. Keep its physical slots stable and apply RTL
@@ -2164,7 +2208,12 @@ class ParagraphFinder:
                 )
 
                 if should_split:
-                    if is_style_boundary and prev_is_bold:
+                    orig_label = (paragraph.layout_label or "").lower()
+                    is_diagram_or_fallback = (
+                        "fallback_line" in orig_label
+                        or (0.0 < prev_size <= 8.5)
+                    )
+                    if is_style_boundary and prev_is_bold and not is_diagram_or_fallback:
                         paragraph.layout_label = "heading"
                     # åˆ›å»ºæ–°çš„æ®µè½
                     new_paragraph = PdfParagraph(
@@ -2176,6 +2225,7 @@ class ParagraphFinder:
                         debug_id=generate_base58_id(),
                         layout_label=(
                             "list_item" if j in unmapped_list_rows
+                            else paragraph.layout_label if is_diagram_or_fallback
                             else "paragraph" if is_style_boundary else paragraph.layout_label
                         ),
                         layout_id=paragraph.layout_id,
@@ -2244,7 +2294,16 @@ class ParagraphFinder:
                     if any(
                         marker in label
                         for label in labels
-                        for marker in ("table", "heading", "title", "section")
+                        for marker in (
+                            "table",
+                            "heading",
+                            "title",
+                            "section",
+                            "fallback_line",
+                            "figure",
+                            "chart",
+                            "diagram",
+                        )
                     ):
                         continue
 
@@ -2401,7 +2460,7 @@ class ParagraphFinder:
                         continue
                     right_box = leading_line_box(right)
                     right_text = " ".join((right.unicode or "").split())
-                    if not right_text or not right_text[0].islower():
+                    if not right_text:
                         continue
                     left_height = max(1.0, left_box.y2 - left_box.y)
                     right_height = max(1.0, right_box.y2 - right_box.y)
@@ -2410,6 +2469,14 @@ class ParagraphFinder:
                         - (right_box.y + right_box.y2) / 2.0
                     )
                     horizontal_gap = right_box.x - left_box.x2
+                    is_proper_noun_tail = (
+                        right_text[0].isupper()
+                        and len(left_text.split()) >= 3
+                        and left_text[-1].islower()
+                        and -2.0 <= horizontal_gap <= 10.0
+                    )
+                    if not (right_text[0].islower() or is_proper_noun_tail):
+                        continue
                     if (
                         center_delta > max(2.5, min(left_height, right_height) * 0.35)
                         or not -2.0 <= horizontal_gap <= 18.0
@@ -2868,15 +2935,13 @@ class ParagraphFinder:
 
         for composition in paragraph.pdf_paragraph_composition:
             line = composition.pdf_line
-            if not line or not line.pdf_character or len(line.pdf_character) < 6:
+            if not line or not line.pdf_character or len(line.pdf_character) < 4:
                 continue
             raw_text = "".join(c.char_unicode or "" for c in line.pdf_character)
             compact_probe = re.sub(r"([A-Za-z])\1", r"\1", raw_text)
             looks_like_iban_banner = bool(
                 re.search(r"IBAN\s*Standards|IBAN.*Ver", compact_probe, re.I)
             )
-            if not is_header_band and not looks_like_iban_banner:
-                continue
 
             chars = list(line.pdf_character)
             if looks_like_iban_banner:
@@ -2917,7 +2982,7 @@ class ParagraphFinder:
             idx = 0
             while idx < len(chars):
                 ch_val = chars[idx].char_unicode or ""
-                if not (ch_val.isascii() and ch_val.isalpha()):
+                if not ch_val or ch_val.isspace():
                     deduped.append(chars[idx])
                     idx += 1
                     continue
