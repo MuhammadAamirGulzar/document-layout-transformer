@@ -5,11 +5,14 @@ import pytest
 from babeldoc.format.pdf.document_il.midend.il_translator import ILTranslator
 
 
-@pytest.fixture
-def translator():
+@pytest.fixture(
+    params=["facebook/nllb-200-distilled-600M", "facebook/nllb-200-3.3B"],
+    ids=["600m", "3.3b"],
+)
+def translator(request):
     il = object.__new__(ILTranslator)
     il.translate_engine = Mock(
-        model_name="facebook/nllb-200-distilled-600M",
+        model_name=request.param,
         src_nllb="eng_Latn",
         tgt_nllb="arb_Arab",
     )

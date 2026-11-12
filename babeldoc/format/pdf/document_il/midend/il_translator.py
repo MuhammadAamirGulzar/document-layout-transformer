@@ -758,7 +758,10 @@ class ILTranslator:
             if (
                 not is_toc_block
                 and (len(non_empty) == 1 or not is_short_labels)
-                and getattr(engine, "model_name", None) == "facebook/nllb-200-distilled-600M"
+                and getattr(engine, "model_name", None) in {
+                    "facebook/nllb-200-distilled-600M",
+                    "facebook/nllb-200-3.3B",
+                }
                 and getattr(engine, "src_nllb", None) == "eng_Latn"
                 and getattr(engine, "tgt_nllb", None) == "arb_Arab"
                 and (subtraction := _SUBTRACTION_INSTRUCTION.fullmatch(body))
