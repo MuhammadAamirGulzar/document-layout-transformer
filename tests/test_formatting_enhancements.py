@@ -67,6 +67,37 @@ def test_punctuation_bidi_locking():
     assert norm_3.endswith(":\u200F"), f"Expected RLM after colon in [{norm_3}]"
 
 
+def test_variation_selectors_do_not_require_standalone_font_glyphs():
+    """Presentation selectors must not abort translated PDF export."""
+    cfg = TranslationConfig(
+        translator=DummyTranslator(),
+        input_file="",
+        lang_in="en",
+        lang_out="ar",
+        doc_layout_model=None,
+    )
+    typesetting = Typesetting(cfg)
+    font = typesetting.font_mapper.base_font
+    paragraph = PdfParagraph(
+        xobj_id=-1,
+        pdf_paragraph_composition=[
+            PdfParagraphComposition(
+                pdf_same_style_unicode_characters=PdfSameStyleUnicodeCharacters(
+                    unicode="A\ufe0eB\ufe0fC\U000e0100",
+                    pdf_style=PdfStyle(font_id=font.font_id, font_size=10.0),
+                )
+            )
+        ],
+    )
+
+    units = typesetting.create_typesetting_units(
+        paragraph,
+        {font.font_id: font, **typesetting.font_mapper.fontid2font},
+    )
+
+    assert "".join(unit.unicode or "" for unit in units) == "ABC"
+
+
 def test_detached_leading_word_is_merged_before_translation():
     """A separately-painted first word must not become an orphan Arabic label."""
     lead = PdfParagraph(

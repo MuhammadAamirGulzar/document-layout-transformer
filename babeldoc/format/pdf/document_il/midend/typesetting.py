@@ -4105,6 +4105,16 @@ class Typesetting:
             """
             if len(value) != 1:
                 raise ValueError(f"Expected a single output character, got {value!r}")
+            codepoint = ord(value)
+            # Variation selectors change the presentation of the preceding
+            # character and do not render as standalone glyphs.  Requiring a
+            # target-font cmap entry for them makes otherwise valid translated
+            # text fail during export (for example, U+FE0F after a symbol).
+            if (
+                0xFE00 <= codepoint <= 0xFE0F
+                or 0xE0100 <= codepoint <= 0xE01EF
+            ):
+                return None, None
             if unicodedata.category(value) == "Cc":
                 return None, None
             is_arabic_target = len(value) == 1 and (
