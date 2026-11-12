@@ -943,18 +943,27 @@ class ParagraphFinder:
         """Keep numbered pseudocode at source coordinates when its region is identifiable."""
         control = re.compile(
             r"^(?:(?:function|procedure|def)\s+\w+\s*\(|"
-            r"(?:for|while)\b.+\bdo\b|if\b.+\bthen\b|end\s+(?:if|for|while|function|procedure)\b)",
+            r"(?:for|while)\b.+\bdo\b|(?:for|while)\b.+\b(?:in|to)\b|if\b.+\bthen\b|"
+            r"else\b|repeat\b|until\b|return\b|"
+            r"end\s+(?:if|for|while|function|procedure)\b)",
             re.IGNORECASE,
         )
         assignment = re.compile(r"←|:=|^\w+\s*=(?!=)")
-        number_prefix = re.compile(r"^(\d+)\s*[:.]\s*(?!\d)")
+        # LaTeX algorithmic blocks number lines as "1:", "1.", "1 for ..." or a
+        # bare gutter number extracted as its own line.
+        number_prefix = re.compile(r"^(\d+)(?:\s*[:.]\s*(?!\d)|\s+(?=\S)|\s*$)")
+        container_classes = {
+            "table", "wired_table", "wireless_table", "algorithm", "pseudocode", "code",
+            # The layout model has no algorithm class, so an algorithm is
+            # usually labelled as ordinary text, a figure or a formula.  The
+            # strict structure checks below decide whether it really is one.
+            "plain text", "text", "figure", "isolate_formula", "formula",
+        }
         preserved_ids = set()
         page_glyph_ids = {id(char) for char in page.pdf_character}
         for region in page.page_layout or []:
             box = region.box
-            if not box or (region.class_name or "").lower() not in {
-                "table", "wired_table", "wireless_table", "algorithm", "pseudocode", "code",
-            }:
+            if not box or (region.class_name or "").lower() not in container_classes:
                 continue
             members = []
             line_numbers = set()
@@ -985,7 +994,11 @@ class ParagraphFinder:
                     if assignment.search(text):
                         assignment_rows.add(round(line.box.y))
             has_sequence = any(n + 1 in line_numbers and n + 2 in line_numbers for n in line_numbers)
-            if not has_sequence or len(control_rows) < 2 or not assignment_rows:
+            if (
+                not has_sequence
+                or len(control_rows) < 2
+                or not (assignment_rows or len(control_rows) >= 3)
+            ):
                 continue
             for paragraph in members:
                 preserved_ids.add(id(paragraph))
@@ -1068,6 +1081,15 @@ class ParagraphFinder:
                 ):
                     horizontal_rules.append(box)
             if len(vertical_rules) < 2:
+                # Three-line ("booktabs") tables have horizontal rules only.
+                # There is no grid to rebuild, but each isolated number must
+                # still stay in its original row and column rather than be
+                # translated, reflowed or mirrored by RTL layout.
+                if (
+                    len(horizontal_rules) >= 2
+                    and not self.translation_config.ocr_workaround
+                ):
+                    self._preserve_numeric_table_values(page, paragraphs, table_box)
                 continue
 
             cell_rows: list[list[Box]] = []

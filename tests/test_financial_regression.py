@@ -372,7 +372,8 @@ def test_qcb_annex193_qa_report_fixes(translator_helper):
         ("مسؤولية البنك الوحيد ومباشرة من خلال المعالجة", "المسؤولية الحصرية للبنك والمعالجة المباشرة دون تدخل يدوي"),
     ]
     for raw_ar, expected_ar in terminology_cases:
-        actual_ar = translator_helper._normalize_arabic_output(raw_ar)
+        # Directional marks are layout metadata, not wording.
+        actual_ar = translator_helper._normalize_arabic_output(raw_ar).replace("\u200e", "").replace("\u200f", "")
         assert actual_ar == expected_ar, f"Expected [{expected_ar}], got [{actual_ar}]"
 
 

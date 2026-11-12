@@ -1,3 +1,4 @@
+import copy
 import io
 import itertools
 import logging
@@ -640,17 +641,25 @@ class PDFCreater:
             )
             font_size = style.font_size if (style and style.font_size) else 9.0
             char_w = max(font_size * 0.55, 4.0)
+            base_font = self.font_mapper.base_font
             for i, ch in enumerate(paragraph.unicode):
+                glyph_id = base_font.has_glyph(ord(ch)) if len(ch) == 1 else 0
+                if not glyph_id or ch.isspace():
+                    # Nothing drawable for this code point; never emit glyph 0.
+                    continue
                 char_box = il_version_1.Box(
                     x=box.x + i * char_w,
                     y=box.y,
                     x2=box.x + (i + 1) * char_w,
                     y2=box.y + font_size,
                 )
+                fallback_style = copy.copy(style)
+                fallback_style.font_id = base_font.font_id
                 pdf_char = il_version_1.PdfCharacter(
-                    unicode=ch,
+                    char_unicode=ch,
+                    pdf_character_id=glyph_id,
                     box=char_box,
-                    pdf_style=style,
+                    pdf_style=fallback_style,
                     xobj_id=paragraph.xobj_id if hasattr(paragraph, "xobj_id") else -1,
                 )
                 chars.append(pdf_char)

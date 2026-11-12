@@ -434,85 +434,12 @@ class ILTranslator:
         if m_date:
             return f"{_months_ar[m_date.group(1).lower()]} {m_date.group(2)}"
 
-        # Standardized QCB / IBAN technical headings & locked phrases
-        text = re.sub(
-            r'\bIBAN\s+Standards\s+Ver\.?\s*2\.?\s*0\s*[-–—]\s*QATAR\b',
-            'معايير IBAN الإصدار 2.0 - قطر',
-            text,
-            flags=re.I,
-        )
-        text = re.sub(r'\bQatar\s+Central\s+Bank\b', 'مصرف قطر المركزي', text, flags=re.I)
-        text = re.sub(
-            r'\bQatar\s+Automated\s+Clearing\s+House\b',
-            'غرفة المقاصة الآلية القطرية',
-            text,
-            flags=re.I,
-        )
-        text = re.sub(
-            r'\bCheck\s+Digit\s+Generation\s+and\s+Validation\b',
-            'توليد رقم التحقق والتحقق من صحته',
-            text,
-            flags=re.I,
-        )
-        text = re.sub(
-            r'\bCheck\s+Digit\s+Validation\b',
-            'التحقق من صحة رقم التحقق',
-            text,
-            flags=re.I,
-        )
-        text = re.sub(
-            r'\bCheck\s+Digit\s+Generation\b',
-            'توليد رقم التحقق',
-            text,
-            flags=re.I,
-        )
-        text = re.sub(
-            r'\bGeneration\s+of\s+IBAN\b',
-            'إنشاء رقم IBAN',
-            text,
-            flags=re.I,
-        )
-        text = re.sub(
-            r'\bSwift\s+Code\s+and\s+Identifier\b',
-            'رمز سويفت (SWIFT) ومعرّف البنك',
-            text,
-            flags=re.I,
-        )
-        text = re.sub(
-            r'\(\s*First\s+4\s+characters?\s+of\s+BIC\s*\)',
-            '(أول 4 أحرف من رمز BIC)',
-            text,
-            flags=re.I,
-        )
-        text = re.sub(
-            r'\(\s*e\.?g\.?\s+QA00\s+for\s+QATAR\s*\)',
-            '(مثل QA00 لدولة قطر)',
-            text,
-            flags=re.I,
-        )
-        text = re.sub(
-            r'\(\s*29\s+characters?\s+for\s+QATAR\s*\)',
-            '(29 حرفاً لدولة قطر)',
-            text,
-            flags=re.I,
-        )
-        text = re.sub(
-            r'\bStraight\s+Through\s+Processing\b',
-            'المعالجة المباشرة دون تدخل يدوي',
-            text,
-            flags=re.I,
-        )
-        text = re.sub(r'\bActing\s+Director\b', 'مدير بالإنابة', text, flags=re.I)
-        text = re.sub(r'\bPictorial\s+Flow\b', 'المخطط التوضيحي للتدفق', text, flags=re.I)
-        text = re.sub(r'\bUpdate\s+History\b', 'سجل التحديثات', text, flags=re.I)
-        text = re.sub(r'\bPresentation\s+Format\b', 'صيغة العرض', text, flags=re.I)
-        text = re.sub(r'\bInternational\s+Envelope\b', 'الغلاف الدولي', text, flags=re.I)
-        text = re.sub(r'\bFirst\s+Edition\b', 'الطبعة الأولى', text, flags=re.I)
-        text = re.sub(r'^\s*(\d+(?:\.\d+)*\.?\s+)Validation\s*$', r'\1التحقق من الصحة', text, flags=re.I)
-        if re.fullmatch(r'\s*Validation\s*', text, flags=re.I):
-            return 'التحقق من الصحة'
-        if re.fullmatch(r'\s*Edition\s*', text, flags=re.I):
-            return 'الطبعة'
+        # Domain (QCB / IBAN) phrase locking lives in domain_glossary.py
+        cfg = getattr(self, "translation_config", None)
+        lang_out = (getattr(cfg, "lang_out", "") or "").lower()
+        if any(marker in lang_out for marker in ("ar", "arabic", "ara")):
+            from babeldoc.format.pdf.document_il.midend.domain_glossary import apply_pre_glossary
+            text = apply_pre_glossary(text)
 
         # Financial rates and central banking terms
         text = re.sub(r'\b(?:The\s+)?QMR\s+Lending\s+Rate\b', 'سعر فائدة الإقراض في سوق قطر النقدي', text, flags=re.I)
@@ -962,36 +889,8 @@ class ILTranslator:
         text = re.sub(r'\bبيليومتر\b', 'برميل', text)
         text = re.sub(r'\bنقاط\s+(?:أوروبية|أرضية|أوراق)\b', 'نقطة أساس', text)
         text = re.sub(r'\bإعادة\s+التأمين\b', 'سعر الريبو', text)
-        text = re.sub(r'\bالبنك\s+المركزي\s+القطري\b', 'مصرف قطر المركزي', text)
-        text = re.sub(r'\bمركز\s+تصفية\s+قطر\s+الآلي\b', 'غرفة المقاصة الآلية القطرية', text)
-        text = re.sub(r'\bتطهير(ها|ه)\s+من\s+خلال\s+QATCH\b', r'مقاصت\1 عبر QATCH', text)
-        text = re.sub(r'\bالتحقق\s+من\s+تصحيح\s+الأرقام\b', 'التحقق من صحة رقم التحقق', text)
-        text = re.sub(r'\bالتحقق\s+من\s+الرقم\s+المالي\b', 'التحقق من صحة رقم التحقق', text)
-        text = re.sub(r'\bتوليد\s+الرقم\s+المالي\b', 'توليد رقم التحقق', text)
-        text = re.sub(r'(?<![\u0621-\u064A])([وبلكف]?)رقمي\s+الشيك\b', r'\1رقمي التحقق', text)
-        text = re.sub(r'(?<![\u0621-\u064A])([وبلكف]?)رقما\s+الشيك\b', r'\1رقما التحقق', text)
-        text = re.sub(r'(?<![\u0621-\u064A])([وبلكف]?)أرقام\s+الشيك(?:ات)?\b', r'\1أرقام التحقق', text)
-        text = re.sub(r'(?<![\u0621-\u064A])([وبلكف]?)رقم\s+الشيك\b', r'\1رقم التحقق', text)
-        text = re.sub(r'\bجيل\s+IBAN\b', 'إنشاء رقم IBAN', text)
-        text = re.sub(r'\bالرمز\s+السريع\s+وتعريف\s+سريع\b', 'رمز سويفت (SWIFT) ومعرّف البنك', text)
-        text = re.sub(r'\bالرمز\s+السريع\b', 'رمز سويفت (SWIFT)', text)
-        text = re.sub(r'\bتعريف\s+سريع\b', 'معرّف البنك', text)
-        text = re.sub(r'\bالتحقق\s+من\s+المصادقة\b', 'التحقق من الصحة', text)
-        text = re.sub(r'\b(?:استبعاد|استبعد|طرح)\s+الباقي\s+من\s+(\d+)\b', r'اطرح الباقي من \1', text)
-        text = re.sub(r'\b(?:الصفر|الأصفار)\s+الرائدة\b', 'الأصفار البادئة', text)
-        text = re.sub(r'\bالصفحة\s+اليسرى\s+مع\s+الصفر\b', 'تُملأ من اليسار بأصفار', text)
-        text = re.sub(r'\bرقم\s+متكامل\s+موقع\b', 'عدد صحيح ذو إشارة', text)
-        text = re.sub(r'\bالطلب\s+المصرفي\s+الرئيسي\b', 'النظام المصرفي الأساسي', text)
-        text = re.sub(r'\bرقم\s+الحساب\s+المصري\b', 'رقم الحساب المصرفي', text)
-        text = re.sub(r'\bحرف[اً]*\s+ألف[اً]*\s+للأرقام\b', 'حرفاً من الحروف والأرقام', text)
-        text = re.sub(r'\b(\d+\s+أو\s+\d+)\s+الأوراق\b', r'\1 رقماً', text)
-        text = re.sub(r'\bمسؤولية\s+البنك\s+الوحيد\b', 'المسؤولية الحصرية للبنك', text)
-        text = re.sub(r'\bمباشرة\s+من\s+خلال\s+المعالجة\b', 'المعالجة المباشرة دون تدخل يدوي', text)
-        text = re.sub(r'\bنائب\s+مدير\b', 'مدير بالإنابة', text)
-        text = re.sub(r'\bالتدفق\s+الرسمي\b', 'المخطط التوضيحي للتدفق', text)
-        text = re.sub(r'\bتحديث\s+التاريخ\b', 'سجل التحديثات', text)
-        text = re.sub(r'\bنموذج\s+العرض\b', 'صيغة العرض', text)
-        text = re.sub(r'\bالملف\s+الدولي\b', 'الغلاف الدولي', text)
+        from babeldoc.format.pdf.document_il.midend.domain_glossary import apply_post_glossary
+        text = apply_post_glossary(text)
 
         # Strip leaked English ordinal suffixes ("5th - 29th" -> "5 - 29") when
         # surrounded by Arabic prose so RTL layout does not detach "th"/"rd".

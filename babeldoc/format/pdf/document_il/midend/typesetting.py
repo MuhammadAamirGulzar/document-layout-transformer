@@ -1814,8 +1814,43 @@ class Typesetting:
             self.render_paragraph(paragraph, page, fonts)
         self._audit_arabic_font_ownership(page)
         self._resolve_rendered_text_collisions(page)
+        self._report_clipped_content(page)
         for paragraph, rules in header_rules:
             self._align_header_underlines(paragraph, rules, page.cropbox.box)
+
+    def _report_clipped_content(self, page: il_version_1.Page) -> list[str]:
+        """Warn about translated text that is omitted or drawn off the page.
+
+        This is a final, read-only check: it never moves anything.  It makes
+        silent loss visible in the job log instead of leaving it to be found in
+        the finished PDF.
+        """
+        problems: list[str] = []
+        crop = page.cropbox.box if page.cropbox and page.cropbox.box else None
+        for paragraph in page.pdf_paragraph or []:
+            label = getattr(paragraph, "debug_id", "?")
+            rendered = self._rendered_text_box(paragraph)
+            text = (paragraph.unicode or "").strip()
+            if rendered is None:
+                if text and not paragraph.vertical:
+                    problems.append(f"{label}: translated text has no rendered glyphs ({text[:30]!r})")
+                continue
+            if crop is None:
+                continue
+            tolerance = 1.0
+            if (
+                rendered.x < crop.x - tolerance
+                or rendered.x2 > crop.x2 + tolerance
+                or rendered.y < crop.y - tolerance
+                or rendered.y2 > crop.y2 + tolerance
+            ):
+                problems.append(f"{label}: rendered text leaves the page ({text[:30]!r})")
+        if problems:
+            logger.warning(
+                "Possible missing or clipped content on page %s: %s",
+                page.page_number, "; ".join(problems[:10]),
+            )
+        return problems
 
     def _shares_reflow_layer(self, first, second) -> bool:
         """Arabic reflow keeps independently painted PDF objects in their own lanes."""
@@ -2155,6 +2190,14 @@ class Typesetting:
             paragraph for paragraph in page.pdf_paragraph or []
             if not self._is_fixed_table_paragraph(paragraph)
             and self._rendered_text_box(paragraph) is not None
+            # Labels inside a chart are anchored to plotted data.  Pushing
+            # them down like body prose would cover bars, lines or ticks.
+            and not (
+                paragraph.box is not None
+                and self._is_inside_table_or_figure_region(
+                    paragraph.box, page, figures_only=True
+                )
+            )
         ]
         source_lanes = {
             id(paragraph): (paragraph.box.y, paragraph.box.y2)

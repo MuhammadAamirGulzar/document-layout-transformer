@@ -127,3 +127,26 @@ def test_grouped_table_header_renders_centered_in_its_slot():
 
     assert fits
     assert (units[0].box.x + units[-1].box.x2) / 2 == 60
+
+
+def test_three_line_table_without_vertical_rules_keeps_numbers_in_place():
+    page = Page(page_layout=[PageLayout(box=Box(0, 30, 120, 60), class_name="table")])
+    page.pdf_curve = [PdfCurve(box=Box(0, y, 120, y)) for y in (30, 52, 60)]
+    rows = [
+        source_line(value, x, y)
+        for y, values in [(40, ["0.91", "0.88"]), (34, ["0.77", "0.69"])]
+        for x, value in zip((30, 80), values)
+    ]
+    label, _ = source_line("Method", 4, 40)
+    body, _ = source_line("The report continues below.", 12, 10)
+    paragraphs = [p for p, _ in rows] + [label, body]
+    expected = [char for _, chars in rows for char in chars]
+    finder = object.__new__(ParagraphFinder)
+    finder.translation_config = SimpleNamespace(lang_out="ar", ocr_workaround=False)
+
+    finder.reconstruct_wired_table_cells(page, paragraphs)
+
+    assert [id(char) for char in page.pdf_character] == [id(char) for char in expected]
+    assert any(p is label for p in paragraphs)
+    assert any(p is body for p in paragraphs)
+    assert all(p is not source for p in paragraphs for source, _ in rows)

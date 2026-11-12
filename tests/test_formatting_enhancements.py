@@ -428,3 +428,32 @@ if __name__ == "__main__":
         print("ALL ADVANCED FORMATTING TESTS PASSED SUCCESSFULLY!")
     else:
         sys.exit(1)
+
+
+def test_clipped_content_report_flags_text_outside_the_page_and_missing_glyphs():
+    cfg = TranslationConfig(
+        translator=DummyTranslator(), input_file="", lang_in="en", lang_out="ar", doc_layout_model=None
+    )
+    ts = Typesetting(cfg)
+    page = Page(page_number=0, cropbox=Cropbox(box=Box(x=0.0, y=0.0, x2=100.0, y2=100.0)))
+    style = PdfStyle(font_id="base", font_size=10.0)
+    outside = PdfParagraph(
+        debug_id="off", unicode="outside", box=Box(x=10, y=10, x2=90, y2=20),
+        pdf_paragraph_composition=[PdfParagraphComposition(pdf_character=PdfCharacter(
+            char_unicode="A", box=Box(x=95, y=10, x2=120, y2=20), pdf_style=style,
+        ))],
+    )
+    missing = PdfParagraph(debug_id="gone", unicode="translated", box=Box(x=10, y=40, x2=90, y2=50))
+    inside = PdfParagraph(
+        debug_id="ok", unicode="fine", box=Box(x=10, y=60, x2=90, y2=70),
+        pdf_paragraph_composition=[PdfParagraphComposition(pdf_character=PdfCharacter(
+            char_unicode="B", box=Box(x=10, y=60, x2=20, y2=70), pdf_style=style,
+        ))],
+    )
+    page.pdf_paragraph.extend([outside, missing, inside])
+
+    problems = ts._report_clipped_content(page)
+
+    assert len(problems) == 2
+    assert any("off" in p and "leaves the page" in p for p in problems)
+    assert any("gone" in p and "no rendered glyphs" in p for p in problems)

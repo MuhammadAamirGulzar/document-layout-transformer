@@ -54,6 +54,11 @@ AUTHOR_YEAR_CITATION = re.compile(
 )
 
 _NUMERAL_PATTERN = re.compile(
+    # 0. Bibliographic atoms that must survive byte-for-byte: URLs, DOIs,
+    # and numeric bracket citations such as [12], [3, 7] or [4-9].
+    r'(https?://[^\s<>"\u201d\u2019]*[^\s<>"\u201d\u2019.,;:!?)\]]|www\.[^\s<>"\u201d\u2019]*[^\s<>"\u201d\u2019.,;:!?)\]])|'
+    r'(\b10\.\d{4,9}/[^\s<>"\u201d\u2019]*[^\s<>"\u201d\u2019.,;:!?)\]])|'
+    r'(\[\s*\d{1,3}(?:\s*[,\u2013\u2014-]\s*\d{1,3})*\s*\])|'
     rf"({AUTHOR_YEAR_CITATION.pattern})|"
     # 1. Parenthetical mixed tokens: (2018=100), (NDS3), (281211210/97 =62), (Chart 7-1)
     # Exclude prose parentheticals with lowercase words such as (First 4 character of BIC),

@@ -58,3 +58,18 @@ def test_keeps_ordinary_numbered_instructions_on_translation_path():
 
     assert paragraphs == original
     assert not page.pdf_character
+
+
+def test_preserves_algorithm_labelled_as_plain_text_with_bare_gutter_numbers():
+    page = Page(page_layout=[PageLayout(box=Box(0, 20, 170, 110), class_name="plain text")])
+    algorithm = [
+        source_line("1", 4, 95), source_line("for item in items do", 20, 95),
+        source_line("2", 4, 80), source_line("total := total + item", 36, 80),
+        source_line("3", 4, 65), source_line("end for", 20, 65),
+        source_line("4", 4, 50), source_line("return total", 20, 50),
+    ]
+    body = source_line("The discussion follows.", 10, 8)
+    paragraphs = algorithm + [body]
+    object.__new__(ParagraphFinder)._preserve_pseudocode_regions(page, paragraphs)
+
+    assert paragraphs == [body]
