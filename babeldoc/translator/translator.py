@@ -1135,7 +1135,47 @@ class NLLBTranslator(BaseTranslator):
 
         self._incomplete_blocks.inc()
         logger.warning("NLLB output is missing protected content. Check the translated block.")
-        return first, False
+        return self._retain_missing_protected_values(first, text, mapping, expected), False
+
+    def _retain_missing_protected_values(self, translated, source, mapping, expected):
+        """Keep exact non-sensitive values visible when both model attempts drop them.
+
+        A third model guess would still be unreliable. Append the exact source
+        values in an isolated parenthetical and leave the block marked
+        incomplete so a reviewer can check their intended placement.
+        """
+        retained = []
+        for value, expected_count in expected.items():
+            missing_count = expected_count - self._protected_value_count(
+                translated, value
+            )
+            if missing_count <= 0:
+                continue
+            compact_value = re.sub(r"\s+", "", value)
+            if _is_valid_bic(value) or _IBAN_PATTERN.fullmatch(compact_value):
+                continue
+
+            tags = [tag for tag, mapped in mapping.items() if mapped == value]
+            source_value = value
+            for tag in tags:
+                currency_match = re.search(
+                    rf"([€£¥$])\s*{re.escape(tag)}", source
+                )
+                if currency_match:
+                    source_value = f"{currency_match.group(1)} {value}"
+                    break
+            retained.extend([source_value] * missing_count)
+
+        if not retained:
+            return translated
+
+        literal_text = "، ".join(f"\u200e{value}\u200e" for value in retained)
+        stripped = translated.rstrip()
+        punctuation = re.search(r"([.!?؟،؛:]+)$", stripped)
+        if punctuation:
+            body = stripped[:punctuation.start()].rstrip()
+            return f"{body} ({literal_text}){punctuation.group(1)}"
+        return f"{stripped} ({literal_text})"
 
     @staticmethod
     def _canonicalize_literal_values(text: str, values) -> str:

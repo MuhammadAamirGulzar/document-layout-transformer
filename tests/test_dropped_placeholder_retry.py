@@ -60,7 +60,9 @@ def test_one_retry_restores_protected_content(make_engine, source, first, repair
 def test_bad_retry_keeps_the_first_output_and_flags_it(make_engine, candidate):
     retry = Mock(side_effect=candidate) if isinstance(candidate, Exception) else Mock(return_value=candidate)
     engine, cache = make_engine("احتفظ بنسخ.", retry)
-    assert engine.translate("Keep 3 copies.") == "احتفظ بنسخ."
+    result = engine.translate("Keep 3 copies.")
+    assert "احتفظ بنسخ" in result
+    assert engine._protected_value_count(result, "3") == 1
     retry.assert_called_once()
     assert engine.incomplete_count == 1
     assert engine.untranslated_count == 0
@@ -70,8 +72,24 @@ def test_bad_retry_keeps_the_first_output_and_flags_it(make_engine, candidate):
 def test_retry_cannot_drop_a_value_that_was_kept(make_engine):
     retry = Mock(return_value="انشر 3 مجموعات.")
     engine, cache = make_engine("توجيه {0}: انشر مجموعات.", retry)
-    assert engine.translate("QCB directive: publish 3 sets.") == "توجيه QCB: انشر مجموعات."
+    result = engine.translate("QCB directive: publish 3 sets.")
+    assert "توجيه QCB: انشر مجموعات" in result
+    assert engine._protected_value_count(result, "3") == 1
     retry.assert_called_once_with("{0} directive: publish 3 sets.")
+    assert engine.incomplete_count == 1
+    cache.set.assert_not_called()
+
+
+def test_failed_retry_retains_currency_and_exact_grouped_number(make_engine):
+    retry = Mock(return_value="تفكر الجامعة في تثبيت نظام.")
+    engine, cache = make_engine("تفكر الجامعة في تثبيت نظام.", retry)
+
+    result = engine.translate(
+        "The university is considering installing a $ 250,000 system."
+    )
+
+    assert "$ 250,000" in result
+    assert engine._protected_value_count(result, "250,000") == 1
     assert engine.incomplete_count == 1
     cache.set.assert_not_called()
 
