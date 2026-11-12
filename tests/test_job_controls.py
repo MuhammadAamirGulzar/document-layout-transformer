@@ -150,6 +150,26 @@ def test_timeout_uses_cooperative_stop(jobs, monkeypatch):
     scenario(go)
 
 
+def test_timeout_allows_jobs_that_keep_reporting_progress(jobs, monkeypatch):
+    monkeypatch.setenv("JOB_TIMEOUT_SECONDS", "0.08")
+
+    async def go():
+        session = {"status": "processing"}
+        server._job_event(session, {"type": "progress_update"})
+        watcher = asyncio.create_task(server._watch_job_deadline(session))
+        for current in range(3):
+            await asyncio.sleep(0.05)
+            server._job_event(
+                session,
+                {"type": "progress_update", "stage_current": current + 1},
+            )
+        assert session["status"] == "processing"
+        session["status"] = "completed"
+        await asyncio.wait_for(watcher, 0.2)
+
+    asyncio.run(go())
+
+
 def test_repeated_cancel_is_idempotent(jobs):
     sid = jobs()
     async def go(c):

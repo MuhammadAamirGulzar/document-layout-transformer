@@ -352,9 +352,10 @@ async def _acquire_job_slot(session):
 
 
 async def _watch_job_deadline(session):
-    deadline = time.monotonic() + _setting_seconds("JOB_TIMEOUT_SECONDS", 3600)
+    idle_limit = _setting_seconds("JOB_TIMEOUT_SECONDS", 3600)
     while session.get("status") not in _terminal_states:
-        if time.monotonic() >= deadline:
+        last_activity = session.get("_last_activity_at", time.monotonic())
+        if time.monotonic() - last_activity >= idle_limit:
             _request_stop(session, "timed_out")
             return
         await asyncio.sleep(0.05)
@@ -442,6 +443,10 @@ def _job_session(session_id):
 
 
 def _job_event(session, event):
+    # The timeout protects against a stalled engine.  Long documents that keep
+    # reporting progress must not be stopped only because their total runtime
+    # exceeds the configured interval.
+    session["_last_activity_at"] = time.monotonic()
     session["_event_id"] = session.get("_event_id", 0) + 1
     event = dict(event, event_id=session["_event_id"])
     history = session.setdefault("_events", [])
