@@ -71,6 +71,10 @@ _NUMERAL_PATTERN = re.compile(
     r'(\b[A-Z]{2}\d{2}(?:\s+[A-Z0-9]{4}){2,7}(?:\s+[A-Z0-9]{1,4})?\b)|'
     r'(\b[A-Z]{2}\d{2}[A-Z0-9]{11,30}\b)|'
     r'(\b(?=[A-Z0-9]{15,35}\b)(?=[A-Z0-9]*\d)[A-Z0-9]+\b)|'
+    # Compact identifiers must be protected before shorter prefixes or numbers.
+    r'((?<![\w\-\u2010\u2011])[A-Z][A-Z0-9]{1,9}[-\u2010\u2011][0-9]{2,6}'
+    r'(?:[.-][0-9]{1,6})*(?!\w|[-\u2010\u2011]\w|\.\d))|'
+
     # 6. SWIFT BIC codes embedded in text (8 or 11 uppercase chars): ABQQQAQAXXX, BBMEQAQXXXX, SCBLQAQXXXX
     r'(\b[A-Z]{4}[A-Z]{2}[A-Z0-9]{2}(?:[A-Z0-9]{3})?\b)|'
     # 7. Bank Identifiers (4-letter routing codes): BBME, QNBA, CBQA, DOHB, IBOQ, etc.
