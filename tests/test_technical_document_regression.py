@@ -343,6 +343,50 @@ class TestTechnicalDocumentRegression(unittest.TestCase):
         clusters = [glyph.cluster for glyph in shaped.glyphs]
         self.assertEqual(clusters, sorted(clusters, reverse=True))
 
+    def test_arabic_preflight_allows_mixed_symbols_and_checkbox_fallbacks(self):
+        """Mixed Arabic runs with checkboxes or stars must not fail GoNotoKurrent preflight."""
+        source_font = PdfFont(font_id="F1", name="Arial")
+        typesetting = Typesetting(self.cfg)
+        for mixed_text, expected_symbols in (
+            ("الاسم: كيف دفعت؟ ☐ نقدية ☑ بطاقة ☒ تحويل 1 2 3", ("□", "✓", "⊠")),
+            ("انظر الفقرة ¶ 2. الرموز: ★ ♥", ("★", "♥")),
+        ):
+            with self.subTest(mixed_text=mixed_text):
+                paragraph = PdfParagraph(
+                    box=Box(x=50.0, y=100.0, x2=400.0, y2=130.0),
+                    xobj_id=-1,
+                    pdf_paragraph_composition=[
+                        PdfParagraphComposition(
+                            pdf_same_style_unicode_characters=PdfSameStyleUnicodeCharacters(
+                                unicode=mixed_text,
+                                pdf_style=PdfStyle(font_id="F1", font_size=10.0),
+                            )
+                        )
+                    ],
+                )
+                units = typesetting.create_typesetting_units(
+                    paragraph,
+                    {"F1": source_font, **typesetting.font_mapper.fontid2font},
+                )
+                rendered_text = "".join(unit.unicode for unit in units)
+                self.assertTrue(units)
+                for expected_symbol in expected_symbols:
+                    self.assertIn(expected_symbol, rendered_text)
+                self.assertTrue(
+                    all(
+                        unit.font is not None and unit.font.has_glyph(ord(unit.unicode))
+                        for unit in units
+                        if unit.unicode
+                    )
+                )
+
+    def test_arabic_preflight_still_rejects_missing_arabic_glyphs(self):
+        """Arabic preflight must still raise when an Arabic glyph is missing from target font."""
+        typesetting = Typesetting(self.cfg)
+        non_arabic_font = typesetting.font_mapper.fonts["NotoSans-Regular.ttf"]
+        with self.assertRaises(RuntimeError):
+            typesetting._preflight_arabic_run("كيف دفعت؟ ★", non_arabic_font)
+
     def test_generated_arabic_never_inherits_source_han_font(self):
         """Resolver ownership must be Arabic target font, not source PDF font."""
         source_font = PdfFont(font_id="F1", name="SourceHanSerifCN-Regular")

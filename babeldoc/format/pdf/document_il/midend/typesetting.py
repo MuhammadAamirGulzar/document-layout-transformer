@@ -18,7 +18,7 @@ from babeldoc.format.pdf.document_il import PdfFormula
 from babeldoc.format.pdf.document_il import PdfParagraphComposition
 from babeldoc.format.pdf.document_il import PdfStyle
 from babeldoc.format.pdf.document_il import il_version_1
-from babeldoc.format.pdf.document_il.utils.fontmap import FontMapper
+from babeldoc.format.pdf.document_il.utils.fontmap import FontMapper, is_arabic_codepoint
 from babeldoc.format.pdf.document_il.utils.arabic_shaper import shape_arabic_run
 from babeldoc.format.pdf.document_il.utils.formular_helper import update_formula_data
 from babeldoc.format.pdf.document_il.utils.layout_helper import box_to_tuple
@@ -1274,6 +1274,17 @@ class Typesetting:
 
         return text
 
+    _SYMBOL_GLYPH_FALLBACKS = {
+        "\u2610": "\u25a1",  # ☐ -> □
+        "\u25fb": "\u25a1",  # ◻ -> □
+        "\u25fd": "\u25a1",  # ◽ -> □
+        "\u2611": "\u2713",  # ☑ -> ✓
+        "\u2714": "\u2713",  # ✔ -> ✓
+        "\u2612": "\u22a0",  # ☒ -> ⊠
+        "\u2715": "\u00d7",  # ✕ -> ×
+        "\u2717": "\u00d7",  # ✗ -> ×
+    }
+
     def _preflight_arabic_run(self, text: str, font: pymupdf.Font) -> None:
         """Validate contextual shaping against the actual embedded target font.
 
@@ -1283,16 +1294,16 @@ class Typesetting:
         """
         if not self.is_arabic or not text or not getattr(font, "font_path", None):
             return
-        # PUA symbols have source-font-specific semantics. They are canonicalized
-        # to U+2022 later by FontMapper; HarfBuzz must see the same portable text.
-        # Directional controls affect the renderer's later per-line BiDi pass and
-        # are intentionally excluded from this glyph-coverage-only check.
+        # Mixed paragraphs combine Arabic runs with Latin labels and symbols
+        # (such as checkbox glyphs or stars) that resolve_unicode maps to other
+        # target fonts later.  Only validate Arabic codepoints against the
+        # Arabic face while keeping word-boundary spaces for contextual shaping.
         preflight_text = "".join(
-            "•" if 0xE000 <= ord(char) <= 0xF8FF else char
+            char if is_arabic_codepoint(ord(char)) else " "
             for char in text
             if unicodedata.category(char) not in {"Cc", "Cf"}
         )
-        if not preflight_text:
+        if not preflight_text.strip():
             return
         try:
             shaped = shape_arabic_run(preflight_text, font.font_path)
@@ -4417,6 +4428,11 @@ class Typesetting:
                 target_font = self.font_mapper.map(source_font, normalized)
                 if target_font is not None:
                     return normalized, target_font
+            fallback_value = self._SYMBOL_GLYPH_FALLBACKS.get(value)
+            if fallback_value:
+                target_font = self.font_mapper.map(source_font, fallback_value)
+                if target_font is not None:
+                    return fallback_value, target_font
             message = (
                 f"No target-font coverage for {value!r} in paragraph "
                 f"{getattr(paragraph, 'debug_id', None) or '<unknown>'}"
@@ -4512,7 +4528,12 @@ class Typesetting:
                 font = get_font(font_id, paragraph_xobj_id)
                 if composition.pdf_same_style_unicode_characters.unicode:
                     unicode_text = composition.pdf_same_style_unicode_characters.unicode
-                    self._preflight_arabic_run(unicode_text, self.font_mapper.arabic_fonts[0] if self.is_arabic else font)
+                    preflight_font = (
+                        (self.font_mapper.map(font, "\u0627") or self.font_mapper.arabic_fonts[0])
+                        if self.is_arabic
+                        else font
+                    )
+                    self._preflight_arabic_run(unicode_text, preflight_font)
                     shaped_text = self.shape_arabic_text(unicode_text)
                     optical_factor = 1.08 if self.is_arabic else 1.0
                     target_font_size = self._arabic_publication_font_size(
