@@ -555,6 +555,7 @@ async def translation_job_status(session_id: str, after: int = 0):
     session = _job_session(session_id)
     if after < 0:
         raise HTTPException(status_code=400, detail="Event cursor must be non-negative")
+    untranslated_count, incomplete_count, dispositions = _session_quality_counts(session)
     return {
         "session_id": session_id,
         "status": session["status"],
@@ -563,11 +564,42 @@ async def translation_job_status(session_id: str, after: int = 0):
         "error": session.get("error"),
         "has_mono": bool(session.get("mono_output_path")),
         "has_dual": bool(session.get("dual_output_path")),
-        "untranslated_count": int(session.get("untranslated_count", 0)),
-        "incomplete_count": session.get("incomplete_count", 0),
+        "untranslated_count": untranslated_count,
+        "incomplete_count": incomplete_count,
+        "dispositions": dispositions,
+        "has_quality_report": bool(session.get("quality_report_path")),
         "events": _job_events_after(session, after),
         "next_event_id": session.get("_event_id", 0),
     }
+
+
+@app.get("/translate/report/{session_id}")
+async def translation_quality_report(session_id: str):
+    session = _job_session(session_id)
+    report_path = session.get("quality_report_path")
+    if report_path and Path(report_path).exists():
+        return JSONResponse(
+            content=json.loads(Path(report_path).read_text(encoding="utf-8"))
+        )
+    config = session.get("_config")
+    ledger = getattr(
+        getattr(config, "shared_context_cross_split_part", None),
+        "content_ledger",
+        None,
+    )
+    if ledger is not None:
+        return JSONResponse(
+            content=ledger.build_report(
+                input_file=getattr(config, "input_file", None),
+                lang_in=getattr(config, "lang_in", None),
+                lang_out=getattr(config, "lang_out", None),
+                engine_untranslated_count=_untranslated_count(config),
+                engine_incomplete_count=_incomplete_count(config),
+            )
+        )
+    if session.get("_quality_report_snapshot") is not None:
+        return JSONResponse(content=session["_quality_report_snapshot"])
+    raise HTTPException(status_code=404, detail="Quality report not found")
 
 
 @app.get("/translate/progress/{session_id}")
@@ -598,6 +630,44 @@ def _untranslated_count(config):
         return max(0, int(value))
     except (TypeError, ValueError):
         return 0
+
+
+def _incomplete_count(config):
+    """How many translated text blocks were incomplete. Never raises."""
+    try:
+        value = getattr(getattr(config, "translator", None), "incomplete_count", 0)
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _session_quality_counts(session):
+    """Return live or final (untranslated_count, incomplete_count, dispositions)."""
+    config = session.get("_config")
+    ledger = getattr(
+        getattr(config, "shared_context_cross_split_part", None),
+        "content_ledger",
+        None,
+    )
+    if ledger is not None:
+        snap = ledger.snapshot()
+        if snap["total_blocks"] > 0:
+            return (
+                snap["untranslated_count"],
+                snap["incomplete_count"],
+                snap["counts"],
+            )
+    if config is not None and session.get("status") not in _terminal_states:
+        return (
+            _untranslated_count(config),
+            _incomplete_count(config),
+            session.get("dispositions", {}),
+        )
+    return (
+        int(session.get("untranslated_count", 0)),
+        int(session.get("incomplete_count", 0)),
+        session.get("dispositions", {}),
+    )
 
 
 async def _translation_events(session):
@@ -655,6 +725,7 @@ async def _translation_events(session):
         )
 
         config._job_cancel_event = session["_cancel_signal"]
+        session["_config"] = config
 
         # Process translation and stream progress
         translate_result = None
@@ -742,14 +813,32 @@ async def _translation_events(session):
                 translate_result = event.get("translate_result")
                 session["result"] = translate_result
                 session["untranslated_count"] = _untranslated_count(config)
-                session["incomplete_count"] = getattr(
-                    getattr(config, "translator", None), "incomplete_count", 0
+                session["incomplete_count"] = _incomplete_count(config)
+                ledger = getattr(
+                    getattr(config, "shared_context_cross_split_part", None),
+                    "content_ledger",
+                    None,
+                )
+                if ledger is not None:
+                    snap = ledger.snapshot()
+                    if snap["total_blocks"] > 0:
+                        session["dispositions"] = snap["counts"]
+                        session["untranslated_count"] = snap["untranslated_count"]
+                        session["incomplete_count"] = snap["incomplete_count"]
+
+                output_directory = Path(session["output_directory"])
+                report_path = getattr(translate_result, "quality_report_path", None)
+                if not report_path or not Path(report_path).exists():
+                    fallback_report = output_directory / "quality_report.json"
+                    if fallback_report.exists():
+                        report_path = fallback_report
+                session["quality_report_path"] = (
+                    str(report_path) if report_path and Path(report_path).exists() else None
                 )
 
                 # Find output files (both mono and dual side-by-side)
                 mono_pdf = None
                 dual_pdf = None
-                output_directory = Path(session["output_directory"])
 
                 if translate_result:
                     if hasattr(translate_result, 'mono_pdf_path') and translate_result.mono_pdf_path:
@@ -812,6 +901,26 @@ async def _translation_events(session):
         session["status"] = "error"
         session["error"] = str(e)
         yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
+    finally:
+        cfg = session.pop("_config", None)
+        if cfg is not None:
+            ledger = getattr(
+                getattr(cfg, "shared_context_cross_split_part", None),
+                "content_ledger",
+                None,
+            )
+            if ledger is not None:
+                snap = ledger.snapshot()
+                if snap["total_blocks"] > 0:
+                    session.setdefault("dispositions", snap["counts"])
+                    if not session.get("quality_report_path"):
+                        session["_quality_report_snapshot"] = ledger.build_report(
+                            input_file=getattr(cfg, "input_file", None),
+                            lang_in=getattr(cfg, "lang_in", None),
+                            lang_out=getattr(cfg, "lang_out", None),
+                            engine_untranslated_count=_untranslated_count(cfg),
+                            engine_incomplete_count=_incomplete_count(cfg),
+                        )
 
 
 

@@ -527,6 +527,7 @@ class BaseTranslator(ABC):
 
     def _inc_incomplete_once(self):
         state = self._get_call_state()
+        state.para_incomplete = True
         if getattr(state, "incomplete_counted", False):
             return
         state.incomplete_counted = True
@@ -537,12 +538,28 @@ class BaseTranslator(ABC):
         blocks.inc()
 
     def _mark_call_failed(self):
-        self._get_call_state().failed = True
+        state = self._get_call_state()
+        state.failed = True
+        state.para_failed = True
 
     def _mark_call_incomplete(self):
         state = self._get_call_state()
         state.incomplete = True
+        state.para_incomplete = True
         self._inc_incomplete_once()
+
+    def _begin_paragraph_tracking(self):
+        state = self._get_call_state()
+        state.para_failed = False
+        state.para_incomplete = False
+
+    def _consume_paragraph_status(self) -> tuple[bool, bool]:
+        state = self._get_call_state()
+        failed = bool(getattr(state, "para_failed", False))
+        incomplete = bool(getattr(state, "para_incomplete", False))
+        state.para_failed = False
+        state.para_incomplete = False
+        return failed, incomplete
 
     def __del__(self):
         with contextlib.suppress(Exception):

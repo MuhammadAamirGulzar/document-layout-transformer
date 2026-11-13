@@ -40,6 +40,7 @@ from babeldoc.format.pdf.document_il.utils.paragraph_helper import (
 from babeldoc.format.pdf.document_il.utils.paragraph_helper import (
     is_pure_numeric_paragraph,
 )
+from babeldoc.format.pdf.document_il.utils.quality_report import detect_leaked_placeholders
 from babeldoc.format.pdf.document_il.utils.sentence_splitter import split_sentences
 from babeldoc.format.pdf.document_il.utils.style_helper import GRAY80
 from babeldoc.format.pdf.translation_config import TranslationConfig
@@ -49,6 +50,99 @@ from babeldoc.utils.priority_thread_pool_executor import PriorityThreadPoolExecu
 from arabic_reshaper import reshape
 
 logger = logging.getLogger(__name__)
+
+def _set_paragraph_skip_reason(paragraph: PdfParagraph, disposition: str, reason: str) -> None:
+    paragraph.pipeline_trace = {
+        **(paragraph.pipeline_trace or {}),
+        "skip_disposition": disposition,
+        "skip_reason": reason,
+    }
+
+
+def _missing_input_placeholders(translate_input, output: str) -> list[str]:
+    placeholders = getattr(translate_input, "placeholders", None) or []
+    if not placeholders:
+        return []
+    missing: list[str] = []
+    for placeholder in placeholders:
+        if isinstance(placeholder, FormulaPlaceholder):
+            if not re.search(placeholder.regex_pattern, output, flags=re.IGNORECASE):
+                missing.append(placeholder.placeholder)
+        else:
+            left_pat = getattr(placeholder, "left_regex_pattern", None)
+            right_pat = getattr(placeholder, "right_regex_pattern", None)
+            if left_pat and right_pat and not re.search(
+                f"{left_pat}.*?{right_pat}", output, flags=re.IGNORECASE | re.DOTALL
+            ):
+                missing.append(
+                    f"{getattr(placeholder, 'left_placeholder', '')}...{getattr(placeholder, 'right_placeholder', '')}"
+                )
+    return missing
+
+
+def _rendered_unicode_texts(paragraph: PdfParagraph) -> list[str]:
+    texts: list[str] = []
+    for comp in getattr(paragraph, "pdf_paragraph_composition", None) or []:
+        uni = getattr(comp, "pdf_same_style_unicode_characters", None)
+        if uni and uni.unicode:
+            texts.append(uni.unicode)
+    return texts
+
+
+def _record_paragraph_disposition(
+    translator,
+    paragraph: PdfParagraph,
+    page: Page | None,
+    disposition: str,
+    *,
+    reason: str | None = None,
+    source_text: str = "",
+    translated_text: str = "",
+    leaked_placeholders: list[str] | None = None,
+    missing_placeholders: list[str] | None = None,
+) -> None:
+    engine_obj = getattr(translator, "translate_engine", None)
+    engine_name = getattr(
+        engine_obj,
+        "name",
+        engine_obj.__class__.__name__ if engine_obj is not None else "",
+    )
+    lbl = getattr(paragraph, "layout_label", None) or "unknown"
+    leaked = list(leaked_placeholders or [])
+    missing = list(missing_placeholders or [])
+    paragraph.pipeline_trace = {
+        **(paragraph.pipeline_trace or {}),
+        "debug_id": getattr(paragraph, "debug_id", None),
+        "layout_label": lbl,
+        "engine": engine_name,
+        "disposition": disposition,
+        "reason": reason,
+        "source_len": len(source_text),
+        "trans_len": len(translated_text),
+        "is_pure_passthrough": _is_pure_passthrough(source_text) if source_text else False,
+        "leaked_placeholders": leaked,
+        "missing_placeholders": missing,
+    }
+    ledger = getattr(
+        getattr(getattr(translator, "translation_config", None), "shared_context_cross_split_part", None),
+        "content_ledger",
+        None,
+    )
+    if ledger is not None:
+        ledger.record(
+            block_key=id(paragraph),
+            page=getattr(page, "page_number", None) if page is not None else None,
+            debug_id=getattr(paragraph, "debug_id", None),
+            layout_label=lbl,
+            disposition=disposition,
+            reason=reason,
+            source_text=source_text,
+            translated_text=translated_text,
+            leaked_placeholders=leaked,
+            missing_placeholders=missing,
+            engine=engine_name,
+        )
+
 
 _INLINE_LIST_MARKER = re.compile(r"(?<!\S)\(([1-9][0-9]?)\)(?=\s)")
 
@@ -1535,12 +1629,14 @@ class ILTranslator:
     ):
         """Pre-translation processing: prepare text for translation."""
         if paragraph.vertical:
+            _set_paragraph_skip_reason(paragraph, "passthrough", "vertical_text")
             return None, None
         tracker.set_pdf_unicode(paragraph.unicode)
         if not self.support_llm_translate and self._is_file_inventory(paragraph.unicode or ""):
             # Keep the original compositions, including filename punctuation.
+            _set_paragraph_skip_reason(paragraph, "passthrough", "file_inventory")
             return None, None
-        if paragraph.xobj_id in xobj_font_map:
+        if xobj_font_map and paragraph.xobj_id in xobj_font_map:
             page_font_map = xobj_font_map[paragraph.xobj_id]
         disable_rich_text_translate = (
             self.translation_config.disable_rich_text_translate
@@ -1550,6 +1646,7 @@ class ILTranslator:
         layout_label = (paragraph.layout_label or "").lower()
         if "table_cell" in layout_label and re.fullmatch(r"[A-Z]", (paragraph.unicode or "").strip()):
             # Conversion-table letters and marks such as X are literal data.
+            _set_paragraph_skip_reason(paragraph, "passthrough", "table_cell_code")
             return None, None
         if any(
             marker in layout_label
@@ -1564,6 +1661,19 @@ class ILTranslator:
             paragraph, page_font_map, disable_rich_text_translate
         )
         if not translate_input:
+            is_formula_only = bool(
+                paragraph.pdf_paragraph_composition
+                and len(paragraph.pdf_paragraph_composition) == 1
+                and paragraph.pdf_paragraph_composition[0].pdf_formula
+            )
+            if (
+                is_pure_numeric_paragraph(paragraph)
+                or is_placeholder_only_paragraph(paragraph)
+                or is_formula_only
+            ):
+                _set_paragraph_skip_reason(paragraph, "passthrough", "numeric_or_formula_only")
+            else:
+                _set_paragraph_skip_reason(paragraph, "skipped-text-none", "empty_or_non_text_composition")
             return None, None
         if any(
             marker in layout_label
@@ -1582,6 +1692,7 @@ class ILTranslator:
             logger.debug(
                 f"Text too short to translate, skip. Text: {text}. Paragraph id: {paragraph.debug_id}."
             )
+            _set_paragraph_skip_reason(paragraph, "passthrough", "short_passthrough")
             return None, None
         return text, translate_input
 
@@ -1620,7 +1731,8 @@ class ILTranslator:
     ):
         """Post-translation processing: update paragraph with translated text."""
         tracker.set_output(translated_text)
-        if translated_text == translate_input:
+        source_cmp = getattr(translate_input, "unicode", translate_input)
+        if translated_text == source_cmp:
             if llm_translate_tracker := tracker.last_llm_translate_tracker():
                 llm_translate_tracker.set_placeholder_full_match()
             return False
@@ -1836,16 +1948,30 @@ Now, please carefully read the following text to be translated and directly outp
         """Translate a paragraph using pre and post processing functions."""
         self.translation_config.raise_if_cancelled()
         with PbarContext(pbar):
+            source_unicode = ""
             try:
                 if self.use_as_fallback:
                     # il translator llm only modifies unicode in some situations
                     paragraph.unicode = get_paragraph_unicode(paragraph)
-                source_unicode = paragraph.unicode
+                source_unicode = paragraph.unicode or ""
+                if isinstance(self.translate_engine, BaseTranslator):
+                    self.translate_engine._begin_paragraph_tracking()
+                before_untranslated = getattr(self.translate_engine, "untranslated_count", None)
+                before_incomplete = getattr(self.translate_engine, "incomplete_count", None)
                 # Pre-translation processing
                 text, translate_input = self.pre_translate_paragraph(
                     paragraph, tracker, page_font_map, xobj_font_map
                 )
                 if text is None:
+                    trace = paragraph.pipeline_trace or {}
+                    _record_paragraph_disposition(
+                        self,
+                        paragraph,
+                        page,
+                        trace.get("skip_disposition", "skipped-text-none"),
+                        reason=trace.get("skip_reason", "pre_translate_returned_none"),
+                        source_text=source_unicode,
+                    )
                     return
                 lbl = paragraph.layout_label or 'unknown'
                 logger.info(f"[{lbl}] Translating paragraph {paragraph.debug_id}: {text[:80] if text else ''}")
@@ -1929,34 +2055,129 @@ Now, please carefully read the following text to be translated and directly outp
                         index_reference = f"\u200e{index_reference}\u200e"
                     translated_text = f"{translated_text.rstrip()} {index_reference}"
 
-                # Attach diagnostic pipeline trace for paragraph routing analysis
-                engine_name = getattr(self.translate_engine, 'name', self.translate_engine.__class__.__name__)
-                paragraph.pipeline_trace = {
-                    **(paragraph.pipeline_trace or {}),
-                    "debug_id": paragraph.debug_id,
-                    "layout_label": lbl,
-                    "engine": engine_name,
-                    "source_len": len(text) if text else 0,
-                    "trans_len": len(translated_text) if translated_text else 0,
-                    "is_pure_passthrough": _is_pure_passthrough(text) if text else False,
-                }
-                logger.info(
-                    f"[TRACE P{paragraph.debug_id}] label='{lbl}' engine='{engine_name}' "
-                    f"in_len={len(text) if text else 0} out_len={len(translated_text) if translated_text else 0}"
-                )
+                if isinstance(self.translate_engine, BaseTranslator):
+                    para_failed, para_incomplete = self.translate_engine._consume_paragraph_status()
+                else:
+                    after_untranslated = getattr(self.translate_engine, "untranslated_count", None)
+                    after_incomplete = getattr(self.translate_engine, "incomplete_count", None)
+                    para_failed = (
+                        isinstance(before_untranslated, int)
+                        and not isinstance(before_untranslated, bool)
+                        and isinstance(after_untranslated, int)
+                        and not isinstance(after_untranslated, bool)
+                        and after_untranslated > before_untranslated
+                    )
+                    para_incomplete = (
+                        isinstance(before_incomplete, int)
+                        and not isinstance(before_incomplete, bool)
+                        and isinstance(after_incomplete, int)
+                        and not isinstance(after_incomplete, bool)
+                        and after_incomplete > before_incomplete
+                    )
+
+                if text.strip() and (not translated_text or not translated_text.strip()):
+                    logger.warning(
+                        "Empty translation output for paragraph %s; preserving source content.",
+                        paragraph.debug_id,
+                    )
+                    if not para_incomplete and isinstance(self.translate_engine, BaseTranslator):
+                        self.translate_engine._inc_incomplete_once()
+                    _record_paragraph_disposition(
+                        self,
+                        paragraph,
+                        page,
+                        "incomplete",
+                        reason="empty_translation",
+                        source_text=text,
+                        translated_text=translated_text or "",
+                    )
+                    return
 
                 # Post-translation processing
-                self.post_translate_paragraph(
+                post_ok = self.post_translate_paragraph(
                     paragraph, tracker, translate_input, translated_text
+                )
+                missing_placeholders = _missing_input_placeholders(translate_input, translated_text)
+                rendered_texts = _rendered_unicode_texts(paragraph)
+                if not getattr(translate_input, "placeholders", None):
+                    rendered_texts.append(translated_text)
+                leaked_placeholders = detect_leaked_placeholders(
+                    rendered_texts, source_unicode or text or ""
+                )
+                if missing_placeholders or leaked_placeholders:
+                    logger.warning(
+                        "Placeholder integrity issue in paragraph %s: missing=%s leaked=%s",
+                        paragraph.debug_id,
+                        missing_placeholders,
+                        leaked_placeholders,
+                    )
+
+                source_cmp = getattr(translate_input, "unicode", text) or text
+                if para_failed:
+                    disposition = "untranslated-exception"
+                    reason = "engine_error_fallback"
+                elif para_incomplete or missing_placeholders or leaked_placeholders:
+                    disposition = "incomplete"
+                    if missing_placeholders or leaked_placeholders:
+                        reason = "leaked_or_missing_placeholders"
+                    else:
+                        reason = "truncated_or_missing_protected_content"
+                    if not para_incomplete and isinstance(self.translate_engine, BaseTranslator):
+                        self.translate_engine._inc_incomplete_once()
+                elif _is_pure_passthrough(text):
+                    disposition = "passthrough"
+                    reason = "pure_passthrough_text"
+                elif (
+                    translated_text.strip() == source_cmp.strip()
+                    or post_ok is False
+                ):
+                    disposition = "unchanged"
+                    reason = "output_identical_to_source"
+                else:
+                    disposition = "translated"
+                    reason = None
+
+                _record_paragraph_disposition(
+                    self,
+                    paragraph,
+                    page,
+                    disposition,
+                    reason=reason,
+                    source_text=text,
+                    translated_text=translated_text,
+                    leaked_placeholders=leaked_placeholders,
+                    missing_placeholders=missing_placeholders,
+                )
+                engine_name = getattr(self.translate_engine, 'name', self.translate_engine.__class__.__name__)
+                logger.info(
+                    f"[TRACE P{paragraph.debug_id}] label='{lbl}' engine='{engine_name}' "
+                    f"disp='{disposition}' in_len={len(text) if text else 0} "
+                    f"out_len={len(translated_text) if translated_text else 0}"
                 )
             except ContentFilterError as e:
                 logger.warning(f"ContentFilterError: {e.message}")
                 self.add_content_filter_hint(page, paragraph)
                 self.translate_engine.untranslated_count = getattr(self.translate_engine, "untranslated_count", 0) + 1
+                _record_paragraph_disposition(
+                    self,
+                    paragraph,
+                    page,
+                    "content-filter",
+                    reason=str(e.message),
+                    source_text=source_unicode,
+                )
                 return
             except Exception as e:
                 logger.exception(
                     f"Error translating paragraph. Paragraph: {paragraph.debug_id} ({paragraph.unicode}). Error: {e}. ",
+                )
+                _record_paragraph_disposition(
+                    self,
+                    paragraph,
+                    page,
+                    "untranslated-exception",
+                    reason=str(e),
+                    source_text=source_unicode,
                 )
                 self.translate_engine.untranslated_count = getattr(self.translate_engine, "untranslated_count", 0) + 1
                 # ignore error and continue

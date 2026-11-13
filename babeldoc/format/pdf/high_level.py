@@ -783,6 +783,34 @@ def do_translate(
             logger.error(
                 f"Failed to migrate TOC from {translation_config.input_file}: {e}"
             )
+        ledger = getattr(
+            getattr(translation_config, "shared_context_cross_split_part", None),
+            "content_ledger",
+            None,
+        )
+        if ledger is not None:
+            try:
+                engine_obj = getattr(translation_config, "translator", None)
+                engine_name = getattr(
+                    engine_obj,
+                    "name",
+                    engine_obj.__class__.__name__ if engine_obj is not None else None,
+                )
+                raw_untr = getattr(engine_obj, "untranslated_count", None)
+                raw_inc = getattr(engine_obj, "incomplete_count", None)
+                report_path = translation_config.get_output_file_path("quality_report.json")
+                ledger.write_json(
+                    report_path,
+                    input_file=translation_config.input_file,
+                    lang_in=translation_config.lang_in,
+                    lang_out=translation_config.lang_out,
+                    engine=engine_name,
+                    engine_untranslated_count=raw_untr if isinstance(raw_untr, int) else None,
+                    engine_incomplete_count=raw_inc if isinstance(raw_inc, int) else None,
+                )
+                result.quality_report_path = report_path
+            except Exception as e:
+                logger.warning(f"Failed to write quality_report.json: {e}")
         pm.translate_done(result)
         return result
 

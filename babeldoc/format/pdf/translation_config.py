@@ -7,6 +7,7 @@ from collections import Counter
 from pathlib import Path
 
 from babeldoc.const import CACHE_FOLDER
+from babeldoc.format.pdf.document_il.utils.quality_report import ContentLedger
 from babeldoc.format.pdf.split_manager import BaseSplitStrategy
 from babeldoc.format.pdf.split_manager import PageCountStrategy
 from babeldoc.glossary import Glossary
@@ -32,6 +33,7 @@ class SharedContextCrossSplitPart:
         self.auto_extracted_glossary: Glossary | None = None
         self.raw_extracted_terms: list[tuple[str, str]] = []
         self.auto_enabled_ocr_workaround = False
+        self.content_ledger = ContentLedger()
 
     def initialize_glossaries(self, initial_glossaries: list[Glossary] | None):
         with self._lock:
@@ -463,12 +465,14 @@ class TranslateResult:
     no_watermark_dual_pdf_path: Path | None
     peak_memory_usage: int | None
     auto_extracted_glossary_path: Path | None
+    quality_report_path: Path | None
 
     def __init__(
         self,
         mono_pdf_path: Path | None,
         dual_pdf_path: Path | None,
         auto_extracted_glossary_path: Path | None = None,
+        quality_report_path: Path | None = None,
     ):
         self.mono_pdf_path = mono_pdf_path
         self.dual_pdf_path = dual_pdf_path
@@ -479,6 +483,7 @@ class TranslateResult:
         self.no_watermark_dual_pdf_path = dual_pdf_path
 
         self.auto_extracted_glossary_path = auto_extracted_glossary_path
+        self.quality_report_path = quality_report_path
 
     def __str__(self):
         """Return a human-readable string representation of the translation result."""
