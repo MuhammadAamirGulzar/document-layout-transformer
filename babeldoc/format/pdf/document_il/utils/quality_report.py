@@ -58,6 +58,27 @@ class ContentLedger:
         self._seq = 0
         self._glyph_substitutions: dict[tuple[str, str, str], int] = {}
         self._unsupported_glyph_count = 0
+        self._layout_issues: list[dict[str, Any]] = []
+
+    def record_layout_issue(
+        self,
+        *,
+        page: int | None,
+        kind: str,
+        detail: str,
+        debug_id: Any = None,
+        severity: str = "warning",
+    ) -> None:
+        """Record an unresolved layout, overflow, or clipping issue."""
+        item = {
+            "page": page,
+            "kind": kind,
+            "detail": detail,
+            "debug_id": debug_id,
+            "severity": severity,
+        }
+        with self._lock:
+            self._layout_issues.append(item)
 
     def record_glyph_substitutions(self, summary: dict[str, Any] | None) -> None:
         """Accumulate glyph substitution statistics from typesetter passes."""
@@ -151,7 +172,18 @@ class ContentLedger:
             entries = list(self._entries.values())
             glyph_items = dict(self._glyph_substitutions)
             unsupported_glyph_count = self._unsupported_glyph_count
+            layout_issues = list(self._layout_issues)
         summary = self.snapshot()
+        clipped_content_count = sum(
+            1
+            for issue in layout_issues
+            if issue.get("kind") in {
+                "clipped_or_missing",
+                "off_page",
+                "page_overflow_unpaginated",
+                "footnote_overflow",
+            }
+        )
         flagged = [
             entry
             for entry in entries
@@ -174,6 +206,7 @@ class ContentLedger:
             or (engine_untranslated_count or 0) > 0
             or (engine_incomplete_count or 0) > 0
             or unsupported_glyph_count > 0
+            or clipped_content_count > 0
         )
         glyph_by_reason: dict[str, int] = {}
         glyph_list = []
@@ -207,6 +240,8 @@ class ContentLedger:
                 "engine_incomplete_count": engine_incomplete_count,
                 "glyph_substitution_count": sum(glyph_items.values()),
                 "unsupported_glyph_count": unsupported_glyph_count,
+                "layout_issue_count": len(layout_issues),
+                "clipped_content_count": clipped_content_count,
             },
             "glyph_substitutions": {
                 "total_substitutions": sum(glyph_items.values()),
@@ -214,6 +249,7 @@ class ContentLedger:
                 "by_reason": glyph_by_reason,
                 "substitutions": glyph_list,
             },
+            "layout_issues": layout_issues,
             "flagged_blocks": flagged,
             "blocks": entries,
         }

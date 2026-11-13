@@ -34,6 +34,8 @@ class SharedContextCrossSplitPart:
         self.raw_extracted_terms: list[tuple[str, str]] = []
         self.auto_enabled_ocr_workaround = False
         self.content_ledger = ContentLedger()
+        self.continuation_pages: dict[int, int] = {}
+        self.layout_issues: list[dict] = []
 
     def initialize_glossaries(self, initial_glossaries: list[Glossary] | None):
         with self._lock:

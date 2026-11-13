@@ -894,12 +894,79 @@ class PDFCreater:
         # Restore graphics state
         draw_op.append(b" n Q\n")
 
+    def _ensure_continuation_pages_in_pdf(self, pdf: pymupdf.Document) -> None:
+        """Insert blank PyMuPDF pages with initialized /Resources/Font for continuation IL pages."""
+        if not any(getattr(p, "continuation_of_page", None) is not None for p in self.docs.page):
+            return
+        for idx, il_page in enumerate(self.docs.page):
+            if il_page.page_number != idx:
+                il_page.page_number = idx
+            if (
+                getattr(il_page, "continuation_of_page", None) is not None
+                and pdf.page_count < len(self.docs.page)
+            ):
+                crop = (
+                    il_page.cropbox.box
+                    if il_page.cropbox and il_page.cropbox.box
+                    else (
+                        il_page.mediabox.box
+                        if il_page.mediabox and il_page.mediabox.box
+                        else None
+                    )
+                )
+                width = max(1.0, crop.x2 - crop.x) if crop else 595.0
+                height = max(1.0, crop.y2 - crop.y) if crop else 842.0
+                new_page = pdf.new_page(pno=idx, width=width, height=height)
+                try:
+                    res_type, res_val = pdf.xref_get_key(new_page.xref, "Resources")
+                    if res_type == "null":
+                        pdf.xref_set_key(new_page.xref, "Resources", "<< /Font << >> >>")
+                    elif res_type == "dict":
+                        font_type, _ = pdf.xref_get_key(new_page.xref, "Resources/Font")
+                        if font_type == "null":
+                            pdf.xref_set_key(new_page.xref, "Resources/Font", "<< >>")
+                    elif res_type == "xref":
+                        match = re.search(r"(\d+)\s+0\s+R", res_val)
+                        if match:
+                            res_xref = int(match.group(1))
+                            font_type, _ = pdf.xref_get_key(res_xref, "Font")
+                            if font_type == "null":
+                                pdf.xref_set_key(res_xref, "Font", "<< >>")
+                except Exception:
+                    logger.debug("Failed to pre-initialize Resources/Font on continuation page %s", idx)
+
+    def _aligned_dual_page_pairs(
+        self,
+        original_count: int,
+        translated_count: int,
+    ) -> list[tuple[int | None, int]]:
+        """Map translated page indices (including continuation pages) to original page indices."""
+        docs = getattr(self, "docs", None)
+        if not docs or not docs.page or len(docs.page) != translated_count:
+            total = max(original_count, translated_count)
+            return [
+                (i if i < original_count else None, i)
+                for i in range(translated_count)
+            ] if total else []
+
+        pairs: list[tuple[int | None, int]] = []
+        orig_cursor = 0
+        for trans_idx, il_page in enumerate(docs.page):
+            if getattr(il_page, "continuation_of_page", None) is not None:
+                pairs.append((None, trans_idx))
+            else:
+                orig_idx = orig_cursor if orig_cursor < original_count else None
+                pairs.append((orig_idx, trans_idx))
+                orig_cursor += 1
+        return pairs
+
     def create_side_by_side_dual_pdf(
         self,
         original_pdf: pymupdf.Document,
         translated_pdf: pymupdf.Document,
         dual_out_path: str,
         translation_config: TranslationConfig,
+        aligned_pairs: list[tuple[int | None, int]] | None = None,
     ) -> pymupdf.Document:
         """Create a dual PDF with side-by-side pages (original and translation).
 
@@ -914,22 +981,31 @@ class PDFCreater:
         """
         # Create a new PDF for side-by-side pages
         dual = pymupdf.open()
-        page_count = min(original_pdf.page_count, translated_pdf.page_count)
+        pairs = aligned_pairs or self._aligned_dual_page_pairs(
+            original_pdf.page_count, translated_pdf.page_count,
+        )
 
-        for page_id in range(page_count):
-            # Get pages from both PDFs
-            orig_page = original_pdf[page_id]
-            trans_page = translated_pdf[page_id]
-            rotate_angle = orig_page.rotation
-            total_width = orig_page.rect.width + trans_page.rect.width
-            max_height = max(orig_page.rect.height, trans_page.rect.height)
+        for orig_id, trans_id in pairs:
+            trans_page = translated_pdf[trans_id]
+            if orig_id is not None:
+                orig_page = original_pdf[orig_id]
+                rotate_angle = orig_page.rotation
+                orig_w = orig_page.rect.width
+                orig_h = orig_page.rect.height
+                orig_page.set_rotation(0)
+            else:
+                rotate_angle = 0
+                orig_w = trans_page.rect.width
+                orig_h = trans_page.rect.height
+
+            total_width = orig_w + trans_page.rect.width
+            max_height = max(orig_h, trans_page.rect.height)
             left_width = (
-                orig_page.rect.width
+                orig_w
                 if not translation_config.dual_translate_first
                 else trans_page.rect.width
             )
 
-            orig_page.set_rotation(0)
             trans_page.set_rotation(0)
 
             # Create new page with combined width
@@ -943,35 +1019,36 @@ class PDFCreater:
             if translation_config.dual_translate_first:
                 # Show translated page on left and original on right
                 rect_left, rect_right = rect_right, rect_left
-            try:
-                # Show original page on left and translated on right (default)
-                dual_page.show_pdf_page(
-                    rect_left,
-                    original_pdf,
-                    page_id,
-                    keep_proportion=True,
-                    rotate=-rotate_angle,
-                )
-            except Exception as e:
-                logger.warning(
-                    f"Failed to show original page on left and translated on right (default). "
-                    f"Page ID: {page_id}. "
-                    f"Original PDF: {self.original_pdf_path}. "
-                    f"Translated PDF: {translation_config.input_file}. ",
-                    exc_info=e,
-                )
+            if orig_id is not None:
+                try:
+                    # Show original page on left and translated on right (default)
+                    dual_page.show_pdf_page(
+                        rect_left,
+                        original_pdf,
+                        orig_id,
+                        keep_proportion=True,
+                        rotate=-rotate_angle,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to show original page on left and translated on right (default). "
+                        f"Page ID: {orig_id}. "
+                        f"Original PDF: {self.original_pdf_path}. "
+                        f"Translated PDF: {translation_config.input_file}. ",
+                        exc_info=e,
+                    )
             try:
                 dual_page.show_pdf_page(
                     rect_right,
                     translated_pdf,
-                    page_id,
+                    trans_id,
                     keep_proportion=True,
                     rotate=-rotate_angle,
                 )
             except Exception as e:
                 logger.warning(
                     f"Failed to show translated page on left and original on right. "
-                    f"Page ID: {page_id}. "
+                    f"Page ID: {trans_id}. "
                     f"Original PDF: {self.original_pdf_path}. "
                     f"Translated PDF: {translation_config.input_file}. ",
                     exc_info=e,
@@ -989,12 +1066,45 @@ class PDFCreater:
         try:
             if selected_pages is not None:
                 original_pdf.select(selected_pages)
+            aligned_pairs = self._aligned_dual_page_pairs(
+                original_pdf.page_count, translated_pdf.page_count,
+            )
+            docs = getattr(self, "docs", None)
+            if selected_pages is not None and docs is not None and any(
+                getattr(p, "continuation_of_page", None) is not None
+                for p in (docs.page or [])
+            ):
+                selected_set = set(selected_pages)
+                kept_trans = []
+                for idx, il_page in enumerate(docs.page):
+                    src_orig = (
+                        il_page.continuation_of_page
+                        if il_page.continuation_of_page is not None
+                        else idx - sum(
+                            1
+                            for prev in docs.page[:idx]
+                            if getattr(prev, "continuation_of_page", None) is not None
+                        )
+                    )
+                    if src_orig in selected_set:
+                        kept_trans.append(il_page)
+                aligned_pairs = []
+                orig_cursor = 0
+                for trans_idx, il_page in enumerate(kept_trans):
+                    if getattr(il_page, "continuation_of_page", None) is not None:
+                        aligned_pairs.append((None, trans_idx))
+                    else:
+                        orig_idx = orig_cursor if orig_cursor < original_pdf.page_count else None
+                        aligned_pairs.append((orig_idx, trans_idx))
+                        orig_cursor += 1
             if translation_config.use_alternating_pages_dual:
                 return self.create_alternating_pages_dual_pdf(
                     original_pdf, translated_pdf, translation_config,
+                    aligned_pairs=aligned_pairs,
                 )
             dual = self.create_side_by_side_dual_pdf(
                 original_pdf, translated_pdf, dual_out_path, translation_config,
+                aligned_pairs=aligned_pairs,
             )
         except BaseException:
             original_pdf.close()
@@ -1007,6 +1117,7 @@ class PDFCreater:
         original_pdf: pymupdf.Document,
         translated_pdf: pymupdf.Document,
         translation_config: TranslationConfig,
+        aligned_pairs: list[tuple[int | None, int]] | None = None,
     ) -> pymupdf.Document:
         """Create a dual PDF with alternating pages (original and translation).
 
@@ -1018,18 +1129,41 @@ class PDFCreater:
         Returns:
             The created dual PDF document
         """
-        # Open the original PDF and insert translated PDF
-        dual = original_pdf
-        dual.insert_file(translated_pdf)
+        pairs = aligned_pairs or self._aligned_dual_page_pairs(
+            original_pdf.page_count, translated_pdf.page_count,
+        )
+        if (
+            original_pdf.page_count == translated_pdf.page_count
+            and len(pairs) == original_pdf.page_count
+            and all(orig_id is not None for orig_id, _ in pairs)
+        ):
+            # Fast path when page counts match 1:1
+            dual = original_pdf
+            dual.insert_file(translated_pdf)
 
-        # Rearrange pages to alternate between original and translated
-        page_count = translated_pdf.page_count
-        for page_id in range(page_count):
-            current = page_count + page_id
-            target = page_id * 2 + int(not translation_config.dual_translate_first)
-            if current != target:
-                dual.move_page(current, target)
+            page_count = translated_pdf.page_count
+            for page_id in range(page_count):
+                current = page_count + page_id
+                target = page_id * 2 + int(not translation_config.dual_translate_first)
+                if current != target:
+                    dual.move_page(current, target)
+            return dual
 
+        dual = pymupdf.open()
+        for orig_id, trans_id in pairs:
+            trans_rect = translated_pdf[trans_id].rect
+            if translation_config.dual_translate_first:
+                dual.insert_pdf(translated_pdf, from_page=trans_id, to_page=trans_id)
+                if orig_id is not None:
+                    dual.insert_pdf(original_pdf, from_page=orig_id, to_page=orig_id)
+                else:
+                    dual.new_page(width=trans_rect.width, height=trans_rect.height)
+            else:
+                if orig_id is not None:
+                    dual.insert_pdf(original_pdf, from_page=orig_id, to_page=orig_id)
+                else:
+                    dual.new_page(width=trans_rect.width, height=trans_rect.height)
+                dual.insert_pdf(translated_pdf, from_page=trans_id, to_page=trans_id)
         return dual
 
     def write_debug_info(
@@ -1387,6 +1521,7 @@ class PDFCreater:
                 f"{basename}{debug_suffix}.{translation_config.lang_out}.mono.pdf",
             )
             pdf = pymupdf.open(self.original_pdf_path)
+            self._ensure_continuation_pages_in_pdf(pdf)
             self.font_mapper.add_font(pdf, self.docs)
             
             with self.translation_config.progress_monitor.stage_start(
@@ -1442,14 +1577,21 @@ class PDFCreater:
 
             selected_pages = None
             if translation_config.only_include_translated_page:
-                selected_pages = sorted({
-                    page.page_number
-                    for page in self.docs.page
-                    if self.translation_config.should_translate_page(
-                        page.page_number + 1
-                    )
-                })
-                pdf.select(selected_pages)
+                selected_orig_pages: list[int] = []
+                selected_trans_pages: list[int] = []
+                orig_cursor = 0
+                for page in self.docs.page:
+                    if getattr(page, "continuation_of_page", None) is not None:
+                        src_orig = page.continuation_of_page
+                        if self.translation_config.should_translate_page(src_orig + 1):
+                            selected_trans_pages.append(page.page_number)
+                    else:
+                        if self.translation_config.should_translate_page(orig_cursor + 1):
+                            selected_orig_pages.append(orig_cursor)
+                            selected_trans_pages.append(page.page_number)
+                        orig_cursor += 1
+                selected_pages = sorted(set(selected_orig_pages))
+                pdf.select(sorted(set(selected_trans_pages)))
 
             # Add detailed logging before saving
             if self.detailed_logger:

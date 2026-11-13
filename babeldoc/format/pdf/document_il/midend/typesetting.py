@@ -926,6 +926,10 @@ class Typesetting:
         self._glyph_substitutions: dict[tuple[str, str, str], int] = {}
         self._unsupported_glyph_count: int = 0
         self._skipped_format_chars: dict[str, int] = {}
+        self._footnote_zone_stabilized_pages: set[int] = set()
+        self._layout_issues: list[dict[str, object]] = []
+        self._reported_layout_issue_keys: set[tuple[object, ...]] = set()
+        self._in_typesetting_document: bool = False
 
     def _is_centered_display_text(self, paragraph, page) -> bool:
         """Recognize large centered titles even when labeled as plain text."""
@@ -1164,6 +1168,7 @@ class Typesetting:
             # otherwise body expansion begins inside the label and the two
             # Arabic runs are committed on the same baseline.
             self._reserve_heading_clearance_from_tables(page)
+            self._stabilize_footnote_zone(page)
             self._resolve_vertical_paragraph_collisions(page)
 
             # Preprocess each paragraph
@@ -1643,7 +1648,7 @@ class Typesetting:
         # before any scale reduction — this preserves full-size type for titles/captions when free space exists below.
         if not is_figure_or_fallback:
             try:
-                min_avail_y = self.get_max_bottom_space(box, page) + safety_margin
+                min_avail_y = self.get_max_bottom_space(box, page, paragraph=paragraph) + safety_margin
                 if min_avail_y < box.y:
                     expanded_box = Box(x=box.x, y=min_avail_y, x2=box.x2, y2=box.y2)
                     box = expanded_box
@@ -1695,7 +1700,7 @@ class Typesetting:
 
                 # Re-check bottom space expansion at this reduced scale
                 if not is_figure_or_fallback:
-                    min_avail_y = self.get_max_bottom_space(box, page) + safety_margin
+                    min_avail_y = self.get_max_bottom_space(box, page, paragraph=paragraph) + safety_margin
                     if min_avail_y < box.y:
                         expanded_box = Box(x=box.x, y=min_avail_y, x2=box.x2, y2=box.y2)
                         box = expanded_box
@@ -1772,14 +1777,18 @@ class Typesetting:
                 use_english_line_break=False,
             )
             if typeset_units:
-                min_unit_y = min((u.box.y for u in typeset_units if u.box and u.box.y is not None), default=box.y)
-                safe_bottom = self.get_max_bottom_space(box, page) + safety_margin
-                if min_unit_y < safe_bottom:
-                    delta = safe_bottom - min_unit_y
-                    typeset_units = self._shift_laid_out_units_vertically(
-                        typeset_units, delta
-                    )
-                    min_unit_y = safe_bottom
+                unit_boxes = [u.box for u in typeset_units if u.box and u.box.y is not None]
+                min_unit_y = min((b.y for b in unit_boxes), default=box.y)
+                max_unit_y2 = max((b.y2 for b in unit_boxes if b.y2 is not None), default=box.y2)
+                safe_bottom = self.get_max_bottom_space(box, page, paragraph=paragraph) + safety_margin
+                if min_unit_y < safe_bottom and safe_bottom < box.y2:
+                    headroom = max(0.0, box.y2 - max_unit_y2)
+                    delta = min(safe_bottom - min_unit_y, headroom)
+                    if delta > 0.0:
+                        typeset_units = self._shift_laid_out_units_vertically(
+                            typeset_units, delta
+                        )
+                        min_unit_y += delta
                 if min_unit_y < paragraph.box.y:
                     paragraph.box = Box(
                         x=paragraph.box.x,
@@ -1840,15 +1849,30 @@ class Typesetting:
         if self.detailed_logger:
             self.detailed_logger.log_step("Typesetting Started")
         
-        # Batch preprocess document - calculate optimal scale for each paragraph
-        if self.translation_config.progress_monitor:
-            with self.translation_config.progress_monitor.stage_start(
-                self.stage_name,
-                len(document.page) * 2,
-            ) as pbar:
-                # Preprocess - calculate optimal scale factor for each paragraph
-                self.preprocess_document(document, pbar)
+        self._in_typesetting_document = True
+        try:
+            # Batch preprocess document - calculate optimal scale for each paragraph
+            if self.translation_config.progress_monitor:
+                with self.translation_config.progress_monitor.stage_start(
+                    self.stage_name,
+                    len(document.page) * 2,
+                ) as pbar:
+                    # Preprocess - calculate optimal scale factor for each paragraph
+                    self.preprocess_document(document, pbar)
 
+                    for page_idx, page in enumerate(document.page):
+                        self.translation_config.raise_if_cancelled()
+
+                        # Add detailed logging for each page
+                        if self.detailed_logger:
+                            self.detailed_logger.log_step(
+                                f"Typesetting Page {page_idx + 1}",
+                                f"Paragraphs to typeset: {len(page.pdf_paragraph) if hasattr(page, 'pdf_paragraph') else 0}"
+                            )
+
+                        self.render_page(page)
+                        pbar.advance()
+            else:
                 for page_idx, page in enumerate(document.page):
                     self.translation_config.raise_if_cancelled()
                     
@@ -1860,19 +1884,12 @@ class Typesetting:
                         )
                     
                     self.render_page(page)
-                    pbar.advance()
-        else:
-            for page_idx, page in enumerate(document.page):
-                self.translation_config.raise_if_cancelled()
-                
-                # Add detailed logging for each page
-                if self.detailed_logger:
-                    self.detailed_logger.log_step(
-                        f"Typesetting Page {page_idx + 1}",
-                        f"Paragraphs to typeset: {len(page.pdf_paragraph) if hasattr(page, 'pdf_paragraph') else 0}"
-                    )
-                
-                self.render_page(page)
+
+            self._paginate_overflowing_pages(document)
+            for final_page in document.page:
+                self._report_clipped_content(final_page, record_to_ledger=True)
+        finally:
+            self._in_typesetting_document = False
         
         self._log_and_report_glyph_substitutions()
         # Add detailed logging at the end
@@ -1970,6 +1987,7 @@ class Typesetting:
         # Balance table row widths before rendering
         self._balance_table_row_widths(page, fonts)
         self._reserve_heading_clearance_from_tables(page)
+        self._stabilize_footnote_zone(page)
         self._resolve_vertical_paragraph_collisions(page)
 
         # Mirror decorative header banners (colored rectangles) horizontally for RTL
@@ -1983,26 +2001,82 @@ class Typesetting:
         self._audit_arabic_font_ownership(page)
         self._resolve_rendered_text_collisions(page)
         self._anchor_inline_highlight_curves(page)
-        self._report_clipped_content(page)
+        self._report_clipped_content(
+            page,
+            record_to_ledger=not self._in_typesetting_document,
+        )
         for paragraph, rules in header_rules:
             self._align_header_underlines(paragraph, rules, page.cropbox.box)
 
-    def _report_clipped_content(self, page: il_version_1.Page) -> list[str]:
-        """Warn about translated text that is omitted or drawn off the page.
+    def _record_layout_issue(
+        self,
+        *,
+        page_number: int | None,
+        kind: str,
+        detail: str,
+        debug_id: object = None,
+        severity: str = "warning",
+    ) -> None:
+        key = (page_number, kind, debug_id, detail)
+        if key in self._reported_layout_issue_keys:
+            return
+        self._reported_layout_issue_keys.add(key)
+        issue = {
+            "page": page_number,
+            "kind": kind,
+            "detail": detail,
+            "debug_id": debug_id,
+            "severity": severity,
+        }
+        self._layout_issues.append(issue)
+        shared = getattr(self.translation_config, "shared_context_cross_split_part", None)
+        if shared is not None:
+            shared_issues = getattr(shared, "layout_issues", None)
+            if isinstance(shared_issues, list):
+                shared_issues.append(issue)
+            ledger = getattr(shared, "content_ledger", None)
+            if ledger is not None and hasattr(ledger, "record_layout_issue"):
+                ledger.record_layout_issue(
+                    page=page_number,
+                    kind=kind,
+                    detail=detail,
+                    debug_id=debug_id,
+                    severity=severity,
+                )
 
-        This is a final, read-only check: it never moves anything.  It makes
-        silent loss visible in the job log instead of leaving it to be found in
-        the finished PDF.
+    def _report_clipped_content(
+        self,
+        page: il_version_1.Page,
+        *,
+        record_to_ledger: bool = True,
+    ) -> list[str]:
+        """Warn about translated text that is omitted, off-page, or overlapping fixed bottom zones.
+
+        This is a final, read-only audit: it never moves anything.  It makes
+        silent loss visible in both logs and ``quality_report.json`` instead of
+        leaving it to be discovered visually in the finished PDF.
         """
         problems: list[str] = []
         crop = page.cropbox.box if page.cropbox and page.cropbox.box else None
+        zones = self._get_page_vertical_zones(page) if crop is not None else None
         for paragraph in page.pdf_paragraph or []:
             label = getattr(paragraph, "debug_id", "?")
             rendered = self._rendered_text_box(paragraph)
             text = (paragraph.unicode or "").strip()
+            para_reasons: list[str] = []
             if rendered is None:
                 if text and not paragraph.vertical:
-                    problems.append(f"{label}: translated text has no rendered glyphs ({text[:30]!r})")
+                    msg = f"{label}: translated text has no rendered glyphs ({text[:30]!r})"
+                    problems.append(msg)
+                    para_reasons.append("clipped_or_missing")
+                    if record_to_ledger:
+                        self._record_layout_issue(
+                            page_number=page.page_number,
+                            kind="clipped_or_missing",
+                            detail=msg,
+                            debug_id=label,
+                            severity="error",
+                        )
                 continue
             if crop is None:
                 continue
@@ -2013,7 +2087,40 @@ class Typesetting:
                 or rendered.y < crop.y - tolerance
                 or rendered.y2 > crop.y2 + tolerance
             ):
-                problems.append(f"{label}: rendered text leaves the page ({text[:30]!r})")
+                msg = f"{label}: rendered text leaves the page ({text[:30]!r})"
+                problems.append(msg)
+                para_reasons.append("off_page")
+                if record_to_ledger:
+                    self._record_layout_issue(
+                        page_number=page.page_number,
+                        kind="off_page",
+                        detail=msg,
+                        debug_id=label,
+                        severity="error",
+                    )
+            elif (
+                zones is not None
+                and not self._is_fixed_table_paragraph(paragraph)
+                and not self._is_bottom_fixed_paragraph(paragraph, page)
+                and not paragraph.vertical
+                and rendered.y < zones["content_floor"] - 2.0
+                and (paragraph.pipeline_trace or {}).get("page_overflow")
+            ):
+                msg = f"{label}: overflowing body text remains in protected bottom zone ({text[:30]!r})"
+                problems.append(msg)
+                para_reasons.append("page_overflow_unpaginated")
+                if record_to_ledger:
+                    self._record_layout_issue(
+                        page_number=page.page_number,
+                        kind="page_overflow_unpaginated",
+                        detail=msg,
+                        debug_id=label,
+                        severity="warning",
+                    )
+            if para_reasons:
+                trace = self._ensure_pipeline_trace(paragraph)
+                trace["clipped"] = True
+                trace["clip_reasons"] = list(dict.fromkeys([*(trace.get("clip_reasons") or []), *para_reasons]))
         if problems:
             logger.warning(
                 "Possible missing or clipped content on page %s: %s",
@@ -2029,6 +2136,193 @@ class Typesetting:
     def _is_fixed_table_paragraph(paragraph: il_version_1.PdfParagraph) -> bool:
         """Whether a paragraph owns a physical cell in a preserved table grid."""
         return "table" in (paragraph.layout_label or "").lower()
+
+    @staticmethod
+    def _ensure_pipeline_trace(paragraph: il_version_1.PdfParagraph) -> dict:
+        if paragraph.pipeline_trace is None:
+            paragraph.pipeline_trace = {}
+        return paragraph.pipeline_trace
+
+    @staticmethod
+    def _is_footnote_paragraph(paragraph: il_version_1.PdfParagraph) -> bool:
+        """Whether a paragraph is a page footnote or table footnote."""
+        return "footnote" in (paragraph.layout_label or "").lower()
+
+    def _is_top_band_header(
+        self,
+        paragraph: il_version_1.PdfParagraph,
+        page: il_version_1.Page,
+    ) -> bool:
+        label = (paragraph.layout_label or "").lower()
+        crop = page.cropbox.box if page.cropbox and page.cropbox.box else None
+        if any(marker in label for marker in ("header", "page_header")):
+            if crop is None or not paragraph.box:
+                return True
+            mid_y = (crop.y + crop.y2) * 0.5
+            return paragraph.box.y >= mid_y
+        if crop is not None and paragraph.box and self._is_header_or_footer(paragraph, page):
+            height = max(1.0, crop.y2 - crop.y)
+            return paragraph.box.y >= crop.y2 - height * 0.12
+        return False
+
+    def _is_bottom_band_footer(
+        self,
+        paragraph: il_version_1.PdfParagraph,
+        page: il_version_1.Page,
+    ) -> bool:
+        label = (paragraph.layout_label or "").lower()
+        crop = page.cropbox.box if page.cropbox and page.cropbox.box else None
+        if any(marker in label for marker in ("footer", "page_footer", "page_number")):
+            if crop is None or not paragraph.box:
+                return True
+            mid_y = (crop.y + crop.y2) * 0.5
+            return paragraph.box.y2 <= mid_y
+        if crop is not None and paragraph.box and self._is_header_or_footer(paragraph, page):
+            height = max(1.0, crop.y2 - crop.y)
+            return paragraph.box.y2 <= crop.y + height * 0.12
+        return False
+
+    def _is_bottom_fixed_paragraph(
+        self,
+        paragraph: il_version_1.PdfParagraph,
+        page: il_version_1.Page,
+    ) -> bool:
+        """Footnotes and running bottom footers own fixed lower bands on a page."""
+        return self._is_footnote_paragraph(paragraph) or self._is_bottom_band_footer(paragraph, page)
+
+    @staticmethod
+    def _extract_leading_footnote_marker(text: str | None) -> str | None:
+        raw = (text or "").strip()
+        if not raw:
+            return None
+        sup_map = str.maketrans("⁰¹²³⁴⁵⁶⁷⁸⁹", "0123456789")
+        match = re.match(r"^(?:\[(\d{1,3})\]|\((\d{1,3})\)|(\d{1,3})[.)]?\s+|([⁰¹²³⁴⁵⁶⁷⁸⁹]{1,3}|[*†‡§]))", raw)
+        if not match:
+            return None
+        token = next((g for g in match.groups() if g), None)
+        if not token:
+            return None
+        return token.translate(sup_map)
+
+    def _annotate_footnote_anchors(self, page: il_version_1.Page) -> None:
+        """Link footnote blocks to likely body anchor paragraphs in pipeline_trace."""
+        footnotes = [p for p in page.pdf_paragraph or [] if self._is_footnote_paragraph(p)]
+        if not footnotes:
+            return
+        body_paragraphs = [
+            p for p in page.pdf_paragraph or []
+            if not self._is_footnote_paragraph(p) and (p.unicode or "").strip()
+        ]
+        sup_map = str.maketrans("⁰¹²³⁴⁵⁶⁷⁸⁹", "0123456789")
+        for fn in footnotes:
+            fn_trace = self._ensure_pipeline_trace(fn)
+            fn_trace["zone"] = "footnote"
+            marker = self._extract_leading_footnote_marker(fn.unicode)
+            if not marker:
+                continue
+            fn_trace["footnote_marker"] = marker
+            anchors: list[object] = []
+            for body in body_paragraphs:
+                body_text = (body.unicode or "").translate(sup_map)
+                found = False
+                if marker in {"*", "†", "‡", "§"}:
+                    found = marker in body_text
+                else:
+                    found = bool(
+                        re.search(rf"(?<=\S)\s*(?:\[{re.escape(marker)}\]|\({re.escape(marker)}\)|{re.escape(marker)})\b", body_text)
+                        or any(c in (body.unicode or "") for c in "⁰¹²³⁴⁵⁶⁷⁸⁹" if c.translate(sup_map) == marker)
+                    )
+                if found:
+                    anchors.append(getattr(body, "debug_id", None) or id(body))
+                    b_trace = self._ensure_pipeline_trace(body)
+                    refs = list(b_trace.get("referenced_footnotes") or [])
+                    if marker not in refs:
+                        refs.append(marker)
+                    b_trace["referenced_footnotes"] = refs
+            if anchors:
+                fn_trace["anchor_paragraph_ids"] = anchors
+
+    def _get_page_vertical_zones(self, page: il_version_1.Page) -> dict[str, float]:
+        """Compute generalized body, header, footer, and footnote vertical boundaries."""
+        crop = page.cropbox.box if page.cropbox and page.cropbox.box else Box(0.0, 0.0, 595.0, 842.0)
+        page_height = max(1.0, crop.y2 - crop.y)
+        bottom_margin = max(14.0, min(28.0, page_height * 0.035))
+        top_margin = max(14.0, min(28.0, page_height * 0.035))
+        page_floor = crop.y + bottom_margin
+        page_ceiling = crop.y2 - top_margin
+
+        paragraphs = [p for p in page.pdf_paragraph or [] if p.box is not None]
+        bottom_footers = [p for p in paragraphs if self._is_bottom_band_footer(p, page)]
+        top_headers = [p for p in paragraphs if self._is_top_band_header(p, page)]
+        footnotes = [p for p in paragraphs if self._is_footnote_paragraph(p)]
+
+        content_floor = page_floor
+        if bottom_footers:
+            footer_top = max(p.box.y2 for p in bottom_footers if p.box)
+            content_floor = max(page_floor, footer_top + 6.0)
+
+        body_ceiling = page_ceiling
+        if top_headers:
+            header_bottom = min(p.box.y for p in top_headers if p.box)
+            body_ceiling = min(page_ceiling, header_bottom - 6.0)
+
+        body_floor = content_floor
+        has_footnotes = 0.0
+        if footnotes:
+            has_footnotes = 1.0
+            footnote_top = max(p.box.y2 for p in footnotes if p.box)
+            for curve in page.pdf_curve or []:
+                if curve.box is None:
+                    continue
+                is_thin_rule = abs(curve.box.y2 - curve.box.y) <= 2.5 and (curve.box.x2 - curve.box.x) >= 24.0
+                if is_thin_rule and footnote_top <= curve.box.y2 <= footnote_top + 14.0:
+                    footnote_top = max(footnote_top, curve.box.y2)
+            body_floor = max(content_floor, footnote_top + 10.0)
+
+        if body_floor > body_ceiling - 24.0:
+            body_floor = max(crop.y + 4.0, min(body_floor, body_ceiling - 24.0))
+        if content_floor > body_ceiling - 12.0:
+            content_floor = max(crop.y + 4.0, min(content_floor, body_ceiling - 12.0))
+
+        return {
+            "crop_y": crop.y,
+            "crop_y2": crop.y2,
+            "page_floor": page_floor,
+            "content_floor": content_floor,
+            "body_floor": body_floor,
+            "body_ceiling": body_ceiling,
+            "page_ceiling": page_ceiling,
+            "has_footnotes": has_footnotes,
+        }
+
+    def _stabilize_footnote_zone(self, page: il_version_1.Page) -> None:
+        """Keep footnotes above page margins/footers and prevent footnote-footnote overlap."""
+        self._annotate_footnote_anchors(page)
+        page_key = id(page)
+        if page_key in self._footnote_zone_stabilized_pages:
+            return
+        self._footnote_zone_stabilized_pages.add(page_key)
+
+        footnotes = [
+            p for p in page.pdf_paragraph or []
+            if self._is_footnote_paragraph(p)
+            and p.box is not None
+            and all(v is not None for v in (p.box.x, p.box.y, p.box.x2, p.box.y2))
+        ]
+        if not footnotes:
+            return
+
+        zones = self._get_page_vertical_zones(page)
+        content_floor = zones["content_floor"]
+
+        # Process bottom-most footnote first so footnotes never slide off the bottom
+        footnotes_bottom_up = sorted(footnotes, key=lambda p: (p.box.y, p.box.x))
+        min_next_y = content_floor
+        for fn in footnotes_bottom_up:
+            fn_h = max(0.0, fn.box.y2 - fn.box.y)
+            if fn.box.y < min_next_y - 0.01:
+                fn.box = Box(fn.box.x, min_next_y, fn.box.x2, min_next_y + fn_h)
+            min_next_y = max(min_next_y, fn.box.y2 + 3.0)
 
     @staticmethod
     def _is_heading_paragraph(paragraph: il_version_1.PdfParagraph) -> bool:
@@ -2219,6 +2513,9 @@ class Typesetting:
         if page_key in self._vertical_collision_resolved_pages:
             return
 
+        self._stabilize_footnote_zone(page)
+        zones = self._get_page_vertical_zones(page)
+
         valid = [
             paragraph
             for paragraph in page.pdf_paragraph or []
@@ -2242,9 +2539,14 @@ class Typesetting:
         occupied: list[il_version_1.PdfParagraph] = []
         moved = 0
         for paragraph in sorted(valid, key=order_key):
-            # Physical table cells already have a ruled grid and synchronized
-            # row heights.  They must act as obstacles but never be shifted.
-            if not self._is_fixed_table_paragraph(paragraph):
+            # Physical table cells, footnotes, bottom footers, and top headers
+            # act as fixed zone obstacles and must never be pushed downward off-page.
+            is_fixed_zone = (
+                self._is_fixed_table_paragraph(paragraph)
+                or self._is_bottom_fixed_paragraph(paragraph, page)
+                or self._is_top_band_header(paragraph, page)
+            )
+            if not is_fixed_zone:
                 required_shift = 0.0
                 for blocker in occupied:
                     if not blocker.box or not self._shares_reflow_layer(paragraph, blocker):
@@ -2277,11 +2579,17 @@ class Typesetting:
                         paragraph.box.x2,
                         paragraph.box.y2 - required_shift,
                     )
+                    trace = self._ensure_pipeline_trace(paragraph)
+                    trace["collision_shifted"] = True
                     moved += 1
                     logger.info(
                         "Reserved vertical lane for paragraph %s on page %s (shift %.1fpt).",
                         getattr(paragraph, "debug_id", "?"), page.page_number, required_shift,
                     )
+                if paragraph.box.y < zones["body_floor"] - 1.0:
+                    trace = self._ensure_pipeline_trace(paragraph)
+                    trace["page_overflow"] = True
+                    trace["body_floor"] = zones["body_floor"]
             occupied.append(paragraph)
 
         self._vertical_collision_resolved_pages.add(page_key)
@@ -2319,14 +2627,18 @@ class Typesetting:
         curve.relocation_transform = transform
 
     @staticmethod
-    def _shift_rendered_paragraph_vertically(
-        paragraph: il_version_1.PdfParagraph, shift: float
+    def _translate_rendered_paragraph(
+        paragraph: il_version_1.PdfParagraph,
+        dx: float = 0.0,
+        dy: float = 0.0,
     ) -> None:
-        """Move already-rendered glyphs (and formula decorations) down together."""
+        """Translate a rendered paragraph and all child glyphs/curves cleanly."""
         def shift_box(box: Box | None) -> None:
             if box:
-                box.y -= shift
-                box.y2 -= shift
+                box.x += dx
+                box.x2 += dx
+                box.y += dy
+                box.y2 += dy
 
         shift_box(paragraph.box)
         for composition in paragraph.pdf_paragraph_composition or []:
@@ -2343,7 +2655,14 @@ class Typesetting:
                     if char.visual_bbox:
                         shift_box(char.visual_bbox.box)
                 for curve in formula.pdf_curve or []:
-                    Typesetting._translate_rendered_curve(curve, dy=-shift)
+                    Typesetting._translate_rendered_curve(curve, dx=dx, dy=dy)
+
+    @staticmethod
+    def _shift_rendered_paragraph_vertically(
+        paragraph: il_version_1.PdfParagraph, shift: float
+    ) -> None:
+        """Move already-rendered glyphs (and formula decorations) down together."""
+        Typesetting._translate_rendered_paragraph(paragraph, dy=-shift)
 
     def _resolve_rendered_text_collisions(self, page: il_version_1.Page) -> None:
         """Final export firewall for collisions caused by glyphs escaping source boxes.
@@ -2352,12 +2671,15 @@ class Typesetting:
         preflight cannot prove visual safety.  Inspect the actual generated
         glyphs and, for non-table prose, push the lower-priority block below
         the collision. Separate source rows keep their reading order; heading
-        priority breaks ties when the source boxes already overlap.
+        priority breaks ties when the source boxes already overlap.  Footnotes
+        and running bottom footers are protected lower barriers and are never
+        shifted off-page by encroaching body text.
         """
         page_key = id(page)
         if page_key in self._rendered_collision_resolved_pages:
             return
 
+        zones = self._get_page_vertical_zones(page)
         paragraphs = [
             paragraph for paragraph in page.pdf_paragraph or []
             if not self._is_fixed_table_paragraph(paragraph)
@@ -2379,6 +2701,7 @@ class Typesetting:
             and paragraph.box.y2 is not None
         }
         moved = 0
+        flagged_overflow_pairs: set[tuple[int, int]] = set()
         for _ in range(max(1, len(paragraphs))):
             changed = False
             rendered = {id(paragraph): self._rendered_text_box(paragraph) for paragraph in paragraphs}
@@ -2400,6 +2723,38 @@ class Typesetting:
                     )
                     min_width = max(1.0, min(first_box.x2 - first_box.x, second_box.x2 - second_box.x))
                     if horizontal_overlap < min_width * 0.25 or vertical_overlap <= 0.25:
+                        continue
+
+                    first_fixed_bottom = self._is_bottom_fixed_paragraph(first, page)
+                    second_fixed_bottom = self._is_bottom_fixed_paragraph(second, page)
+                    if first_fixed_bottom != second_fixed_bottom:
+                        # Body text collided with a protected footnote or bottom footer.
+                        # Never push the footnote off the page; flag the body block
+                        # so continuation pagination moves it cleanly.
+                        body_para = second if first_fixed_bottom else first
+                        fixed_para = first if first_fixed_bottom else second
+                        pair_key = (id(body_para), id(fixed_para))
+                        if pair_key not in flagged_overflow_pairs:
+                            flagged_overflow_pairs.add(pair_key)
+                            trace = self._ensure_pipeline_trace(body_para)
+                            trace["page_overflow"] = True
+                            trace["overflow_reason"] = "bottom_zone_collision"
+                        continue
+                    if first_fixed_bottom and second_fixed_bottom:
+                        # Two footnotes overlapped after expansion: push the UPPER one up,
+                        # preserving the bottom margin floor.
+                        if first_box.y2 >= second_box.y2:
+                            upper_fn, lower_fn = first, second
+                        else:
+                            upper_fn, lower_fn = second, first
+                        upper_box = rendered[id(upper_fn)]
+                        lower_box = rendered[id(lower_fn)]
+                        shift_up = max(0.0, (lower_box.y2 + 3.0) - upper_box.y)
+                        if shift_up > 0.01:
+                            self._translate_rendered_paragraph(upper_fn, dy=shift_up)
+                            moved += 1
+                            changed = True
+                            break
                         continue
 
                     first_lane = source_lanes.get(id(first))
@@ -2427,6 +2782,12 @@ class Typesetting:
                         # a collision: separate by the measured overlap.
                         shift = vertical_overlap + gap
                     self._shift_rendered_paragraph_vertically(mover, shift)
+                    trace = self._ensure_pipeline_trace(mover)
+                    trace["collision_shifted"] = True
+                    new_mover_box = self._rendered_text_box(mover)
+                    if new_mover_box is not None and new_mover_box.y < zones["body_floor"] - 1.0:
+                        trace["page_overflow"] = True
+                        trace["body_floor"] = zones["body_floor"]
                     moved += 1
                     changed = True
                     break
@@ -2440,6 +2801,358 @@ class Typesetting:
             logger.warning(
                 "Resolved %d rendered glyph collision(s) on page %s.", moved, page.page_number
             )
+
+    @staticmethod
+    def _composition_item_box(comp: PdfParagraphComposition) -> Box | None:
+        if comp.pdf_character and comp.pdf_character.box:
+            return comp.pdf_character.box
+        if comp.pdf_formula:
+            if comp.pdf_formula.box:
+                return comp.pdf_formula.box
+            boxes = [c.box for c in comp.pdf_formula.pdf_character or [] if c.box]
+            if boxes:
+                return Box(
+                    min(b.x for b in boxes), min(b.y for b in boxes),
+                    max(b.x2 for b in boxes), max(b.y2 for b in boxes),
+                )
+        return None
+
+    def _split_rendered_paragraph_at_y(
+        self,
+        paragraph: il_version_1.PdfParagraph,
+        split_y: float,
+    ) -> il_version_1.PdfParagraph | None:
+        """Split a rendered paragraph at a vertical cutoff by visual glyph lines.
+
+        Returns the lower continuation ``PdfParagraph`` when at least one line
+        stays above ``split_y`` and at least one line falls below it; returns
+        ``None`` if splitting is unnecessary or cannot leave a clean upper line.
+        """
+        compositions = list(paragraph.pdf_paragraph_composition or [])
+        if not compositions:
+            return None
+
+        positioned: list[tuple[PdfParagraphComposition, Box]] = []
+        for comp in compositions:
+            box = self._composition_item_box(comp)
+            if box is not None:
+                positioned.append((comp, box))
+        if not positioned:
+            return None
+
+        heights = sorted(max(1.0, box.y2 - box.y) for _, box in positioned)
+        line_tol = max(2.5, heights[len(heights) // 2] * 0.45)
+
+        lines: list[dict] = []
+        for comp, box in compositions:
+            cbox = self._composition_item_box(comp)
+            if cbox is None:
+                if lines:
+                    lines[-1]["items"].append(comp)
+                continue
+            mid_y = (cbox.y + cbox.y2) * 0.5
+            if lines and abs(mid_y - lines[-1]["mid_y"]) <= line_tol:
+                line = lines[-1]
+                n = line["count"]
+                line["mid_y"] = (line["mid_y"] * n + mid_y) / (n + 1)
+                line["count"] = n + 1
+                line["y"] = min(line["y"], cbox.y)
+                line["y2"] = max(line["y2"], cbox.y2)
+                line["items"].append(comp)
+            else:
+                lines.append({
+                    "mid_y": mid_y,
+                    "count": 1,
+                    "y": cbox.y,
+                    "y2": cbox.y2,
+                    "items": [comp],
+                })
+
+        if len(lines) < 2:
+            return None
+
+        keep_lines = [line for line in lines if line["y"] >= split_y - 1.0]
+        move_lines = [line for line in lines if line["y"] < split_y - 1.0]
+        if not keep_lines or not move_lines:
+            return None
+
+        keep_comps = [item for line in keep_lines for item in line["items"]]
+        move_comps = [item for line in move_lines for item in line["items"]]
+        paragraph.pdf_paragraph_composition = keep_comps
+        kept_box = self._rendered_text_box(paragraph)
+        if kept_box is not None:
+            paragraph.box = kept_box
+
+        cont_box_items = [self._composition_item_box(c) for c in move_comps]
+        valid_boxes = [b for b in cont_box_items if b is not None]
+        cont_box = (
+            Box(
+                min(b.x for b in valid_boxes), min(b.y for b in valid_boxes),
+                max(b.x2 for b in valid_boxes), max(b.y2 for b in valid_boxes),
+            )
+            if valid_boxes
+            else copy.copy(paragraph.box)
+        )
+        cont_text = "".join(
+            comp.pdf_character.char_unicode
+            for comp in move_comps
+            if comp.pdf_character and comp.pdf_character.char_unicode
+        ).strip()
+        cont_para = il_version_1.PdfParagraph(
+            box=cont_box,
+            pdf_style=copy.copy(paragraph.pdf_style) if paragraph.pdf_style else None,
+            pdf_paragraph_composition=move_comps,
+            xobj_id=paragraph.xobj_id,
+            unicode=cont_text or paragraph.unicode,
+            scale=paragraph.scale,
+            optimal_scale=paragraph.optimal_scale,
+            vertical=paragraph.vertical,
+            first_line_indent=paragraph.first_line_indent,
+            debug_id=(f"{paragraph.debug_id}_cont" if paragraph.debug_id is not None else None),
+            layout_label=paragraph.layout_label,
+            layout_id=paragraph.layout_id,
+            render_order=paragraph.render_order,
+            text_direction=paragraph.text_direction,
+            text_align=paragraph.text_align,
+            pipeline_trace={
+                "split_continuation_of": getattr(paragraph, "debug_id", None),
+            },
+        )
+        p_trace = self._ensure_pipeline_trace(paragraph)
+        p_trace["split_across_page"] = True
+        return cont_para
+
+    @staticmethod
+    def _create_continuation_page(
+        src_page: il_version_1.Page,
+        new_page_number: int,
+    ) -> il_version_1.Page:
+        """Allocate a clean normalized continuation Page inheriting source fonts."""
+        src_crop = src_page.cropbox.box if src_page.cropbox and src_page.cropbox.box else Box(0.0, 0.0, 595.0, 842.0)
+        width = max(1.0, src_crop.x2 - src_crop.x)
+        height = max(1.0, src_crop.y2 - src_crop.y)
+        norm_box = Box(0.0, 0.0, width, height)
+
+        fonts_by_id: dict[str, il_version_1.PdfFont] = {}
+        for f in src_page.pdf_font or []:
+            if f.font_id and f.font_id not in fonts_by_id:
+                fonts_by_id[f.font_id] = copy.copy(f)
+        for xobj in src_page.pdf_xobject or []:
+            for f in xobj.pdf_font or []:
+                if f.font_id and f.font_id not in fonts_by_id:
+                    fonts_by_id[f.font_id] = copy.copy(f)
+
+        return il_version_1.Page(
+            mediabox=il_version_1.Mediabox(box=Box(0.0, 0.0, width, height)),
+            cropbox=il_version_1.Cropbox(box=norm_box),
+            pdf_font=list(fonts_by_id.values()),
+            page_number=new_page_number,
+            unit=src_page.unit,
+            continuation_of_page=src_page.page_number,
+        )
+
+    @staticmethod
+    def _clear_paragraph_xobj_id(paragraph: il_version_1.PdfParagraph) -> None:
+        paragraph.xobj_id = None
+        for comp in paragraph.pdf_paragraph_composition or []:
+            if comp.pdf_character:
+                comp.pdf_character.xobj_id = None
+            elif comp.pdf_formula:
+                comp.pdf_formula.xobj_id = None
+                for ch in comp.pdf_formula.pdf_character or []:
+                    ch.xobj_id = None
+                for curve in comp.pdf_formula.pdf_curve or []:
+                    curve.xobj_id = None
+
+    def _paginate_overflowing_pages(self, document: il_version_1.Document) -> int:
+        """Reflow overflowing body prose cleanly onto inserted continuation pages.
+
+        Returns the number of continuation pages created across ``document``.
+        """
+        if not document.page:
+            return 0
+
+        new_pages: list[il_version_1.Page] = []
+        created_continuations = 0
+        max_continuations_per_page = 10
+
+        for src_page in list(document.page):
+            new_pages.append(src_page)
+            crop = src_page.cropbox.box if src_page.cropbox and src_page.cropbox.box else None
+            if crop is None:
+                continue
+
+            zones = self._get_page_vertical_zones(src_page)
+            body_floor = zones["body_floor"]
+            content_floor = zones["content_floor"]
+            has_footnotes = zones["has_footnotes"] > 0.5
+            crop_h = max(1.0, crop.y2 - crop.y)
+            body_span = max(40.0, zones["body_ceiling"] - body_floor)
+
+            movable: list[tuple[il_version_1.PdfParagraph, Box]] = []
+            for para in src_page.pdf_paragraph or []:
+                if (
+                    self._is_fixed_table_paragraph(para)
+                    or self._is_bottom_fixed_paragraph(para, src_page)
+                    or self._is_top_band_header(para, src_page)
+                    or para.vertical
+                    or (para.box is not None and self._is_inside_table_or_figure_region(para.box, src_page, figures_only=True))
+                ):
+                    continue
+                rbox = self._rendered_text_box(para)
+                if rbox is not None:
+                    movable.append((para, rbox))
+
+            movable.sort(key=lambda item: (-item[1].y2, item[1].x))
+
+            overflow_queue: list[tuple[il_version_1.PdfParagraph, Box, list[il_version_1.PdfRectangle]]] = []
+            overflow_cutoff_y2: float | None = None
+            keep_paragraphs = set(id(p) for p in src_page.pdf_paragraph or [])
+
+            for para, rbox in movable:
+                trace = para.pipeline_trace or {}
+                violates_offpage = rbox.y < crop.y + 4.0
+                violates_footnote = has_footnotes and rbox.y < body_floor - 1.0
+                violates_content = rbox.y < content_floor - 2.0 and (
+                    bool(trace.get("collision_shifted"))
+                    or bool(trace.get("page_overflow"))
+                    or rbox.y < crop.y + 8.0
+                )
+                follows_moved_stream = overflow_cutoff_y2 is not None and rbox.y2 <= overflow_cutoff_y2 + 0.5
+                is_overflowing = (
+                    bool(trace.get("page_overflow"))
+                    or violates_offpage
+                    or violates_footnote
+                    or violates_content
+                    or follows_moved_stream
+                )
+                if not is_overflowing:
+                    continue
+
+                para_height = max(0.0, rbox.y2 - rbox.y)
+                can_split = (
+                    rbox.y2 > body_floor + 16.0
+                    and para_height > body_span * 0.25
+                    and overflow_cutoff_y2 is None
+                )
+                if can_split:
+                    cont_part = self._split_rendered_paragraph_at_y(para, body_floor)
+                    if cont_part is not None:
+                        cont_rbox = self._rendered_text_box(cont_part) or cont_part.box
+                        if cont_rbox is not None:
+                            overflow_queue.append((cont_part, cont_rbox, []))
+                            overflow_cutoff_y2 = body_floor
+                            continue
+
+                if overflow_cutoff_y2 is None:
+                    overflow_cutoff_y2 = rbox.y2
+
+                # Collect matching translated_code_band rectangles anchored to this paragraph
+                attached_rects: list[il_version_1.PdfRectangle] = []
+                for rect in list(src_page.pdf_rectangle or []):
+                    if (
+                        rect.debug_info == "translated_code_band"
+                        and rect.box is not None
+                        and rect.box.y <= rbox.y2 + 4.0
+                        and rect.box.y2 >= rbox.y - 4.0
+                        and rect.box.x >= rbox.x - 12.0
+                        and rect.box.x2 <= rbox.x2 + 12.0
+                    ):
+                        attached_rects.append(rect)
+                        src_page.pdf_rectangle.remove(rect)
+
+                keep_paragraphs.discard(id(para))
+                overflow_queue.append((para, rbox, attached_rects))
+
+            if not overflow_queue:
+                continue
+
+            src_page.pdf_paragraph = [
+                p for p in (src_page.pdf_paragraph or []) if id(p) in keep_paragraphs
+            ]
+
+            cont_margin = max(14.0, min(28.0, crop_h * 0.035))
+            cont_ceiling = crop_h - cont_margin
+            cont_floor = cont_margin
+            cont_page = self._create_continuation_page(src_page, len(new_pages))
+            new_pages.append(cont_page)
+            created_continuations += 1
+            cont_count_for_src = 1
+            cursor_y2 = cont_ceiling
+            dx = -crop.x
+
+            idx = 0
+            while idx < len(overflow_queue):
+                para, rbox, attached_rects = overflow_queue[idx]
+                item_h = max(0.0, rbox.y2 - rbox.y)
+
+                if cursor_y2 - item_h < cont_floor - 1.0 and cont_page.pdf_paragraph:
+                    if cont_count_for_src >= max_continuations_per_page:
+                        break
+                    cont_page = self._create_continuation_page(src_page, len(new_pages))
+                    new_pages.append(cont_page)
+                    created_continuations += 1
+                    cont_count_for_src += 1
+                    cursor_y2 = cont_ceiling
+
+                dy = cursor_y2 - rbox.y2
+                self._translate_rendered_paragraph(para, dx=dx, dy=dy)
+                self._clear_paragraph_xobj_id(para)
+                moved_rbox = self._rendered_text_box(para)
+                if moved_rbox is not None:
+                    para.box = moved_rbox
+                trace = self._ensure_pipeline_trace(para)
+                trace["paginated_from_page"] = src_page.page_number
+                trace.pop("page_overflow", None)
+
+                for rect in attached_rects:
+                    if rect.box is not None:
+                        rect.box = Box(
+                            rect.box.x + dx,
+                            rect.box.y + dy,
+                            rect.box.x2 + dx,
+                            rect.box.y2 + dy,
+                        )
+                    rect.xobj_id = None
+                    cont_page.pdf_rectangle.append(rect)
+
+                # If even alone on a fresh continuation page the block still dips below
+                # cont_floor, split its lines iteratively onto the next continuation page.
+                if (
+                    moved_rbox is not None
+                    and moved_rbox.y < cont_floor - 1.0
+                    and cont_count_for_src < max_continuations_per_page
+                ):
+                    extra_tail = self._split_rendered_paragraph_at_y(para, cont_floor)
+                    if extra_tail is not None:
+                        tail_box = self._rendered_text_box(extra_tail) or extra_tail.box
+                        if tail_box is not None:
+                            overflow_queue.insert(idx + 1, (extra_tail, tail_box, []))
+                            moved_rbox = self._rendered_text_box(para) or moved_rbox
+
+                cont_page.pdf_paragraph.append(para)
+                placed_h = (moved_rbox.y2 - moved_rbox.y) if moved_rbox is not None else item_h
+                cursor_y2 -= max(0.0, placed_h) + 8.0
+                idx += 1
+
+        if created_continuations:
+            document.page[:] = new_pages
+            for page_idx, page in enumerate(document.page):
+                page.page_number = page_idx
+            document.total_pages = len(document.page)
+            shared = getattr(self.translation_config, "shared_context_cross_split_part", None)
+            if shared is not None and hasattr(shared, "continuation_pages"):
+                shared.continuation_pages = {
+                    p.page_number: p.continuation_of_page
+                    for p in document.page
+                    if p.continuation_of_page is not None
+                }
+            logger.info(
+                "Paginated overflowing translated content onto %d continuation page(s) (total pages=%d).",
+                created_continuations,
+                len(document.page),
+            )
+        return created_continuations
 
     def _anchor_inline_highlight_curves(self, page: il_version_1.Page) -> None:
         """Relocate inline background highlight rectangles from LTR source lines to RTL rendered lines.
@@ -4891,18 +5604,32 @@ class Typesetting:
 
         return max_x
 
-    def get_max_bottom_space(self, current_box: Box, page: il_version_1.Page) -> float:
-        """Get the maximum bottom space available below the current paragraph
+    def get_max_bottom_space(
+        self,
+        current_box: Box,
+        page: il_version_1.Page,
+        *,
+        paragraph: il_version_1.PdfParagraph | None = None,
+    ) -> float:
+        """Get the maximum bottom space available below the current paragraph.
 
         Args:
             current_box: Current paragraph bounding box
             page: Current page
+            paragraph: Optional paragraph being laid out, for zone-aware floor limits
 
         Returns:
             Maximum available bottom edge y position
         """
-        # Get page's bottom margin as the lower limit
-        min_y = page.cropbox.box.y * 1.1
+        zones = self._get_page_vertical_zones(page)
+        if paragraph is not None and self._is_bottom_fixed_paragraph(paragraph, page):
+            if self._is_footnote_paragraph(paragraph):
+                min_y = zones["content_floor"]
+            else:
+                min_y = zones["crop_y"] + 4.0
+        else:
+            # Reserve page bottom margin, running footers, and the footnote band.
+            min_y = zones["body_floor"]
 
         # Check for content below that may interfere
         for para in page.pdf_paragraph:

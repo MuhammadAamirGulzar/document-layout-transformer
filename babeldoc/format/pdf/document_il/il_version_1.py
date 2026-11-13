@@ -1306,6 +1306,12 @@ class Page:
             "required": True,
         },
     )
+    continuation_of_page: int | None = field(
+        default=None,
+        metadata={
+            "type": "Ignore",
+        },
+    )
 
 
 @dataclass(slots=True)
