@@ -92,21 +92,26 @@ _NUMERAL_PATTERN = re.compile(
     r'(\b(?:AL|AD|AT|BE|BA|BG|HR|CY|CZ|DK|EE|FO|FI|FR|GE|DE|GI|GR|GL|HU|IS|IE|IL|IT|JO|KW|LV|LB|LI|LT|LU|MK|MT|MR|MU|MD|MC|ME|NL|NO|PK|PL|PT|QA|RO|SM|SA|RS|SK|SI|ES|SE|CH|TN|TR|AE|GB)\b)|'
     # 9. Mixed alphanumeric codes containing both letters and numbers (3 to 35 chars): Q1, H2, MOD97, A01
     r'(\b(?=[A-Z0-9]{3,35}\b)(?=[A-Z0-9]*\d)(?=[A-Z0-9]*[A-Z])[A-Z0-9]+\b)|'
+    # 9b. Scientific notation: 2e-5, 1.5E+10, -3.2e-4, 2e-5%
+    # Must precede dash-range and plain-number rules so exponents stay atomic.
+    r'((?<![A-Za-z0-9_.])[+\-\u2212]?(?:\d+(?:\.\d+)?|\.\d+)[eE][+\-]?\d+(?:\s*[%\u066A])?(?!\w))|'
     # 10. Compound numeric references: 2-1, Chart 4-4, 7-3, 5.1.1, 2.1.2
     # Ordinals must precede the generic number alternatives below. Otherwise the
     # word-boundary checks on the numeric alternatives leave the suffix behind
     # (``5th`` becomes ``{0}th``), which lets MT and BiDi reorder it.
+    # Multi-dot version/section numbers require >= 2 dots so single decimals like
+    # ``4.2%`` stay atomic with their percent sign in rule 13.
     r'(\b\d+(?:st|nd|rd|th)\s*[-\u2013\u2014]\s*\d+(?:st|nd|rd|th)\b)|'
     r'(\b\d+(?:st|nd|rd|th)\b)|'
     r'(\b\d+[-\u2013\u2014]\d+\b)|'
-    r'(\b\d+(?:\.\d+){1,3}\b)|'
+    r'(\b\d+(?:\.\d+){2,3}\b)|'
     # 11. Known financial/statistical acronyms that must never be translated
     r'(\b(?:QCB(?:RR|LR|DR)?|AOIR|QMR|NDS\d*|CPI|PPI|GDP|GNP|IMF|OPEC|FISIM|BBAN|IBAN|BIC|SWIFT|STP|TERMS|QATCH|Y-o-Y|Q-o-Q|MoM|RHS|LHS|USD|EUR|GBP|SAR|AED|QR|BPS|bps)\b)|'
     # 12. International phone and fax numbers: +974 44456371, +974 44430382
     r'(\+\d{1,4}\s*\d{3,4}\s*\d{3,4}(?:\s*\d{3,4})?)|'
     # 13. Numbers: integers, comma-separated thousands, decimals, percentages
-    #    e.g. 75, 75.3, 75,432, 1,200,000.5, 8.6%, -3.2, +4.5
-    r'([+-]?(?<!\w)\d{1,3}(?:,\d{3})*(?:\.\d+)?(?:\s*[%\u066A])?(?!\w))|'
+    #    e.g. 75, 75.3, 4.2%, 75,432, 1,250.5%, -3.2, +4.5
+    r'((?<![A-Za-z0-9_.])[+\-\u2212]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?:\s*[%\u066A])?(?!\w)(?!\.\d))|'
     # 14. Plain integers not already caught (catches standalone digits)
     r'((?<!\w)\d+(?:\.\d+)?(?!\w))'
 )
@@ -234,7 +239,7 @@ def _restore_numerals(text: str, mapping: dict[str, str]) -> str:
     # log a diagnostic warning rather than crashing the pipeline and reverting the paragraph to English.
     expected_counts = Counter(mapping.values())
     for original_token, expected_count in expected_counts.items():
-        actual_count = text.count(original_token)
+        actual_count = BaseTranslator._protected_value_count(text, original_token)
         if actual_count < expected_count:
             is_critical = bool(_is_valid_bic(original_token) or _IBAN_PATTERN.match(original_token))
             if is_critical:
@@ -405,6 +410,9 @@ def _is_pure_passthrough(text: str) -> bool:
             continue
         # Is it purely digits/numeric?
         if re.fullmatch(r'[\d,.%+\-±]+', clean):
+            continue
+        # Scientific notation: "2e-5", "-1.5E+10", "2e-5%"
+        if re.fullmatch(r'[+-]?(?:\d+(?:\.\d+)?|\.\d+)[eE][+-]?\d+%?', clean):
             continue
         # Is it a known passthrough code?
         if clean in _KNOWN_CODES or clean.upper() in _KNOWN_CODES:
@@ -612,6 +620,140 @@ class BaseTranslator(ABC):
             self.cache.set(text, translation)
         return translation
 
+    _PERCENT_VALUE_RE = re.compile(
+        r"^([+\-\u2212]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?:[eE][+\-]?\d+)?)\s*([%\u066A])$"
+    )
+    _NUMERIC_VALUE_RE = re.compile(
+        r"^[+\-\u2212]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)*(?:[eE][+\-]?\d+)?$"
+    )
+    _retry_missing_values = False
+
+    def _generate_translation(self, text: str) -> str:
+        """Raw model call used for single-pass protected-content retry."""
+        return self.do_translate(text)
+
+    def _retry_target_satisfied(self, text: str) -> bool:
+        """Verify retry output is non-empty and in Arabic when targeting Arabic."""
+        target_lang = str(getattr(self, "lang_out", "")).lower()
+        tgt_nllb = str(getattr(self, "tgt_nllb", ""))
+        if target_lang.startswith("ar") or tgt_nllb == "arb_Arab":
+            return bool(re.search(r"[\u0621-\u064A]", text))
+        return bool(text and text.strip())
+
+    @classmethod
+    def _canonicalize_literal_values(cls, text: str, values) -> str:
+        """Canonicalize Arabic/spaced percentage forms back to source tokens."""
+        if not text:
+            return text
+        for value in set(values):
+            pct_match = cls._PERCENT_VALUE_RE.match(value)
+            if not pct_match:
+                continue
+            num = re.escape(pct_match.group(1))
+            left = r"(?<![A-Za-z0-9_.\u066B\u066C+\-\u2212])(?<!\d,)"
+            right = r"(?![A-Za-z_\d])"
+            pct_pattern = re.compile(
+                rf"{left}(?:{num}\s*(?:[%\u066A]|في\s+المائة|بالمائة|بالمئة)|[%\u066A]\s*{num}(?![.,\u066B\u066C]\d)){right}"
+            )
+            text = pct_pattern.sub(value, text)
+        return text
+
+    @classmethod
+    def _protected_value_count(cls, text: str, value: str) -> int:
+        """Boundary-aware count of protected literal occurrences in *text*."""
+        if not text or not value:
+            return 0
+        if "{" not in value:
+            text = re.sub(r"\{\s*\d+\s*\}", " ", text)
+        pct_match = cls._PERCENT_VALUE_RE.match(value)
+        if pct_match:
+            num = re.escape(pct_match.group(1))
+            left = r"(?<![A-Za-z0-9_.\u066B\u066C+\-\u2212])(?<!\d,)"
+            right = r"(?![A-Za-z_\d])"
+            pct_pattern = re.compile(
+                rf"{left}(?:{num}\s*(?:[%\u066A]|في\s+المائة|بالمائة|بالمئة)|[%\u066A]\s*{num}(?![.,\u066B\u066C]\d)){right}"
+            )
+            return len(pct_pattern.findall(text))
+        if cls._NUMERIC_VALUE_RE.match(value):
+            left = r"(?<![A-Za-z0-9_.\u066B\u066C+\-\u2212])(?<!\d,)"
+            right = r"(?![A-Za-z0-9_])(?![.,\u066B\u066C]\d)(?!\s*[%\u066A])"
+            return len(re.findall(left + re.escape(value) + right, text))
+        left = r"(?<![A-Za-z_\d])" if value[0].isalnum() else (r"(?<!\d)" if value[0] in "+-\u2212" else "")
+        right = r"(?![A-Za-z_\d])" if value[-1].isalnum() else ""
+        return len(re.findall(left + re.escape(value) + right, text))
+
+    @staticmethod
+    def _find_unresolved_placeholders(
+        protected_source: str,
+        restored: str,
+        mapping: dict[str, str],
+    ) -> list[str]:
+        """Return any un-restored ``{n}`` or unallowed ``<bN>`` placeholder tags."""
+        if not restored:
+            return []
+        if mapping:
+            tag_pattern = re.compile("|".join(re.escape(k) for k in mapping))
+            literal_chunks = tag_pattern.split(protected_source or "")
+        else:
+            literal_chunks = [protected_source or ""]
+        literal_sources = list(literal_chunks) + list(mapping.values())
+
+        expected_braces = Counter()
+        allowed_b_tags: set[str] = set()
+        for chunk in literal_sources:
+            for match in re.finditer(r"\{\s*\d+\s*\}", chunk):
+                expected_braces[re.sub(r"\s+", "", match.group(0))] += 1
+            for match in re.finditer(r"<\s*/?\s*b\s*\d+\s*>", chunk, re.IGNORECASE):
+                allowed_b_tags.add(re.sub(r"\s+", "", match.group(0)).lower())
+
+        unresolved: list[str] = []
+        seen_braces = Counter()
+        for match in re.finditer(r"\{\s*\d+\s*\}", restored):
+            norm = re.sub(r"\s+", "", match.group(0))
+            seen_braces[norm] += 1
+            if seen_braces[norm] > expected_braces[norm]:
+                unresolved.append(match.group(0))
+        for match in re.finditer(r"<\s*/?\s*b\s*\d+\s*>", restored, re.IGNORECASE):
+            norm = re.sub(r"\s+", "", match.group(0)).lower()
+            if norm not in allowed_b_tags:
+                unresolved.append(match.group(0))
+        return unresolved
+
+    def _retain_missing_protected_values(self, translated, source, mapping, expected):
+        """Keep exact non-sensitive values visible when model attempts drop them."""
+        retained = []
+        for value, expected_count in expected.items():
+            missing_count = expected_count - self._protected_value_count(
+                translated, value
+            )
+            if missing_count <= 0:
+                continue
+            compact_value = re.sub(r"\s+", "", value)
+            if _is_valid_bic(value) or _IBAN_PATTERN.fullmatch(compact_value):
+                continue
+
+            tags = [tag for tag, mapped in mapping.items() if mapped == value]
+            source_value = value
+            for tag in tags:
+                currency_match = re.search(
+                    rf"([€£¥$])\s*{re.escape(tag)}", source
+                )
+                if currency_match:
+                    source_value = f"{currency_match.group(1)} {value}"
+                    break
+            retained.extend([source_value] * missing_count)
+
+        if not retained:
+            return translated
+
+        literal_text = "، ".join(f"\u200e{value}\u200e" for value in retained)
+        stripped = translated.rstrip()
+        punctuation = re.search(r"([.!?؟،؛:]+)$", stripped)
+        if punctuation:
+            body = stripped[:punctuation.start()].rstrip()
+            return f"{body} ({literal_text}){punctuation.group(1)}"
+        return f"{stripped} ({literal_text})"
+
     def _translate_protected(self, text, mapping, rate_limit_params):
         state = self._get_call_state()
         state.failed = False
@@ -623,14 +765,76 @@ class BaseTranslator(ABC):
             output = self.do_translate(text, rate_limit_params)
         finally:
             state.in_protected_call = False
-        restored = _restore_numerals(output, mapping)
+        first = _restore_numerals(output, mapping)
+        if mapping:
+            first = self._canonicalize_literal_values(first, mapping.values())
         if (
             getattr(state, "failed", False)
-            or getattr(state, "incomplete", False)
             or getattr(self, "untranslated_count", 0) > before_untranslated
         ):
-            return restored, False
-        return restored, True
+            return first, False
+
+        unresolved = self._find_unresolved_placeholders(text, first, mapping)
+        if not mapping:
+            if unresolved:
+                self._inc_incomplete_once()
+                logger.warning(
+                    "Translated output contains unresolved placeholders. Check the translated block."
+                )
+                return first, False
+            return first, not getattr(state, "incomplete", False)
+
+        expected = Counter(mapping.values())
+        missing = {
+            value for value, count in expected.items()
+            if self._protected_value_count(first, value) < count
+        }
+        if not missing and not unresolved:
+            return first, not getattr(state, "incomplete", False)
+
+        if not getattr(self, "_retry_missing_values", False):
+            self._inc_incomplete_once()
+            logger.warning(
+                "Translated output is missing protected content or kept unresolved placeholders. "
+                "Check the translated block."
+            )
+            return first, False
+
+        was_incomplete = getattr(state, "incomplete", False)
+        # Do not expose full account numbers (including grouped IBANs) or bank codes.
+        literal = {
+            tag: value for tag, value in mapping.items()
+            if value in missing
+            and not (_is_valid_bic(value) or _IBAN_PATTERN.fullmatch(re.sub(r"\s+", "", value)))
+        }
+        if literal:
+            retry_text = re.sub(r"\{\d+\}", lambda match: literal.get(match[0], match[0]), text)
+            remaining = {tag: value for tag, value in mapping.items() if tag not in literal}
+            state.incomplete = False
+            try:
+                candidate = _restore_numerals(self._generate_translation(retry_text), remaining)
+                candidate = self._canonicalize_literal_values(candidate, mapping.values())
+            except Exception:
+                logger.warning("Protected-content retry failed")
+            else:
+                retry_incomplete = getattr(state, "incomplete", False)
+                if (
+                    not retry_incomplete
+                    and not self._find_unresolved_placeholders(retry_text, candidate, remaining)
+                    and self._retry_target_satisfied(candidate)
+                    and all(
+                        self._protected_value_count(candidate, value) == count
+                        for value, count in expected.items()
+                    )
+                ):
+                    return candidate, (not was_incomplete)
+
+        self._inc_incomplete_once()
+        logger.warning(
+            "Translated output is missing protected content or kept unresolved placeholders. "
+            "Check the translated block."
+        )
+        return self._retain_missing_protected_values(first, text, mapping, expected), False
 
     def llm_translate(self, text, ignore_cache=False, rate_limit_params: dict = None):
         """
@@ -1114,6 +1318,9 @@ class MarianMTTranslator(_Seq2SeqTranslator):
         self._tokenizer = None
         self.add_cache_impact_parameters("model", self.model_name)
         self.add_cache_impact_parameters("max_length", self.max_length)
+        self._retry_missing_values = norm_in == "en" and norm_out == "ar"
+        if self._retry_missing_values:
+            self.add_cache_impact_parameters("protected_content_retry", 1)
 
     def _get_device(self):
         if self._device is not None:
@@ -1159,14 +1366,7 @@ class MarianMTTranslator(_Seq2SeqTranslator):
             protected_text, numeral_map = cleaned_text, {}
 
         try:
-            translation = self._translate_seq2seq_text(
-                protected_text,
-                lambda limit: {
-                    "max_length": limit,
-                    "no_repeat_ngram_size": 4,
-                    "repetition_penalty": 1.1,
-                },
-            )
+            translation = self._generate_translation(protected_text)
             # Restore original numerals if shielded locally
             if numeral_map:
                 translation = _restore_numerals(translation.strip(), numeral_map)
@@ -1176,6 +1376,16 @@ class MarianMTTranslator(_Seq2SeqTranslator):
             self.untranslated_count = getattr(self, "untranslated_count", 0) + 1
             self._mark_call_failed()
             return cleaned_text
+
+    def _generate_translation(self, text: str) -> str:
+        return self._translate_seq2seq_text(
+            text,
+            lambda limit: {
+                "max_length": limit,
+                "no_repeat_ngram_size": 4,
+                "repetition_penalty": 1.1,
+            },
+        )
 
     def do_llm_translate(self, text, rate_limit_params: dict = None):
         raise NotImplementedError("MarianMT uses sequence-to-sequence translation, not LLM chat completions.")
@@ -1250,7 +1460,7 @@ class NLLBTranslator(_Seq2SeqTranslator):
         self.add_cache_impact_parameters("model", self.model_name)
         self.add_cache_impact_parameters("load_in_8bit", str(self.load_in_8bit))
         self._retry_missing_values = (
-            self.model_name == "facebook/nllb-200-distilled-600M"
+            self.model_name in ("facebook/nllb-200-distilled-600M", "facebook/nllb-200-1.3B")
             and self.src_nllb == "eng_Latn"
             and self.tgt_nllb == "arb_Arab"
         )
@@ -1346,126 +1556,6 @@ class NLLBTranslator(_Seq2SeqTranslator):
             self.untranslated_count = getattr(self, "untranslated_count", 0) + 1
             self._mark_call_failed()
             return cleaned_text
-
-    def _translate_protected(self, text, mapping, rate_limit_params):
-        first, cacheable = super()._translate_protected(text, mapping, rate_limit_params)
-        state = self._get_call_state()
-        if getattr(state, "failed", False) or (not cacheable and not getattr(state, "incomplete", False)):
-            return first, False
-        if not self._retry_missing_values or not mapping:
-            return first, cacheable
-
-        expected = Counter(mapping.values())
-        missing = {
-            value for value, count in expected.items()
-            if self._protected_value_count(first, value) < count
-        }
-        if not missing:
-            return first, cacheable
-
-        was_incomplete = getattr(state, "incomplete", False)
-        # Do not expose full account numbers (including grouped IBANs) or bank codes.
-        literal = {
-            tag: value for tag, value in mapping.items()
-            if value in missing
-            and not (_is_valid_bic(value) or _IBAN_PATTERN.fullmatch(re.sub(r"\s+", "", value)))
-        }
-        if literal:
-            retry_text = re.sub(r"\{\d+\}", lambda match: literal.get(match[0], match[0]), text)
-            remaining = {tag: value for tag, value in mapping.items() if tag not in literal}
-            state.incomplete = False
-            try:
-                candidate = _restore_numerals(self._generate_translation(retry_text), remaining)
-                candidate = self._canonicalize_literal_values(candidate, literal.values())
-            except Exception:
-                logger.warning("NLLB protected-content retry failed")
-            else:
-                retry_incomplete = getattr(state, "incomplete", False)
-                if (
-                    not retry_incomplete
-                    and re.search(r"[\u0621-\u064A]", candidate)
-                    and all(
-                        self._protected_value_count(candidate, value) == count
-                        for value, count in expected.items()
-                    )
-                ):
-                    return candidate, (not was_incomplete)
-
-        self._inc_incomplete_once()
-        logger.warning("NLLB output is missing protected content. Check the translated block.")
-        return self._retain_missing_protected_values(first, text, mapping, expected), False
-
-    def _retain_missing_protected_values(self, translated, source, mapping, expected):
-        """Keep exact non-sensitive values visible when both model attempts drop them.
-
-        A third model guess would still be unreliable. Append the exact source
-        values in an isolated parenthetical and leave the block marked
-        incomplete so a reviewer can check their intended placement.
-        """
-        retained = []
-        for value, expected_count in expected.items():
-            missing_count = expected_count - self._protected_value_count(
-                translated, value
-            )
-            if missing_count <= 0:
-                continue
-            compact_value = re.sub(r"\s+", "", value)
-            if _is_valid_bic(value) or _IBAN_PATTERN.fullmatch(compact_value):
-                continue
-
-            tags = [tag for tag, mapped in mapping.items() if mapped == value]
-            source_value = value
-            for tag in tags:
-                currency_match = re.search(
-                    rf"([€£¥$])\s*{re.escape(tag)}", source
-                )
-                if currency_match:
-                    source_value = f"{currency_match.group(1)} {value}"
-                    break
-            retained.extend([source_value] * missing_count)
-
-        if not retained:
-            return translated
-
-        literal_text = "، ".join(f"\u200e{value}\u200e" for value in retained)
-        stripped = translated.rstrip()
-        punctuation = re.search(r"([.!?؟،؛:]+)$", stripped)
-        if punctuation:
-            body = stripped[:punctuation.start()].rstrip()
-            return f"{body} ({literal_text}){punctuation.group(1)}"
-        return f"{stripped} ({literal_text})"
-
-    @staticmethod
-    def _canonicalize_literal_values(text: str, values) -> str:
-        """Canonicalize Arabic/spaced percentage and parenthetical forms back to source tokens."""
-        if not text:
-            return text
-        for value in set(values):
-            if value.endswith("%") and value[:-1].replace(".", "", 1).isdigit():
-                num = re.escape(value[:-1])
-                pct_pattern = re.compile(
-                    rf"(?<![A-Za-z_\d])(?:{num}\s*(?:[%\u066A]|في\s+المائة|بالمائة|بالمئة)|[%\u066A]\s*{num})(?![A-Za-z_\d])"
-                )
-                text = pct_pattern.sub(value, text)
-        return text
-
-    @staticmethod
-    def _protected_value_count(text, value):
-        if value.endswith("%") and value[:-1].replace(".", "", 1).isdigit():
-            num = re.escape(value[:-1])
-            pct_pattern = re.compile(
-                rf"(?<![A-Za-z_\d])(?:{num}\s*(?:[%\u066A]|في\s+المائة|بالمائة|بالمئة)|[%\u066A]\s*{num})(?![A-Za-z_\d])"
-            )
-            return len(pct_pattern.findall(text))
-        # Allow surrounding Arabic prose, but distinguish IBANX from IBAN and 13 from 3.
-        left = r"(?<![A-Za-z_\d])" if value[0].isalnum() else ""
-        right = r"(?![A-Za-z_\d])" if value[-1].isalnum() else ""
-        if value.isdecimal():
-            # A bare number is also different from part of a decimal or thousands group.
-            text = re.sub(r"\{\s*\d+\s*\}", "", text)
-            left += r"(?<![+\-\u2212])(?<!\d[.,\u066B\u066C])"
-            right += r"(?![.,\u066B\u066C]\d)"
-        return len(re.findall(left + re.escape(value) + right, text))
 
     def _generate_translation(self, text):
         self._tokenizer.src_lang = self.src_nllb
