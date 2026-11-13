@@ -17,6 +17,10 @@ from tenacity import stop_after_attempt
 from tenacity import wait_exponential
 
 from babeldoc.babeldoc_exception.BabelDOCException import ContentFilterError
+from babeldoc.format.pdf.document_il.utils.sentence_splitter import (
+    SEGMENTATION_VERSION,
+    split_text_for_token_budget,
+)
 from babeldoc.translator.cache import TranslationCache
 from babeldoc.utils.atomic_integer import AtomicInteger
 
@@ -505,6 +509,40 @@ class BaseTranslator(ABC):
         self.translate_call_count = 0
         self.translate_cache_call_count = 0
         self.untranslated_count = 0  # text blocks the engine could not translate
+        self._incomplete_blocks = AtomicInteger()
+        self._call_state = threading.local()
+        self.add_cache_impact_parameters("segmentation_version", SEGMENTATION_VERSION)
+
+    @property
+    def incomplete_count(self):
+        blocks = getattr(self, "_incomplete_blocks", None)
+        return blocks.value if blocks is not None else 0
+
+    def _get_call_state(self):
+        state = getattr(self, "_call_state", None)
+        if state is None:
+            state = threading.local()
+            self._call_state = state
+        return state
+
+    def _inc_incomplete_once(self):
+        state = self._get_call_state()
+        if getattr(state, "incomplete_counted", False):
+            return
+        state.incomplete_counted = True
+        blocks = getattr(self, "_incomplete_blocks", None)
+        if blocks is None:
+            blocks = AtomicInteger()
+            self._incomplete_blocks = blocks
+        blocks.inc()
+
+    def _mark_call_failed(self):
+        self._get_call_state().failed = True
+
+    def _mark_call_incomplete(self):
+        state = self._get_call_state()
+        state.incomplete = True
+        self._inc_incomplete_once()
 
     def __del__(self):
         with contextlib.suppress(Exception):
@@ -558,8 +596,24 @@ class BaseTranslator(ABC):
         return translation
 
     def _translate_protected(self, text, mapping, rate_limit_params):
-        output = self.do_translate(text, rate_limit_params)
-        return _restore_numerals(output, mapping), True
+        state = self._get_call_state()
+        state.failed = False
+        state.incomplete = False
+        state.incomplete_counted = False
+        state.in_protected_call = True
+        before_untranslated = getattr(self, "untranslated_count", 0)
+        try:
+            output = self.do_translate(text, rate_limit_params)
+        finally:
+            state.in_protected_call = False
+        restored = _restore_numerals(output, mapping)
+        if (
+            getattr(state, "failed", False)
+            or getattr(state, "incomplete", False)
+            or getattr(self, "untranslated_count", 0) > before_untranslated
+        ):
+            return restored, False
+        return restored, True
 
     def llm_translate(self, text, ignore_cache=False, rate_limit_params: dict = None):
         """
@@ -798,7 +852,196 @@ class OpenAITranslator(BaseTranslator):
         return "</style>", r"<\s*\/\s*style\s*>"
 
 
-class MarianMTTranslator(BaseTranslator):
+def _collect_token_ids(value) -> set[int]:
+    if value is None:
+        return set()
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return {int(value)}
+    if isinstance(value, (list, tuple, set)):
+        return {int(v) for v in value if v is not None}
+    return set()
+
+
+def _count_seq2seq_tokens(tokenizer, text: str) -> int:
+    """Measure exact model input tokens without truncating."""
+    try:
+        encoded = tokenizer([text], truncation=False)
+        if isinstance(encoded, dict) or hasattr(encoded, "__getitem__"):
+            ids = encoded["input_ids"]
+            if ids:
+                first = ids[0]
+                return len(first) if hasattr(first, "__len__") else len(ids)
+    except TypeError:
+        try:
+            encoded = tokenizer(text)
+            ids = encoded["input_ids"]
+            return len(ids[0]) if ids and hasattr(ids[0], "__len__") else len(ids)
+        except Exception:
+            pass
+    except Exception:
+        pass
+    if hasattr(tokenizer, "encode"):
+        try:
+            return len(tokenizer.encode(text, truncation=False))
+        except TypeError:
+            return len(tokenizer.encode(text))
+    if hasattr(tokenizer, "tokenize"):
+        return len(tokenizer.tokenize(text)) + 2
+    return len(text.split()) + 2
+
+
+def _is_output_truncated(translated_tokens, tokenizer, model, max_length: int) -> bool:
+    """Return True if generation reached *max_length* without ending on EOS."""
+    first = translated_tokens[0]
+    seq = first.tolist() if hasattr(first, "tolist") else list(first)
+    if len(seq) < max_length:
+        return False
+    eos_ids = _collect_token_ids(getattr(tokenizer, "eos_token_id", None)) | _collect_token_ids(
+        getattr(getattr(model, "config", None), "eos_token_id", None)
+    )
+    pad_ids = (
+        _collect_token_ids(getattr(tokenizer, "pad_token_id", None))
+        | _collect_token_ids(getattr(getattr(model, "config", None), "pad_token_id", None))
+    ) - eos_ids
+    non_pad = list(seq)
+    while non_pad and int(non_pad[-1]) in pad_ids:
+        non_pad.pop()
+    if eos_ids:
+        return not non_pad or int(non_pad[-1]) not in eos_ids
+    return True
+
+
+class _Seq2SeqTranslator(BaseTranslator):
+    """Shared token-budget segmentation and truncation guards for HF Seq2Seq engines."""
+
+    def _effective_max_length(self) -> int:
+        limit = int(self.max_length)
+        tok_max = getattr(getattr(self, "_tokenizer", None), "model_max_length", None)
+        if isinstance(tok_max, int) and 0 < tok_max < 100_000:
+            limit = min(limit, tok_max)
+        return max(1, limit)
+
+    def _prepare_seq2seq_inputs(self, text: str, max_length: int, device: str):
+        try:
+            inputs = self._tokenizer(
+                [text],
+                return_tensors="pt",
+                padding=True,
+                truncation=False,
+            )
+            was_truncated = False
+        except TypeError:
+            inputs = self._tokenizer(
+                [text],
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=max_length,
+            )
+            was_truncated = False
+        input_ids = inputs["input_ids"]
+        seq_len = input_ids.shape[1] if hasattr(input_ids, "shape") else len(input_ids[0])
+        if seq_len > max_length:
+            was_truncated = True
+            logger.warning(
+                "%s input segment reached %s tokens (> max_length=%s) and could not be split safely; truncating and flagging incomplete.",
+                self.name,
+                seq_len,
+                max_length,
+            )
+            inputs = self._tokenizer(
+                [text],
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=max_length,
+            )
+        if hasattr(inputs, "to"):
+            inputs = inputs.to(device)
+        return inputs, was_truncated
+
+    def _run_seq2seq_chunk(self, text: str, generate_kwargs: dict, max_length: int) -> tuple[str, bool, bool]:
+        import torch
+
+        device = self._get_device()
+        inputs, input_truncated = self._prepare_seq2seq_inputs(text, max_length, device)
+        with torch.no_grad():
+            translated_tokens = self._model.generate(**inputs, **generate_kwargs)
+        output_truncated = _is_output_truncated(
+            translated_tokens, self._tokenizer, self._model, max_length
+        )
+        decoded = self._tokenizer.batch_decode(translated_tokens, skip_special_tokens=True)[0]
+        return decoded, input_truncated, output_truncated
+
+    def _translate_seq2seq_segments(
+        self,
+        segments: list[str],
+        make_gen_kwargs,
+        max_length: int,
+        depth: int = 0,
+    ) -> list[str]:
+        results: list[str] = []
+        min_output_resplit = max(4, min(16, max_length // 2))
+        for seg in segments:
+            decoded, in_trunc, out_trunc = self._run_seq2seq_chunk(
+                seg, make_gen_kwargs(max_length), max_length
+            )
+            if in_trunc:
+                self._mark_call_incomplete()
+            if out_trunc:
+                seg_tokens = _count_seq2seq_tokens(self._tokenizer, seg)
+                if depth < 2 and seg_tokens >= min_output_resplit:
+                    sub_segments, _ = split_text_for_token_budget(
+                        seg,
+                        lambda s: _count_seq2seq_tokens(self._tokenizer, s),
+                        max(1, seg_tokens // 2),
+                        allow_word_split=False,
+                    )
+                    if len(sub_segments) > 1:
+                        results.extend(
+                            self._translate_seq2seq_segments(
+                                sub_segments, make_gen_kwargs, max_length, depth=depth + 1
+                            )
+                        )
+                        continue
+                logger.warning(
+                    "%s generation hit max_length=%s without EOS; marking block incomplete.",
+                    self.name,
+                    max_length,
+                )
+                self._mark_call_incomplete()
+            results.append(decoded)
+        return results
+
+    def _translate_seq2seq_text(self, text: str, make_gen_kwargs) -> str:
+        state = self._get_call_state()
+        if not getattr(state, "in_protected_call", False):
+            state.failed = False
+            state.incomplete = False
+            state.incomplete_counted = False
+
+        limit = self._effective_max_length()
+        input_budget = max(1, limit - 2) if limit > 4 else limit
+        count_fn = lambda s: _count_seq2seq_tokens(self._tokenizer, s)
+        if count_fn(text) > limit:
+            segments, had_oversized = split_text_for_token_budget(
+                text, count_fn, input_budget, allow_word_split=True
+            )
+            if had_oversized:
+                self._mark_call_incomplete()
+        else:
+            segments = [text]
+
+        translated_parts = self._translate_seq2seq_segments(
+            segments, make_gen_kwargs, limit
+        )
+        if len(translated_parts) == 1:
+            return translated_parts[0]
+        joined = " ".join(part.strip() for part in translated_parts if part and part.strip())
+        return joined if joined else (translated_parts[0] if translated_parts else "")
+
+
+class MarianMTTranslator(_Seq2SeqTranslator):
     """
     Offline/Local Machine Translation using Hugging Face MarianMT models.
     Requires no API keys and runs entirely locally.
@@ -853,6 +1096,7 @@ class MarianMTTranslator(BaseTranslator):
         self._model = None
         self._tokenizer = None
         self.add_cache_impact_parameters("model", self.model_name)
+        self.add_cache_impact_parameters("max_length", self.max_length)
 
     def _get_device(self):
         if self._device is not None:
@@ -889,7 +1133,6 @@ class MarianMTTranslator(BaseTranslator):
             return cleaned_text
 
         self._load_model()
-        import torch
 
         # Protect numerals from translation (if not already shielded by translate())
         has_placeholders = bool(re.search(r'\{\d+\}', cleaned_text))
@@ -898,25 +1141,15 @@ class MarianMTTranslator(BaseTranslator):
         else:
             protected_text, numeral_map = cleaned_text, {}
 
-        device = self._get_device()
         try:
-            inputs = self._tokenizer(
-                [protected_text],
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=self.max_length
-            ).to(device)
-            
-            with torch.no_grad():
-                translated_tokens = self._model.generate(
-                    **inputs,
-                    max_length=self.max_length,
-                    no_repeat_ngram_size=4,
-                    repetition_penalty=1.1,
-                )
-            
-            translation = self._tokenizer.batch_decode(translated_tokens, skip_special_tokens=True)[0]
+            translation = self._translate_seq2seq_text(
+                protected_text,
+                lambda limit: {
+                    "max_length": limit,
+                    "no_repeat_ngram_size": 4,
+                    "repetition_penalty": 1.1,
+                },
+            )
             # Restore original numerals if shielded locally
             if numeral_map:
                 translation = _restore_numerals(translation.strip(), numeral_map)
@@ -924,6 +1157,7 @@ class MarianMTTranslator(BaseTranslator):
         except Exception as e:
             logger.error(f"Error during MarianMT translation: {e}")
             self.untranslated_count = getattr(self, "untranslated_count", 0) + 1
+            self._mark_call_failed()
             return cleaned_text
 
     def do_llm_translate(self, text, rate_limit_params: dict = None):
@@ -933,7 +1167,7 @@ class MarianMTTranslator(BaseTranslator):
 HuggingFaceTranslator = MarianMTTranslator
 
 
-class NLLBTranslator(BaseTranslator):
+class NLLBTranslator(_Seq2SeqTranslator):
     """
     State-of-the-Art Offline Local Translation with Meta NLLB-200 (No Language Left Behind).
     Supports 200+ languages including rich Modern Standard Arabic with full GPU (CUDA) acceleration.
@@ -1003,13 +1237,9 @@ class NLLBTranslator(BaseTranslator):
             and self.src_nllb == "eng_Latn"
             and self.tgt_nllb == "arb_Arab"
         )
-        self._incomplete_blocks = AtomicInteger()
+        self.add_cache_impact_parameters("max_length", self.max_length)
         if self._retry_missing_values:
             self.add_cache_impact_parameters("protected_content_retry", 1)
-
-    @property
-    def incomplete_count(self):
-        return self._incomplete_blocks.value
 
     def _get_device(self):
         if self._device is not None:
@@ -1097,10 +1327,14 @@ class NLLBTranslator(BaseTranslator):
         except Exception as e:
             logger.error(f"Error during NLLB translation: {e}")
             self.untranslated_count = getattr(self, "untranslated_count", 0) + 1
+            self._mark_call_failed()
             return cleaned_text
 
     def _translate_protected(self, text, mapping, rate_limit_params):
         first, cacheable = super()._translate_protected(text, mapping, rate_limit_params)
+        state = self._get_call_state()
+        if getattr(state, "failed", False) or (not cacheable and not getattr(state, "incomplete", False)):
+            return first, False
         if not self._retry_missing_values or not mapping:
             return first, cacheable
 
@@ -1112,6 +1346,7 @@ class NLLBTranslator(BaseTranslator):
         if not missing:
             return first, cacheable
 
+        was_incomplete = getattr(state, "incomplete", False)
         # Do not expose full account numbers (including grouped IBANs) or bank codes.
         literal = {
             tag: value for tag, value in mapping.items()
@@ -1121,19 +1356,25 @@ class NLLBTranslator(BaseTranslator):
         if literal:
             retry_text = re.sub(r"\{\d+\}", lambda match: literal.get(match[0], match[0]), text)
             remaining = {tag: value for tag, value in mapping.items() if tag not in literal}
+            state.incomplete = False
             try:
                 candidate = _restore_numerals(self._generate_translation(retry_text), remaining)
                 candidate = self._canonicalize_literal_values(candidate, literal.values())
             except Exception:
                 logger.warning("NLLB protected-content retry failed")
             else:
-                if re.search(r"[\u0621-\u064A]", candidate) and all(
-                    self._protected_value_count(candidate, value) == count
-                    for value, count in expected.items()
+                retry_incomplete = getattr(state, "incomplete", False)
+                if (
+                    not retry_incomplete
+                    and re.search(r"[\u0621-\u064A]", candidate)
+                    and all(
+                        self._protected_value_count(candidate, value) == count
+                        for value, count in expected.items()
+                    )
                 ):
-                    return candidate, True
+                    return candidate, (not was_incomplete)
 
-        self._incomplete_blocks.inc()
+        self._inc_incomplete_once()
         logger.warning("NLLB output is missing protected content. Check the translated block.")
         return self._retain_missing_protected_values(first, text, mapping, expected), False
 
@@ -1210,31 +1451,20 @@ class NLLBTranslator(BaseTranslator):
         return len(re.findall(left + re.escape(value) + right, text))
 
     def _generate_translation(self, text):
-        import torch
-
-        device = self._get_device()
         self._tokenizer.src_lang = self.src_nllb
-        inputs = self._tokenizer(
-            [text],
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=self.max_length
-        ).to(device)
 
-        gen_kwargs = {
-            "max_length": self.max_length,
-            "num_beams": 3 if self.load_in_8bit else 4,
-            "no_repeat_ngram_size": 4,
-            "repetition_penalty": 1.1,
-        }
-        if self._forced_bos_token_id is not None:
-            gen_kwargs["forced_bos_token_id"] = self._forced_bos_token_id
+        def make_gen_kwargs(limit: int) -> dict:
+            gen_kwargs = {
+                "max_length": limit,
+                "num_beams": 3 if self.load_in_8bit else 4,
+                "no_repeat_ngram_size": 4,
+                "repetition_penalty": 1.1,
+            }
+            if self._forced_bos_token_id is not None:
+                gen_kwargs["forced_bos_token_id"] = self._forced_bos_token_id
+            return gen_kwargs
 
-        with torch.no_grad():
-            translated_tokens = self._model.generate(**inputs, **gen_kwargs)
-
-        return self._tokenizer.batch_decode(translated_tokens, skip_special_tokens=True)[0]
+        return self._translate_seq2seq_text(text, make_gen_kwargs)
 
     def do_llm_translate(self, text, rate_limit_params: dict = None):
         raise NotImplementedError("NLLB uses sequence-to-sequence translation, not LLM chat completions.")

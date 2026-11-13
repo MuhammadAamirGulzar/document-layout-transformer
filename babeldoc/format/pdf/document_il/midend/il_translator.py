@@ -40,6 +40,7 @@ from babeldoc.format.pdf.document_il.utils.paragraph_helper import (
 from babeldoc.format.pdf.document_il.utils.paragraph_helper import (
     is_pure_numeric_paragraph,
 )
+from babeldoc.format.pdf.document_il.utils.sentence_splitter import split_sentences
 from babeldoc.format.pdf.document_il.utils.style_helper import GRAY80
 from babeldoc.format.pdf.translation_config import TranslationConfig
 from babeldoc.translator.translator import AUTHOR_YEAR_CITATION
@@ -783,15 +784,7 @@ class ILTranslator:
             # from truncating sentences at the tail of long paragraphs.
             # Periods in an author–year reference do not end a sentence.
             citations = [match.span() for match in AUTHOR_YEAR_CITATION.finditer(normalized_text)]
-            cuts = [match.span() for match in re.finditer(r"(?<=[.!?])\s+", normalized_text)
-                    if not any(start < match.start() < end for start, end in citations)]
-            sentences = []
-            start = 0
-            for left, right in cuts:
-                sentences.append(normalized_text[start:left].strip())
-                start = right
-            sentences.append(normalized_text[start:].strip())
-            sentences = [sentence for sentence in sentences if sentence]
+            sentences = split_sentences(normalized_text, citation_spans=citations)
             if len(sentences) > 1 and len(normalized_text) > 150:
                 translated_sentences = [
                     translate_segment(s)
