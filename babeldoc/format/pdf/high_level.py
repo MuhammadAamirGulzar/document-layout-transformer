@@ -427,6 +427,19 @@ async def async_translate(translation_config: TranslationConfig):
         loop=loop,
         report_interval=translation_config.report_interval,
     ) as pm:
+        translator_engine = getattr(translation_config, "translator", None)
+        if translator_engine is not None and hasattr(translator_engine, "set_model_status_callback"):
+            translator_engine.set_model_status_callback(
+                lambda loading, message="", elapsed_seconds=None: pm.heartbeat(
+                    stage=ILTranslator.stage_name,
+                    message=message,
+                    model_loading=loading,
+                    model_load_seconds=(
+                        round(elapsed_seconds, 2) if elapsed_seconds is not None else None
+                    ),
+                    force=True,
+                )
+            )
         future = loop.run_in_executor(None, do_translate, pm, translation_config)
         try:
             async for event in callback:
@@ -440,6 +453,8 @@ async def async_translate(translation_config: TranslationConfig):
             logger.info("Translation cancelled by user through keyboard interrupt")
             cancel_event.set()
         finally:
+            if translator_engine is not None and hasattr(translator_engine, "set_model_status_callback"):
+                translator_engine.set_model_status_callback(None)
             # A cancelled Future is not proof that its worker thread stopped.
             # Keep the engine slot until do_translate's finally/cleanup returns.
             if not future.done():

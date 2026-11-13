@@ -1374,6 +1374,12 @@
                             updateOverallProgress(data.overall_progress);
                             break;
 
+                        case 'heartbeat':
+                            if (typeof data.model_loading === 'boolean') {
+                                updateModelLoadingHint(data);
+                            }
+                            break;
+
                         case 'finish':
                             cancelBtn.disabled = true;
                             // Mark all stages as completed
@@ -1433,6 +1439,7 @@
                         cursor = Math.max(cursor, event.event_id || 0);
                     }
                     cursor = Math.max(cursor, state.next_event_id || 0);
+                    updateEtaDisplay(state.eta_seconds, state.model_loading);
                     updateUntranslatedNote(state.untranslated_count || 0, state.incomplete_count || 0);
                     if (['error', 'cancelled', 'timed_out'].includes(state.status) && !pollStopped) {
                         pollStopped = true;
@@ -1464,10 +1471,12 @@
             let hint = document.getElementById('modelLoadingHint');
             const stage = String((data && data.stage) || '');
             const current = Number(data && data.stage_current) || 0;
-            const waiting = !!data
-                && (data.type === 'progress_start' || data.type === 'progress_update')
-                && stage.includes('Translate Paragraphs')
-                && current === 0;
+            const waiting = data && typeof data.model_loading === 'boolean'
+                ? data.model_loading
+                : (!!data
+                    && (data.type === 'progress_start' || data.type === 'progress_update')
+                    && stage.includes('Translate Paragraphs')
+                    && current === 0);
             if (!hint) {
                 if (!waiting || !stageProgressText || !stageProgressText.parentElement) return;
                 hint = document.createElement('div');
@@ -1478,6 +1487,32 @@
                 stageProgressText.parentElement.insertAdjacentElement('afterend', hint);
             }
             hint.style.display = waiting ? 'block' : 'none';
+        }
+
+        function formatEtaSeconds(seconds) {
+            const total = Math.max(0, Math.round(seconds));
+            const mins = Math.floor(total / 60);
+            const secs = total % 60;
+            return mins > 0 ? `${mins}m ${secs}s remaining` : `${secs}s remaining`;
+        }
+
+        function updateEtaDisplay(etaSeconds, modelLoading) {
+            let etaEl = document.getElementById('etaEstimateText');
+            if (!etaEl && progressPercentage && progressPercentage.parentElement) {
+                etaEl = document.createElement('span');
+                etaEl.id = 'etaEstimateText';
+                etaEl.className = 'result-subtext';
+                etaEl.style.cssText = 'margin-left:10px; font-weight:500;';
+                progressPercentage.insertAdjacentElement('afterend', etaEl);
+            }
+            if (!etaEl) return;
+            if (modelLoading) {
+                etaEl.textContent = '• Loading model...';
+            } else if (typeof etaSeconds === 'number' && Number.isFinite(etaSeconds) && etaSeconds > 0) {
+                etaEl.textContent = `• ~${formatEtaSeconds(etaSeconds)}`;
+            } else {
+                etaEl.textContent = '';
+            }
         }
 
         function updateOverallProgress(progress) {

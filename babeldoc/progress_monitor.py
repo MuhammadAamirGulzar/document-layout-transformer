@@ -48,6 +48,7 @@ class ProgressMonitor:
         self.report_interval = report_interval
         logger.debug(f"report_interval: {self.report_interval}")
         self.last_report_time = 0
+        self.last_heartbeat_time = 0.0
         self.finish_stage_count = 0
         self.finish_event = finish_event
         self.cancel_event = cancel_event
@@ -233,6 +234,38 @@ class ProgressMonitor:
                 total_parts=self.total_parts,
             )
             self.last_report_time = time.time()
+
+    def heartbeat(
+        self,
+        stage: str | None = None,
+        message: str | None = None,
+        *,
+        force: bool = False,
+        **extra,
+    ):
+        """Emit a lightweight liveness heartbeat without altering stage counters."""
+        if self.disable or (self.parent_monitor and self.parent_monitor.disable):
+            return
+        if not self.progress_change_callback:
+            return
+        with self.lock:
+            now = time.monotonic()
+            if not force and (now - getattr(self, "last_heartbeat_time", 0.0)) < max(1.0, self.report_interval):
+                return
+            self.last_heartbeat_time = now
+            active_stage = self.stage.get(stage) if stage else None
+            payload = {
+                "type": "heartbeat",
+                "stage": stage or "",
+                "message": message or "",
+                "overall_progress": self.calculate_current_progress(active_stage),
+                "part_index": self.part_index + 1,
+                "total_parts": self.total_parts,
+            }
+            for k, v in extra.items():
+                if v is not None:
+                    payload[k] = v
+        self.progress_change_callback(**payload)
 
     def translate_done(self, translate_result):
         if self.disable or self.parent_monitor and self.parent_monitor.disable:

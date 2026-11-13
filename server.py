@@ -33,6 +33,33 @@ logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel("CRITICAL")
 logging.getLogger("openai").setLevel("CRITICAL")
 
+
+class _SuppressStatusPollAccessFilter(logging.Filter):
+    """Avoid flooding access logs with routine 200 OK polling checks."""
+
+    _POLL_200_RE = re.compile(
+        r'"(?:GET|HEAD)\s+(?:/translate/status/[^"\s]+|/health(?:\?[^"\s]*)?)\s+HTTP/[^"]+"\s+200\b'
+    )
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+        except Exception:
+            return True
+        return not bool(self._POLL_200_RE.search(msg))
+
+
+def _install_access_log_filter() -> None:
+    access_logger = logging.getLogger("uvicorn.access")
+    if not any(
+        isinstance(existing, _SuppressStatusPollAccessFilter)
+        for existing in access_logger.filters
+    ):
+        access_logger.addFilter(_SuppressStatusPollAccessFilter())
+
+
+_install_access_log_filter()
+
 # Initialize FastAPI app
 app = FastAPI(
     title="TransDOC Translation API",
@@ -300,10 +327,24 @@ def _setting_seconds(name, default):
     return float(default)
 
 
+def _optional_positive_seconds(name):
+    raw = os.getenv(name)
+    if raw is None or not str(raw).strip():
+        return None
+    try:
+        value = float(raw)
+        if math.isfinite(value) and value > 0:
+            return value
+    except ValueError:
+        pass
+    return None
+
+
 def _finish_stopped(session):
     reason = session.get("_stop_reason", "cancelled")
     message = "Translation timed out" if reason == "timed_out" else "Translation cancelled"
     session["status"] = reason
+    session["model_loading"] = False
     session["error"] = message
     session["_finished_at"] = time.time()
     _job_event(session, {"type": reason, "error": message})
@@ -353,9 +394,19 @@ async def _acquire_job_slot(session):
 
 async def _watch_job_deadline(session):
     idle_limit = _setting_seconds("JOB_TIMEOUT_SECONDS", 3600)
+    wall_limit = _optional_positive_seconds("JOB_MAX_WALL_SECONDS")
     while session.get("status") not in _terminal_states:
-        last_activity = session.get("_last_activity_at", time.monotonic())
-        if time.monotonic() - last_activity >= idle_limit:
+        now = time.monotonic()
+        last_activity = session.get("_last_activity_at", now)
+        started_mono = session.get("_started_mono_at")
+        if now - last_activity >= idle_limit:
+            _request_stop(session, "timed_out")
+            return
+        if (
+            wall_limit is not None
+            and started_mono is not None
+            and now - started_mono >= wall_limit
+        ):
             _request_stop(session, "timed_out")
             return
         await asyncio.sleep(0.05)
@@ -442,11 +493,73 @@ def _job_session(session_id):
     return translation_sessions[session_id]
 
 
+def _update_stage_timing(session, event):
+    event_type = event.get("type")
+    now = time.monotonic()
+    if event_type == "progress_start":
+        session["_active_stage_name"] = str(event.get("stage") or "")
+        session["_stage_current"] = int(event.get("stage_current") or 0)
+        session["_stage_total"] = int(event.get("stage_total") or 0)
+        session["_stage_rate_anchor"] = None
+    elif event_type == "heartbeat":
+        if "model_loading" in event:
+            loading = bool(event.get("model_loading"))
+            session["model_loading"] = loading
+            if loading:
+                # Exclude model download/load duration from subsequent block-rate ETA.
+                session["_stage_rate_anchor"] = None
+            elif session.get("_active_stage_name"):
+                session["_stage_rate_anchor"] = (
+                    int(session.get("_stage_current") or 0),
+                    now,
+                )
+    elif event_type == "progress_update":
+        stage = str(event.get("stage") or session.get("_active_stage_name") or "")
+        current = int(event.get("stage_current") or 0)
+        total = int(event.get("stage_total") or 0)
+        session["_active_stage_name"] = stage
+        session["_stage_current"] = current
+        session["_stage_total"] = total
+        if not session.get("model_loading") and session.get("_stage_rate_anchor") is None:
+            is_translate_stage = "translate paragraph" in stage.lower()
+            if not is_translate_stage or current >= 1:
+                session["_stage_rate_anchor"] = (current, now)
+    elif event_type == "progress_end":
+        total = int(event.get("stage_total") or 0)
+        session["_stage_current"] = total
+        session["_stage_total"] = total
+        session["model_loading"] = False
+        session["_stage_rate_anchor"] = None
+
+
+def _estimate_eta_seconds(session) -> float | None:
+    status = session.get("status")
+    if status == "completed":
+        return 0.0
+    if status != "processing" or session.get("model_loading"):
+        return None
+    total = int(session.get("_stage_total") or 0)
+    current = int(session.get("_stage_current") or 0)
+    anchor = session.get("_stage_rate_anchor")
+    if anchor is None or total <= 0 or current >= total:
+        return None
+    anchor_current, anchor_time = anchor
+    completed = current - anchor_current
+    elapsed = time.monotonic() - anchor_time
+    if completed < 2 or elapsed < 0.5:
+        return None
+    rate = completed / elapsed
+    if rate <= 0:
+        return None
+    return round(max(0.0, (total - current) / rate), 1)
+
+
 def _job_event(session, event):
     # The timeout protects against a stalled engine.  Long documents that keep
     # reporting progress must not be stopped only because their total runtime
     # exceeds the configured interval.
     session["_last_activity_at"] = time.monotonic()
+    _update_stage_timing(session, event)
     session["_event_id"] = session.get("_event_id", 0) + 1
     event = dict(event, event_id=session["_event_id"])
     history = session.setdefault("_events", [])
@@ -459,6 +572,7 @@ def _job_event(session, event):
 
 def _job_error(session, message):
     session["status"] = "error"
+    session["model_loading"] = False
     session["error"] = message
     session["_finished_at"] = time.time()
     _job_event(session, {"type": "error", "error": message})
@@ -467,10 +581,12 @@ def _job_error(session, message):
 async def _run_job(session):
     acquired = False
     watcher = None
+    run_owner = session.get("_run_owner")
     try:
         acquired = await _acquire_job_slot(session)
         if not acquired or session.get("_stop_reason"):
-            _finish_stopped(session)
+            if session.get("_run_owner") == run_owner:
+                _finish_stopped(session)
             return
         watcher = asyncio.create_task(_watch_job_deadline(session))
         final = None
@@ -493,6 +609,7 @@ async def _run_job(session):
             _job_error(session, "Translation completed but output file not found")
         else:
             session["status"] = "completed"
+            session["model_loading"] = False
             session["progress"] = 100
             session["_finished_at"] = time.time()
             _job_event(session, final)
@@ -516,7 +633,7 @@ async def _run_job(session):
         finally:
             if acquired:
                 _job_slots.release()
-            if session.get("status") in _terminal_states:
+            if session.get("_run_owner") == run_owner and session.get("status") in _terminal_states:
                 session.setdefault("_finished_at", time.time())
 
 
@@ -525,9 +642,12 @@ def _schedule_job(session):
     if session.get("_task") is not None or session.get("status") in _terminal_states:
         return False
     session.setdefault("_created_at", time.time())
+    session["_started_mono_at"] = time.monotonic()
+    session["_run_owner"] = uuid.uuid4().hex
     session["_cancel_signal"] = threading.Event()
     session["_stop_event"] = asyncio.Event()
     session["status"] = "queued"
+    session["model_loading"] = False
     session["error"] = None
     _job_event(session, {"type": "init", "message": "Queued for translation..."})
     session["_task"] = asyncio.create_task(_run_job(session))
@@ -556,6 +676,8 @@ async def translation_job_status(session_id: str, after: int = 0):
     if after < 0:
         raise HTTPException(status_code=400, detail="Event cursor must be non-negative")
     untranslated_count, incomplete_count, dispositions = _session_quality_counts(session)
+    started_mono = session.get("_started_mono_at")
+    last_activity = session.get("_last_activity_at")
     return {
         "session_id": session_id,
         "status": session["status"],
@@ -568,6 +690,18 @@ async def translation_job_status(session_id: str, after: int = 0):
         "incomplete_count": incomplete_count,
         "dispositions": dispositions,
         "has_quality_report": bool(session.get("quality_report_path")),
+        "model_loading": bool(session.get("model_loading", False)),
+        "elapsed_seconds": (
+            round(max(0.0, time.monotonic() - started_mono), 1)
+            if started_mono is not None
+            else None
+        ),
+        "eta_seconds": _estimate_eta_seconds(session),
+        "last_activity_seconds_ago": (
+            round(max(0.0, time.monotonic() - last_activity), 1)
+            if last_activity is not None
+            else None
+        ),
         "events": _job_events_after(session, after),
         "next_event_id": session.get("_event_id", 0),
     }
@@ -787,6 +921,21 @@ async def _translation_events(session):
                     "total_parts": event.get("total_parts", 1),
                 }
                 yield f"data: {json.dumps(progress_event)}\n\n"
+
+            elif event_type == "heartbeat":
+                hb_event = {
+                    "type": "heartbeat",
+                    "stage": event.get("stage", session.get("stage", "")),
+                    "message": event.get("message", ""),
+                    "overall_progress": round(event.get("overall_progress", session.get("progress", 0)), 1),
+                    "part_index": event.get("part_index", 1),
+                    "total_parts": event.get("total_parts", 1),
+                }
+                if "model_loading" in event:
+                    hb_event["model_loading"] = bool(event["model_loading"])
+                if event.get("model_load_seconds") is not None:
+                    hb_event["model_load_seconds"] = event["model_load_seconds"]
+                yield f"data: {json.dumps(hb_event)}\n\n"
 
             elif event_type == "progress_end":
                 stage = event.get("stage", "Unknown")
@@ -1137,6 +1286,7 @@ async def translate_document(
 if __name__ == "__main__":
     import uvicorn
     
+    _install_access_log_filter()
     port = int(os.getenv("PORT", 7860))
     
     logger.info(f"Starting TransDOC API server on port {port}")

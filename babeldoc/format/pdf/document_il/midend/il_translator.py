@@ -778,18 +778,18 @@ class ILTranslator:
         # Pre-translation terminology replacement
         text = self._pre_translate_terminology(text)
 
-        def translate_segment(segment: str) -> str:
+        def prepare_segment(segment: str):
             contact_fn = getattr(self, "_translate_contact_field_directly", None)
             if contact_fn is not None:
                 direct_contact = contact_fn(segment)
                 if direct_contact is not None:
-                    return direct_contact
+                    return ("literal", direct_contact, "")
             # List and section numbering is document structure.
             marker = re.match(r"^[ \t]*\d{1,3}(?:\.\d{1,3})*\.(?:[ \t]+|$)", segment)
             prefix = marker.group() if marker else ""
             body = segment[len(prefix):]
             if marker and not body:
-                return segment
+                return ("literal", segment, "")
             engine = self.translate_engine
             if (
                 not is_toc_block
@@ -812,7 +812,16 @@ class ILTranslator:
                 body += (subtraction["tail"] or "") + subtraction["punctuation"]
             inline_list = self._inline_numbered_list(body)
             if inline_list:
-                heading, items = inline_list
+                return ("inline_list", inline_list, prefix)
+            return ("plain", body, prefix)
+
+        def translate_segment(segment: str) -> str:
+            kind, payload, prefix = prepare_segment(segment)
+            engine = self.translate_engine
+            if kind == "literal":
+                return payload
+            if kind == "inline_list":
+                heading, items = payload
                 translated_parts = []
                 if heading:
                     translated_heading = engine.translate(heading, rate_limit_params=rate_limit_params)
@@ -822,8 +831,8 @@ class ILTranslator:
                     translated_parts.append(f"{item_marker} {translated_item}{separator}")
                 translated = " ".join(translated_parts)
             else:
-                translated = engine.translate(body, rate_limit_params=rate_limit_params)
-            return prefix + translated if marker else translated
+                translated = engine.translate(payload, rate_limit_params=rate_limit_params)
+            return prefix + translated if prefix else translated
 
         # Check if text contains Table of Contents (TOC) entries with dotted leader lines
         # e.g. "1. Introduction ................................................................................................. 1306"
@@ -880,10 +889,43 @@ class ILTranslator:
             citations = [match.span() for match in AUTHOR_YEAR_CITATION.finditer(normalized_text)]
             sentences = split_sentences(normalized_text, citation_spans=citations)
             if len(sentences) > 1 and len(normalized_text) > 150:
-                translated_sentences = [
-                    translate_segment(s)
-                    for s in sentences
-                ]
+                config = getattr(self, "translation_config", None)
+                cancel_fn = getattr(config, "raise_if_cancelled", None)
+                if callable(cancel_fn):
+                    cancel_fn()
+                engine = self.translate_engine
+                if getattr(type(engine), "supports_sentence_batching", False) is True:
+                    prepared = [prepare_segment(s) for s in sentences]
+                    plain_indices = [
+                        idx for idx, (kind, _, _) in enumerate(prepared) if kind == "plain"
+                    ]
+                    translated_sentences = [None] * len(sentences)
+                    if len(plain_indices) >= 2:
+                        plain_bodies = [prepared[idx][1] for idx in plain_indices]
+                        batch_out = engine.translate_batch(
+                            plain_bodies, rate_limit_params=rate_limit_params
+                        )
+                        for idx, tr_body in zip(plain_indices, batch_out):
+                            prefix = prepared[idx][2]
+                            translated_sentences[idx] = prefix + tr_body if prefix else tr_body
+                    for idx, sentence in enumerate(sentences):
+                        if translated_sentences[idx] is None:
+                            if callable(cancel_fn):
+                                cancel_fn()
+                            translated_sentences[idx] = translate_segment(sentence)
+                    pm = getattr(config, "progress_monitor", None)
+                    if pm is not None and hasattr(pm, "heartbeat"):
+                        pm.heartbeat(stage=getattr(self, "stage_name", "Translate Paragraphs"))
+                    return " ".join(translated_sentences)
+
+                translated_sentences = []
+                pm = getattr(config, "progress_monitor", None)
+                for sentence in sentences:
+                    if callable(cancel_fn):
+                        cancel_fn()
+                    translated_sentences.append(translate_segment(sentence))
+                    if pm is not None and hasattr(pm, "heartbeat"):
+                        pm.heartbeat(stage=getattr(self, "stage_name", "Translate Paragraphs"))
                 return " ".join(translated_sentences)
 
             return translate_segment(normalized_text)
@@ -2182,3 +2224,7 @@ Now, please carefully read the following text to be translated and directly outp
                 self.translate_engine.untranslated_count = getattr(self.translate_engine, "untranslated_count", 0) + 1
                 # ignore error and continue
                 return
+            finally:
+                pm = getattr(getattr(self, "translation_config", None), "progress_monitor", None)
+                if pm is not None and hasattr(pm, "heartbeat"):
+                    pm.heartbeat(stage=getattr(self, "stage_name", "Translate Paragraphs"))

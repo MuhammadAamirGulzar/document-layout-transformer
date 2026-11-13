@@ -1,5 +1,6 @@
 import contextlib
 import logging
+import os
 import re
 import threading
 import time
@@ -498,6 +499,8 @@ class BaseTranslator(ABC):
     # cache.py: translate_engine = CharField(max_length=20)
     name = "base"
     lang_map = {}
+    supports_sentence_batching = False
+    _model_status_callback = None
 
     def __init__(self, lang_in, lang_out, ignore_cache):
         self.ignore_cache = ignore_cache
@@ -519,7 +522,28 @@ class BaseTranslator(ABC):
         self.untranslated_count = 0  # text blocks the engine could not translate
         self._incomplete_blocks = AtomicInteger()
         self._call_state = threading.local()
+        self._model_lock = threading.Lock()
+        self._model_status_callback = None
         self.add_cache_impact_parameters("segmentation_version", SEGMENTATION_VERSION)
+
+    def _get_model_lock(self):
+        lock = getattr(self, "_model_lock", None)
+        return lock if lock is not None else contextlib.nullcontext()
+
+    def set_model_status_callback(self, callback):
+        self._model_status_callback = callback
+
+    def _emit_model_status(
+        self,
+        *,
+        loading: bool,
+        message: str = "",
+        elapsed_seconds: float | None = None,
+    ):
+        cb = getattr(self, "_model_status_callback", None)
+        if cb is not None:
+            with contextlib.suppress(Exception):
+                cb(loading=loading, message=message, elapsed_seconds=elapsed_seconds)
 
     @property
     def incomplete_count(self):
@@ -754,17 +778,20 @@ class BaseTranslator(ABC):
             return f"{body} ({literal_text}){punctuation.group(1)}"
         return f"{stripped} ({literal_text})"
 
-    def _translate_protected(self, text, mapping, rate_limit_params):
+    def translate_batch(
+        self,
+        texts: list[str],
+        ignore_cache: bool = False,
+        rate_limit_params: dict = None,
+    ) -> list[str]:
+        """Translate a list of texts while preserving per-item protection and caching."""
+        return [
+            self.translate(text, ignore_cache=ignore_cache, rate_limit_params=rate_limit_params)
+            for text in texts
+        ]
+
+    def _finalize_protected_translation(self, text, output, mapping, before_untranslated):
         state = self._get_call_state()
-        state.failed = False
-        state.incomplete = False
-        state.incomplete_counted = False
-        state.in_protected_call = True
-        before_untranslated = getattr(self, "untranslated_count", 0)
-        try:
-            output = self.do_translate(text, rate_limit_params)
-        finally:
-            state.in_protected_call = False
         first = _restore_numerals(output, mapping)
         if mapping:
             first = self._canonicalize_literal_values(first, mapping.values())
@@ -835,6 +862,19 @@ class BaseTranslator(ABC):
             "Check the translated block."
         )
         return self._retain_missing_protected_values(first, text, mapping, expected), False
+
+    def _translate_protected(self, text, mapping, rate_limit_params):
+        state = self._get_call_state()
+        state.failed = False
+        state.incomplete = False
+        state.incomplete_counted = False
+        state.in_protected_call = True
+        before_untranslated = getattr(self, "untranslated_count", 0)
+        try:
+            output = self.do_translate(text, rate_limit_params)
+        finally:
+            state.in_protected_call = False
+        return self._finalize_protected_translation(text, output, mapping, before_untranslated)
 
     def llm_translate(self, text, ignore_cache=False, rate_limit_params: dict = None):
         """
@@ -1133,7 +1173,26 @@ def _is_output_truncated(translated_tokens, tokenizer, model, max_length: int) -
 
 
 class _Seq2SeqTranslator(BaseTranslator):
-    """Shared token-budget segmentation and truncation guards for HF Seq2Seq engines."""
+    """Shared token-budget segmentation, batch decoding, and truncation guards for HF Seq2Seq engines."""
+
+    supports_sentence_batching = True
+
+    def _decode_batch_size(self) -> int:
+        raw = os.getenv("TRANSDOC_DECODE_BATCH_SIZE", "8")
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            return 8
+
+    def _prepare_generation_lang(self):
+        """Hook for subclasses needing tokenizer language state before generation."""
+
+    def _seq2seq_make_gen_kwargs(self):
+        return lambda limit: {
+            "max_length": limit,
+            "no_repeat_ngram_size": 4,
+            "repetition_penalty": 1.1,
+        }
 
     def _effective_max_length(self) -> int:
         limit = int(self.max_length)
@@ -1142,28 +1201,44 @@ class _Seq2SeqTranslator(BaseTranslator):
             limit = min(limit, tok_max)
         return max(1, limit)
 
-    def _prepare_seq2seq_inputs(self, text: str, max_length: int, device: str):
+    def _prepare_seq2seq_batch_inputs(
+        self, texts: list[str], max_length: int, device: str
+    ) -> tuple[object, list[bool]]:
+        count_fn = lambda s: _count_seq2seq_tokens(self._tokenizer, s)
+        truncated_flags = [count_fn(text) > max_length for text in texts]
+        any_truncated = any(truncated_flags)
+        if any_truncated:
+            for text, is_trunc in zip(texts, truncated_flags):
+                if is_trunc:
+                    logger.warning(
+                        "%s input segment reached > max_length=%s tokens and could not be split safely; truncating and flagging incomplete.",
+                        self.name,
+                        max_length,
+                    )
         try:
             inputs = self._tokenizer(
-                [text],
+                texts,
                 return_tensors="pt",
                 padding=True,
-                truncation=False,
+                truncation=any_truncated,
+                **(
+                    {"max_length": max_length}
+                    if any_truncated
+                    else {}
+                ),
             )
-            was_truncated = False
         except TypeError:
             inputs = self._tokenizer(
-                [text],
+                texts,
                 return_tensors="pt",
                 padding=True,
                 truncation=True,
                 max_length=max_length,
             )
-            was_truncated = False
         input_ids = inputs["input_ids"]
-        seq_len = input_ids.shape[1] if hasattr(input_ids, "shape") else len(input_ids[0])
-        if seq_len > max_length:
-            was_truncated = True
+        seq_len = input_ids.shape[1] if hasattr(input_ids, "shape") else (len(input_ids[0]) if input_ids else 0)
+        if not any_truncated and seq_len > max_length:
+            truncated_flags = [True] * len(texts)
             logger.warning(
                 "%s input segment reached %s tokens (> max_length=%s) and could not be split safely; truncating and flagging incomplete.",
                 self.name,
@@ -1171,7 +1246,7 @@ class _Seq2SeqTranslator(BaseTranslator):
                 max_length,
             )
             inputs = self._tokenizer(
-                [text],
+                texts,
                 return_tensors="pt",
                 padding=True,
                 truncation=True,
@@ -1179,15 +1254,43 @@ class _Seq2SeqTranslator(BaseTranslator):
             )
         if hasattr(inputs, "to"):
             inputs = inputs.to(device)
-        return inputs, was_truncated
+        return inputs, truncated_flags
+
+    def _prepare_seq2seq_inputs(self, text: str, max_length: int, device: str):
+        inputs, flags = self._prepare_seq2seq_batch_inputs([text], max_length, device)
+        return inputs, flags[0]
+
+    def _run_seq2seq_batch(
+        self, texts: list[str], make_gen_kwargs, max_length: int
+    ) -> list[tuple[str, bool, bool]]:
+        import torch
+
+        device = self._get_device()
+        generate_kwargs = make_gen_kwargs(max_length)
+        with self._get_model_lock():
+            self._prepare_generation_lang()
+            inputs, truncated_flags = self._prepare_seq2seq_batch_inputs(texts, max_length, device)
+            with torch.no_grad():
+                translated_tokens = self._model.generate(**inputs, **generate_kwargs)
+        decoded_list = self._tokenizer.batch_decode(translated_tokens, skip_special_tokens=True)
+        outcomes: list[tuple[str, bool, bool]] = []
+        for idx, decoded in enumerate(decoded_list):
+            row_tokens = translated_tokens[idx : idx + 1]
+            out_trunc = _is_output_truncated(
+                row_tokens, self._tokenizer, self._model, max_length
+            )
+            outcomes.append((decoded, truncated_flags[idx], out_trunc))
+        return outcomes
 
     def _run_seq2seq_chunk(self, text: str, generate_kwargs: dict, max_length: int) -> tuple[str, bool, bool]:
         import torch
 
         device = self._get_device()
-        inputs, input_truncated = self._prepare_seq2seq_inputs(text, max_length, device)
-        with torch.no_grad():
-            translated_tokens = self._model.generate(**inputs, **generate_kwargs)
+        with self._get_model_lock():
+            self._prepare_generation_lang()
+            inputs, input_truncated = self._prepare_seq2seq_inputs(text, max_length, device)
+            with torch.no_grad():
+                translated_tokens = self._model.generate(**inputs, **generate_kwargs)
         output_truncated = _is_output_truncated(
             translated_tokens, self._tokenizer, self._model, max_length
         )
@@ -1261,6 +1364,141 @@ class _Seq2SeqTranslator(BaseTranslator):
         joined = " ".join(part.strip() for part in translated_parts if part and part.strip())
         return joined if joined else (translated_parts[0] if translated_parts else "")
 
+    def translate_batch(
+        self,
+        texts: list[str],
+        ignore_cache: bool = False,
+        rate_limit_params: dict = None,
+    ) -> list[str]:
+        """Batch-decode multi-sentence lists while preserving per-item M2b/M4 guarantees."""
+        if not texts:
+            return []
+        if len(texts) == 1:
+            return [self.translate(texts[0], ignore_cache=ignore_cache, rate_limit_params=rate_limit_params)]
+
+        use_cache = not (self.ignore_cache or ignore_cache)
+        results: list[str] = [""] * len(texts)
+        pending: list[tuple[int, str, str, dict[str, str]]] = []
+
+        for idx, text in enumerate(texts):
+            self.translate_call_count += 1
+            if use_cache:
+                try:
+                    cached = self.cache.get(text)
+                    if cached is not None:
+                        self.translate_cache_call_count += 1
+                        results[idx] = cached
+                        continue
+                except Exception as exc:
+                    logger.debug(f"try get cache failed, ignore it: {exc}")
+
+            cleaned = remove_control_characters(str(text)) if text else text
+            if not cleaned or not str(cleaned).strip():
+                results[idx] = text
+                continue
+            if _is_pure_passthrough(cleaned):
+                results[idx] = cleaned
+                continue
+            protected_text, numeral_map = _protect_numerals(cleaned)
+            pending.append((idx, text, protected_text, numeral_map))
+
+        if not pending:
+            return results
+
+        if len(pending) == 1:
+            _translate_rate_limiter.wait()
+            idx, raw_text, protected_text, numeral_map = pending[0]
+            translated, cacheable = self._translate_protected(
+                protected_text, numeral_map, rate_limit_params
+            )
+            if cacheable and use_cache:
+                self.cache.set(raw_text, translated)
+            results[idx] = translated
+            return results
+
+        _translate_rate_limiter.wait()
+        try:
+            self._load_model()
+        except Exception as exc:
+            logger.error(f"Error loading {self.name} model for batch translation: {exc}")
+            for idx, raw_text, _, _ in pending:
+                self.untranslated_count = getattr(self, "untranslated_count", 0) + 1
+                self._mark_call_failed()
+                results[idx] = remove_control_characters(str(raw_text))
+            return results
+
+        limit = self._effective_max_length()
+        make_gen_kwargs = self._seq2seq_make_gen_kwargs()
+        normal_items: list[tuple[int, int, str, str, dict[str, str]]] = []
+        oversized_items: list[tuple[int, str, str, dict[str, str]]] = []
+
+        for idx, raw_text, protected_text, numeral_map in pending:
+            tok_len = _count_seq2seq_tokens(self._tokenizer, protected_text)
+            if tok_len > limit:
+                oversized_items.append((idx, raw_text, protected_text, numeral_map))
+            else:
+                normal_items.append((tok_len, idx, raw_text, protected_text, numeral_map))
+
+        for idx, raw_text, protected_text, numeral_map in oversized_items:
+            translated, cacheable = self._translate_protected(
+                protected_text, numeral_map, rate_limit_params
+            )
+            if cacheable and use_cache:
+                self.cache.set(raw_text, translated)
+            results[idx] = translated
+
+        # Group similarly sized sentences to minimize attention padding overhead.
+        normal_items.sort(key=lambda item: (item[0], item[1]))
+        batch_size = self._decode_batch_size()
+
+        for start in range(0, len(normal_items), batch_size):
+            chunk = normal_items[start : start + batch_size]
+            batch_inputs = [item[3] for item in chunk]
+            try:
+                raw_outputs = self._run_seq2seq_batch(batch_inputs, make_gen_kwargs, limit)
+            except Exception as exc:
+                logger.warning(f"{self.name} batch decode failed ({exc}); falling back per-sentence.")
+                for _, idx, raw_text, protected_text, numeral_map in chunk:
+                    translated, cacheable = self._translate_protected(
+                        protected_text, numeral_map, rate_limit_params
+                    )
+                    if cacheable and use_cache:
+                        self.cache.set(raw_text, translated)
+                    results[idx] = translated
+                continue
+
+            for (_, idx, raw_text, protected_text, numeral_map), (decoded, in_trunc, out_trunc) in zip(
+                chunk, raw_outputs
+            ):
+                state = self._get_call_state()
+                state.failed = False
+                state.incomplete = False
+                state.incomplete_counted = False
+                state.in_protected_call = True
+                before_untranslated = getattr(self, "untranslated_count", 0)
+                try:
+                    if in_trunc:
+                        self._mark_call_incomplete()
+                    if out_trunc:
+                        recovered_parts = self._translate_seq2seq_segments(
+                            [protected_text], make_gen_kwargs, limit
+                        )
+                        decoded = (
+                            recovered_parts[0]
+                            if len(recovered_parts) == 1
+                            else " ".join(p.strip() for p in recovered_parts if p and p.strip())
+                        )
+                finally:
+                    state.in_protected_call = False
+                translated, cacheable = self._finalize_protected_translation(
+                    protected_text, decoded, numeral_map, before_untranslated
+                )
+                if cacheable and use_cache:
+                    self.cache.set(raw_text, translated)
+                results[idx] = translated
+
+        return results
+
 
 class MarianMTTranslator(_Seq2SeqTranslator):
     """
@@ -1331,18 +1569,28 @@ class MarianMTTranslator(_Seq2SeqTranslator):
         return "cpu"
 
     def _load_model(self):
-        if self._model is None or self._tokenizer is None:
-            import torch
-            from transformers import AutoModelForSeq2SeqLM, AutoTokenizer, MarianMTModel, MarianTokenizer
-            device = self._get_device()
-            logger.info(f"Loading local MarianMT model: {self.model_name} on device: {device}")
-            try:
-                self._tokenizer = MarianTokenizer.from_pretrained(self.model_name)
-                self._model = MarianMTModel.from_pretrained(self.model_name).to(device)
-            except Exception:
-                self._tokenizer = AutoTokenizer.from_pretrained(self.model_name)
-                self._model = AutoModelForSeq2SeqLM.from_pretrained(self.model_name).to(device)
-            self._model.eval()
+        with self._get_model_lock():
+            if self._model is None or self._tokenizer is None:
+                import torch
+                from transformers import AutoModelForSeq2SeqLM, AutoTokenizer, MarianMTModel, MarianTokenizer
+                device = self._get_device()
+                started = time.monotonic()
+                logger.info(f"Loading local MarianMT model: {self.model_name} on device: {device}")
+                self._emit_model_status(loading=True, message=f"Loading {self.model_name}...")
+                try:
+                    try:
+                        self._tokenizer = MarianTokenizer.from_pretrained(self.model_name)
+                        self._model = MarianMTModel.from_pretrained(self.model_name).to(device)
+                    except Exception:
+                        self._tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+                        self._model = AutoModelForSeq2SeqLM.from_pretrained(self.model_name).to(device)
+                    self._model.eval()
+                finally:
+                    self._emit_model_status(
+                        loading=False,
+                        message=f"Model {self.model_name} ready",
+                        elapsed_seconds=time.monotonic() - started,
+                    )
 
     def do_translate(self, text: str, rate_limit_params: dict = None) -> str:
         if not text or not str(text).strip():
@@ -1377,15 +1625,15 @@ class MarianMTTranslator(_Seq2SeqTranslator):
             self._mark_call_failed()
             return cleaned_text
 
+    def _seq2seq_make_gen_kwargs(self):
+        return lambda limit: {
+            "max_length": limit,
+            "no_repeat_ngram_size": 4,
+            "repetition_penalty": 1.1,
+        }
+
     def _generate_translation(self, text: str) -> str:
-        return self._translate_seq2seq_text(
-            text,
-            lambda limit: {
-                "max_length": limit,
-                "no_repeat_ngram_size": 4,
-                "repetition_penalty": 1.1,
-            },
-        )
+        return self._translate_seq2seq_text(text, self._seq2seq_make_gen_kwargs())
 
     def do_llm_translate(self, text, rate_limit_params: dict = None):
         raise NotImplementedError("MarianMT uses sequence-to-sequence translation, not LLM chat completions.")
@@ -1477,52 +1725,61 @@ class NLLBTranslator(_Seq2SeqTranslator):
         return "cpu"
 
     def _load_model(self):
-        if self._model is None or self._tokenizer is None:
-            import torch
-            from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
-            
-            device = self._get_device()
-            logger.info(f"Loading Meta NLLB-200 model: {self.model_name} on device: {device} (8-bit: {self.load_in_8bit})")
-            
-            self._tokenizer = AutoTokenizer.from_pretrained(
-                self.model_name,
-                src_lang=self.src_nllb
-            )
-            
-            # Use 8-bit quantization on CUDA if requested (e.g. 3.3B model)
-            if device.startswith("cuda") and self.load_in_8bit:
+        with self._get_model_lock():
+            if self._model is None or self._tokenizer is None:
+                import torch
+                from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+
+                device = self._get_device()
+                started = time.monotonic()
+                logger.info(f"Loading Meta NLLB-200 model: {self.model_name} on device: {device} (8-bit: {self.load_in_8bit})")
+                self._emit_model_status(loading=True, message=f"Loading {self.model_name}...")
                 try:
-                    from transformers import BitsAndBytesConfig
-                    logger.info("Enabling BitsAndBytes 8-bit quantization for NLLB on CUDA")
-                    quant_config = BitsAndBytesConfig(load_in_8bit=True)
-                    self._model = AutoModelForSeq2SeqLM.from_pretrained(
+                    self._tokenizer = AutoTokenizer.from_pretrained(
                         self.model_name,
-                        quantization_config=quant_config,
-                        device_map="auto"
+                        src_lang=self.src_nllb
                     )
-                except Exception as e:
-                    logger.warning(f"Could not load 8-bit quantized model ({e}), falling back to float16")
-                    self._model = AutoModelForSeq2SeqLM.from_pretrained(
-                        self.model_name,
-                        dtype=torch.float16
-                    ).to(device)
-            elif device.startswith("cuda"):
-                # Use float16 on CUDA for fast inference and low VRAM footprint
-                self._model = AutoModelForSeq2SeqLM.from_pretrained(
-                    self.model_name,
-                    dtype=torch.float16
-                ).to(device)
-            else:
-                self._model = AutoModelForSeq2SeqLM.from_pretrained(
-                    self.model_name
-                ).to(device)
-            
-            self._model.eval()
-            
-            try:
-                self._forced_bos_token_id = self._tokenizer.convert_tokens_to_ids(self.tgt_nllb)
-            except Exception:
-                self._forced_bos_token_id = None
+
+                    # Use 8-bit quantization on CUDA if requested (e.g. 3.3B model)
+                    if device.startswith("cuda") and self.load_in_8bit:
+                        try:
+                            from transformers import BitsAndBytesConfig
+                            logger.info("Enabling BitsAndBytes 8-bit quantization for NLLB on CUDA")
+                            quant_config = BitsAndBytesConfig(load_in_8bit=True)
+                            self._model = AutoModelForSeq2SeqLM.from_pretrained(
+                                self.model_name,
+                                quantization_config=quant_config,
+                                device_map="auto"
+                            )
+                        except Exception as e:
+                            logger.warning(f"Could not load 8-bit quantized model ({e}), falling back to float16")
+                            self._model = AutoModelForSeq2SeqLM.from_pretrained(
+                                self.model_name,
+                                dtype=torch.float16
+                            ).to(device)
+                    elif device.startswith("cuda"):
+                        # Use float16 on CUDA for fast inference and low VRAM footprint
+                        self._model = AutoModelForSeq2SeqLM.from_pretrained(
+                            self.model_name,
+                            dtype=torch.float16
+                        ).to(device)
+                    else:
+                        self._model = AutoModelForSeq2SeqLM.from_pretrained(
+                            self.model_name
+                        ).to(device)
+
+                    self._model.eval()
+
+                    try:
+                        self._forced_bos_token_id = self._tokenizer.convert_tokens_to_ids(self.tgt_nllb)
+                    except Exception:
+                        self._forced_bos_token_id = None
+                finally:
+                    self._emit_model_status(
+                        loading=False,
+                        message=f"Model {self.model_name} ready",
+                        elapsed_seconds=time.monotonic() - started,
+                    )
 
     def do_translate(self, text: str, rate_limit_params: dict = None) -> str:
         if not text or not str(text).strip():
@@ -1557,9 +1814,11 @@ class NLLBTranslator(_Seq2SeqTranslator):
             self._mark_call_failed()
             return cleaned_text
 
-    def _generate_translation(self, text):
-        self._tokenizer.src_lang = self.src_nllb
+    def _prepare_generation_lang(self):
+        if getattr(self, "_tokenizer", None) is not None:
+            self._tokenizer.src_lang = self.src_nllb
 
+    def _seq2seq_make_gen_kwargs(self):
         def make_gen_kwargs(limit: int) -> dict:
             gen_kwargs = {
                 "max_length": limit,
@@ -1571,7 +1830,11 @@ class NLLBTranslator(_Seq2SeqTranslator):
                 gen_kwargs["forced_bos_token_id"] = self._forced_bos_token_id
             return gen_kwargs
 
-        return self._translate_seq2seq_text(text, make_gen_kwargs)
+        return make_gen_kwargs
+
+    def _generate_translation(self, text):
+        self._prepare_generation_lang()
+        return self._translate_seq2seq_text(text, self._seq2seq_make_gen_kwargs())
 
     def do_llm_translate(self, text, rate_limit_params: dict = None):
         raise NotImplementedError("NLLB uses sequence-to-sequence translation, not LLM chat completions.")
