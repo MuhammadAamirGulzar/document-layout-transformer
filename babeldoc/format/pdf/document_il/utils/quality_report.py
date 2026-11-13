@@ -56,6 +56,25 @@ class ContentLedger:
         self._lock = threading.Lock()
         self._entries: dict[Any, dict[str, Any]] = {}
         self._seq = 0
+        self._glyph_substitutions: dict[tuple[str, str, str], int] = {}
+        self._unsupported_glyph_count = 0
+
+    def record_glyph_substitutions(self, summary: dict[str, Any] | None) -> None:
+        """Accumulate glyph substitution statistics from typesetter passes."""
+        if not summary:
+            return
+        with self._lock:
+            for item in summary.get("substitutions") or []:
+                source = str(item.get("source", ""))
+                replacement = str(item.get("replacement", ""))
+                reason = str(item.get("reason", "unknown"))
+                count = int(item.get("count", 0) or 0)
+                if not source or count <= 0:
+                    continue
+                key = (source, replacement, reason)
+                self._glyph_substitutions[key] = self._glyph_substitutions.get(key, 0) + count
+                if reason == "unsupported_replacement":
+                    self._unsupported_glyph_count += count
 
     def record(
         self,
@@ -130,6 +149,8 @@ class ContentLedger:
     ) -> dict[str, Any]:
         with self._lock:
             entries = list(self._entries.values())
+            glyph_items = dict(self._glyph_substitutions)
+            unsupported_glyph_count = self._unsupported_glyph_count
         summary = self.snapshot()
         flagged = [
             entry
@@ -152,7 +173,25 @@ class ContentLedger:
             or summary["missing_content_blocks"] > 0
             or (engine_untranslated_count or 0) > 0
             or (engine_incomplete_count or 0) > 0
+            or unsupported_glyph_count > 0
         )
+        glyph_by_reason: dict[str, int] = {}
+        glyph_list = []
+        for (src, dst, reason), count in sorted(
+            glyph_items.items(),
+            key=lambda item: (-item[1], ord(item[0][0]), item[0][2]),
+        ):
+            glyph_by_reason[reason] = glyph_by_reason.get(reason, 0) + count
+            glyph_list.append(
+                {
+                    "source": src,
+                    "source_codepoint": f"U+{ord(src):04X}",
+                    "replacement": dst,
+                    "replacement_codepoint": f"U+{ord(dst):04X}",
+                    "reason": reason,
+                    "count": count,
+                }
+            )
         return {
             "schema_version": "1.0",
             "status": "needs_review" if needs_review else "clean",
@@ -166,6 +205,14 @@ class ContentLedger:
                 **summary,
                 "engine_untranslated_count": engine_untranslated_count,
                 "engine_incomplete_count": engine_incomplete_count,
+                "glyph_substitution_count": sum(glyph_items.values()),
+                "unsupported_glyph_count": unsupported_glyph_count,
+            },
+            "glyph_substitutions": {
+                "total_substitutions": sum(glyph_items.values()),
+                "unsupported_replacement_count": unsupported_glyph_count,
+                "by_reason": glyph_by_reason,
+                "substitutions": glyph_list,
             },
             "flagged_blocks": flagged,
             "blocks": entries,

@@ -923,6 +923,9 @@ class Typesetting:
         self._heading_clearance_resolved_pages: set[int] = set()
         self._inline_highlights_anchored_pages: set[int] = set()
         self._translated_code_band_keys: set[tuple[int, int]] = set()
+        self._glyph_substitutions: dict[tuple[str, str, str], int] = {}
+        self._unsupported_glyph_count: int = 0
+        self._skipped_format_chars: dict[str, int] = {}
 
     def _is_centered_display_text(self, paragraph, page) -> bool:
         """Recognize large centered titles even when labeled as plain text."""
@@ -1274,16 +1277,141 @@ class Typesetting:
 
         return text
 
+    _SCIENTIFIC_MULTIPLICATION_OPERATORS = frozenset({
+        "\u00d7",  # × MULTIPLICATION SIGN
+        "\u22c5",  # ⋅ DOT OPERATOR
+        "\u2217",  # ∗ ASTERISK OPERATOR
+        "\u2297",  # ⊗ CIRCLED TIMES
+        "\u2a2f",  # ⨯ VECTOR OR CROSS PRODUCT
+    })
+    _SCIENTIFIC_PROTECTED_OPERATORS = _SCIENTIFIC_MULTIPLICATION_OPERATORS | frozenset({
+        "\u2212",  # − MINUS SIGN
+        "\u00f7",  # ÷ DIVISION SIGN
+        "\u00b1",  # ± PLUS-MINUS SIGN
+        "\u2264",  # ≤ LESS-THAN OR EQUAL TO
+        "\u2265",  # ≥ GREATER-THAN OR EQUAL TO
+        "\u2260",  # ≠ NOT EQUAL TO
+        "\u2248",  # ≈ ALMOST EQUAL TO
+        "\u221e",  # ∞ INFINITY
+        "\u00b7",  # · MIDDLE DOT
+    })
+    _CROSS_GLYPHS = frozenset({
+        "\u2715",  # ✕ MULTIPLICATION X
+        "\u2716",  # ✖ HEAVY MULTIPLICATION X
+        "\u2717",  # ✗ BALLOT X
+        "\u2718",  # ✘ HEAVY BALLOT X
+        "\u274c",  # ❌ CROSS MARK
+        "\u2612",  # ☒ BALLOT BOX WITH X
+        "x",
+        "X",
+    })
     _SYMBOL_GLYPH_FALLBACKS = {
         "\u2610": "\u25a1",  # ☐ -> □
         "\u25fb": "\u25a1",  # ◻ -> □
         "\u25fd": "\u25a1",  # ◽ -> □
+        "\u25af": "\u25a1",  # ▯ -> □
+        "\u2b1c": "\u25a1",  # ⬜ -> □
+        "\u2b1b": "\u25a0",  # ⬛ -> ■
         "\u2611": "\u2713",  # ☑ -> ✓
         "\u2714": "\u2713",  # ✔ -> ✓
+        "\u2705": "\u2713",  # ✅ -> ✓
         "\u2612": "\u22a0",  # ☒ -> ⊠
         "\u2715": "\u00d7",  # ✕ -> ×
+        "\u2716": "\u00d7",  # ✖ -> ×
         "\u2717": "\u00d7",  # ✗ -> ×
+        "\u2718": "\u00d7",  # ✘ -> ×
+        "\u274c": "\u00d7",  # ❌ -> ×
+        "\u25b8": "\u2023",  # ▸ -> ‣
+        "\u25b9": "\u2023",  # ▹ -> ‣
+        "\u22c5": "\u2219",  # ⋅ -> ∙ (dot multiplication operator)
+        "\u2217": "*",       # ∗ -> * (asterisk operator)
+        "\u2a2f": "\u00d7",  # ⨯ -> × (vector cross product)
     }
+
+    @staticmethod
+    def _is_variation_selector(codepoint: int) -> bool:
+        """Return True for Unicode variation selectors that never render standalone."""
+        return (
+            0xFE00 <= codepoint <= 0xFE0F
+            or 0xE0100 <= codepoint <= 0xE01EF
+            or 0x180B <= codepoint <= 0x180D
+            or codepoint == 0x180F
+        )
+
+    @classmethod
+    def _is_forbidden_operator_substitution(cls, source: str, target: str) -> bool:
+        """Never downgrade scientific/mathematical operators into cross/ballot glyphs."""
+        return (
+            source in cls._SCIENTIFIC_PROTECTED_OPERATORS
+            and target in cls._CROSS_GLYPHS
+        )
+
+    def _record_glyph_substitution(
+        self,
+        source: str,
+        replacement: str,
+        reason: str,
+        paragraph=None,
+    ) -> None:
+        key = (source, replacement, reason)
+        first_seen = key not in self._glyph_substitutions
+        self._glyph_substitutions[key] = self._glyph_substitutions.get(key, 0) + 1
+        if reason == "unsupported_replacement":
+            self._unsupported_glyph_count += 1
+        if first_seen:
+            para_id = getattr(paragraph, "debug_id", None) or "<unknown>"
+            log_fn = logger.warning if reason == "unsupported_replacement" else logger.info
+            log_fn(
+                "Glyph substitution [%s]: %r (U+%04X) -> %r (U+%04X) in paragraph %s",
+                reason,
+                source,
+                ord(source),
+                replacement,
+                ord(replacement),
+                para_id,
+            )
+
+    def get_glyph_substitution_summary(self) -> dict[str, object]:
+        total = sum(self._glyph_substitutions.values())
+        by_reason: dict[str, int] = {}
+        entries = []
+        for (src, dst, reason), count in sorted(
+            self._glyph_substitutions.items(),
+            key=lambda item: (-item[1], ord(item[0][0]), item[0][2]),
+        ):
+            by_reason[reason] = by_reason.get(reason, 0) + count
+            entries.append(
+                {
+                    "source": src,
+                    "source_codepoint": f"U+{ord(src):04X}",
+                    "replacement": dst,
+                    "replacement_codepoint": f"U+{ord(dst):04X}",
+                    "reason": reason,
+                    "count": count,
+                }
+            )
+        return {
+            "total_substitutions": total,
+            "unsupported_replacement_count": self._unsupported_glyph_count,
+            "by_reason": by_reason,
+            "substitutions": entries,
+        }
+
+    def _log_and_report_glyph_substitutions(self) -> None:
+        summary = self.get_glyph_substitution_summary()
+        total = int(summary["total_substitutions"])
+        if total > 0:
+            log_fn = logger.warning if self._unsupported_glyph_count > 0 else logger.info
+            log_fn(
+                "Typesetting glyph substitution summary: total=%d unsupported_replacements=%d by_reason=%s",
+                total,
+                self._unsupported_glyph_count,
+                summary["by_reason"],
+            )
+        shared_ctx = getattr(self.translation_config, "shared_context_cross_split_part", None)
+        ledger = getattr(shared_ctx, "content_ledger", None)
+        if ledger is not None and hasattr(ledger, "record_glyph_substitutions"):
+            ledger.record_glyph_substitutions(summary)
 
     def _preflight_arabic_run(self, text: str, font: pymupdf.Font) -> None:
         """Validate contextual shaping against the actual embedded target font.
@@ -1746,6 +1874,7 @@ class Typesetting:
                 
                 self.render_page(page)
         
+        self._log_and_report_glyph_substitutions()
         # Add detailed logging at the end
         if self.detailed_logger:
             self.detailed_logger.log_step("Typesetting Complete")
@@ -2583,6 +2712,7 @@ class Typesetting:
                     None,
                 )
                 if target_font is not None:
+                    self._record_glyph_substitution(char.char_unicode, normalized, "nfkc")
                     char.char_unicode = normalized
             if target_font is None:
                 raise RuntimeError(
@@ -4387,6 +4517,7 @@ class Typesetting:
             Arabic reshaping can generate contextual presentation forms absent
             from a target cmap. Only in that case, use its NFKC base letter;
             supported presentation forms are retained for correct joining.
+            Fallbacks run strictly after direct target-font coverage misses.
             """
             if len(value) != 1:
                 raise ValueError(f"Expected a single output character, got {value!r}")
@@ -4395,19 +4526,22 @@ class Typesetting:
             # character and do not render as standalone glyphs.  Requiring a
             # target-font cmap entry for them makes otherwise valid translated
             # text fail during export (for example, U+FE0F after a symbol).
-            if (
-                0xFE00 <= codepoint <= 0xFE0F
-                or 0xE0100 <= codepoint <= 0xE01EF
-            ):
+            if self._is_variation_selector(codepoint):
                 return None, None
             if unicodedata.category(value) == "Cc":
                 return None, None
-            is_arabic_target = len(value) == 1 and (
-                0x0600 <= ord(value) <= 0x06FF
-                or 0x0750 <= ord(value) <= 0x077F
-                or 0x08A0 <= ord(value) <= 0x08FF
-                or 0xFB50 <= ord(value) <= 0xFDFF
-                or 0xFE70 <= ord(value) <= 0xFEFF
+            if 0xE000 <= codepoint <= 0xF8FF:
+                bullet = "\u2022"
+                bullet_font = self.font_mapper.map(source_font, bullet)
+                if bullet_font is not None:
+                    self._record_glyph_substitution(value, bullet, "pua_bullet", paragraph)
+                    return bullet, bullet_font
+            is_arabic_target = (
+                0x0600 <= codepoint <= 0x06FF
+                or 0x0750 <= codepoint <= 0x077F
+                or 0x08A0 <= codepoint <= 0x08FF
+                or 0xFB50 <= codepoint <= 0xFDFF
+                or 0xFE70 <= codepoint <= 0xFEFF
             )
             # A translated paragraph can inherit Source Han's style ID from
             # the English PDF; that face must never become the output owner of
@@ -4418,21 +4552,59 @@ class Typesetting:
                 if weighted_target is not None:
                     return value, weighted_target
                 for arabic_font in self.font_mapper.arabic_fonts:
-                    if arabic_font.has_glyph(ord(value)):
+                    if arabic_font.has_glyph(codepoint):
                         return value, arabic_font
-            target_font = self.font_mapper.map(source_font, value)
-            if target_font is not None:
-                return value, target_font
+            else:
+                target_font = self.font_mapper.map(source_font, value)
+                if target_font is not None:
+                    return value, target_font
+
             normalized = unicodedata.normalize("NFKC", value)
-            if len(normalized) == 1 and normalized != value:
+            if (
+                len(normalized) == 1
+                and normalized != value
+                and not self._is_forbidden_operator_substitution(value, normalized)
+            ):
                 target_font = self.font_mapper.map(source_font, normalized)
                 if target_font is not None:
+                    self._record_glyph_substitution(value, normalized, "nfkc", paragraph)
                     return normalized, target_font
+                if self.is_arabic and is_arabic_target:
+                    for arabic_font in self.font_mapper.arabic_fonts:
+                        if arabic_font.has_glyph(ord(normalized)):
+                            self._record_glyph_substitution(value, normalized, "nfkc", paragraph)
+                            return normalized, arabic_font
+
             fallback_value = self._SYMBOL_GLYPH_FALLBACKS.get(value)
-            if fallback_value:
+            if fallback_value and not self._is_forbidden_operator_substitution(value, fallback_value):
                 target_font = self.font_mapper.map(source_font, fallback_value)
                 if target_font is not None:
+                    self._record_glyph_substitution(
+                        value, fallback_value, "symbol_fallback", paragraph
+                    )
                     return fallback_value, target_font
+
+            if unicodedata.category(value) == "Cf":
+                self._skipped_format_chars[value] = self._skipped_format_chars.get(value, 0) + 1
+                logger.debug(
+                    "Skipped uncovered format control U+%04X in paragraph %s",
+                    codepoint,
+                    getattr(paragraph, "debug_id", None) or "<unknown>",
+                )
+                return None, None
+
+            if not is_arabic_target:
+                replacement = "\uFFFD"
+                replacement_font = self.font_mapper.map(source_font, replacement)
+                if (
+                    replacement_font is not None
+                    and replacement_font.has_glyph(ord(replacement))
+                ):
+                    self._record_glyph_substitution(
+                        value, replacement, "unsupported_replacement", paragraph
+                    )
+                    return replacement, replacement_font
+
             message = (
                 f"No target-font coverage for {value!r} in paragraph "
                 f"{getattr(paragraph, 'debug_id', None) or '<unknown>'}"
@@ -4469,9 +4641,7 @@ class Typesetting:
                     )
                 )
                 source_font = get_font(style.font_id, char_xobj)
-                target_value, target_font = resolve_unicode(
-                    source_font, "•" if is_pua_bullet else value
-                )
+                target_value, target_font = resolve_unicode(source_font, value)
                 if target_value is None:
                     return TypesettingUnit(char=char)
                 return TypesettingUnit(
