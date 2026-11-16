@@ -18,7 +18,7 @@ _NUMBERED_INSTRUCTION_LINE_RE = re.compile(
 _CODE_DEF_OR_BLOCK_RE = re.compile(
     r"^\s*(?:"
     r"(?:def|async\s+def|class|function|procedure|fn|sub)\s+[A-Za-z_]\w*\s*(?:\(|:|\{)|"
-    r"(?:import|from)\s+[A-Za-z_][\w.]*(?:\s+import\b)?|"
+    r"import\s+[A-Za-z_][\w.]*|from\s+[A-Za-z_][\w.]*\s+import\s+[A-Za-z_*]|"
     r"(?:public|private|protected|static|const|let|var)\s+[A-Za-z_]\w*\s*(?:=|:|\()|"
     r"(?:SELECT|INSERT\s+INTO|UPDATE|DELETE\s+FROM|CREATE\s+TABLE)\b|"
     r"(?:return|yield|raise|throw)\b(?:\s+[\w\(\[\{\'\"\-]|\s*;?\s*$)|"
@@ -28,19 +28,20 @@ _CODE_DEF_OR_BLOCK_RE = re.compile(
 _CODE_CONTROL_RE = re.compile(
     r"^\s*(?:\d+\s*[:.)]?\s*)?(?:"
     r"(?:function|procedure|def)\s+\w+\s*\(|"
-    r"(?:for|while)\b.+\b(?:do|in|to)\b|"
     r"(?:for|while)\s*\([^)]*\)|"
+    r"(?:for|while)\s+(?:each\s+)?[A-Za-z_]\w*(?:\s*,\s*[A-Za-z_]\w*)?\s+(?:←|:=|=|\bin\b)\s*\S.*?\b(?:do|to)\b|"
+    r"(?:for|while)\b.+\bdo\s*(?::|\{|$)|"
     r"if\b.+\bthen\b|"
     r"if\s*\([^)]+\)\s*(?:\{|:)|"
-    r"else(?:\s+if\b.*)?\s*(?:\{|:|\b)|"
+    r"else\s*(?:if\b.*?(?:\{|:|\bthen\b)|\{|:|$)|"
     r"elif\b.+:|"
-    r"repeat\b|until\b|return\b|"
+    r"repeat\s*(?::|\{|$)|until\s*\(|return\b(?:\s+[\w\(\[\{\'\"\-]|\s*;?\s*$)|"
     r"end\s+(?:if|for|while|function|procedure)\b)",
     re.IGNORECASE,
 )
 
 _CODE_OP_RE = re.compile(
-    r"(?:←|:=|=>|->|::|\+=|-=|\*=|==|!=|<=|>=|&&|\|\||;\s*$|[\{\}]\s*$)"
+    r"(?:←|:=|=>|->|::|\+=|-=|\*=|==|!=|<=|>=|&&|\|\||(?:[()={}]|\breturn\b).*;\s*$|[\{\}]\s*$)"
 )
 _CODE_ASSIGN_RE = re.compile(r"^\s*[A-Za-z_]\w*(?:\[[^\]]+\]|\.[A-Za-z_]\w*)*\s*(?:←|:=|=)\s*\S")
 _FUNCTION_CALL_OR_SNAKE_RE = re.compile(r"\b[a-z_][a-z0-9_]*_[a-z0-9_]+\b|\b[A-Za-z_]\w*\([^)\n]*\)")
@@ -207,6 +208,14 @@ def classify_pseudocode_region_paragraphs(
             or (len(assignment_rows) >= 3 and len(control_rows) >= 1)
         )
     )
+    is_table_container = cname in {"table", "wired_table", "wireless_table"}
+    if is_table_container and not captions:
+        # A genuine table layout without an Algorithm/Listing caption must not be
+        # mistaken for unnumbered code unless it has both sequential line numbers
+        # and explicit code definitions/assignments.
+        if classic_numbered and (len(def_rows) >= 1 or len(assignment_rows) >= 2):
+            return True, body_candidates, captions
+        return False, [], []
     if explicit_code_region and (classic_numbered or unnumbered_code or (len(def_rows) + len(assignment_rows) + len(control_rows)) >= 2):
         return True, body_candidates, captions
     if classic_numbered or unnumbered_code:

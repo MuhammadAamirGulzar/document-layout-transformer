@@ -299,3 +299,125 @@ def test_unresolvable_clipping_is_reported_to_quality_report_ledger():
     assert report["status"] == "needs_review"
     assert report["summary"]["clipped_content_count"] == 2
     assert len(report["layout_issues"]) == 2
+
+
+def test_continuation_pagination_with_formula_clears_nested_xobj_ownership():
+    """Overflowing paragraphs containing PdfFormula, PdfLine, and PdfSameStyleCharacters move to a continuation page without AttributeError and clear all nested xobj_id fields."""
+    from babeldoc.format.pdf.document_il.il_version_1 import (
+        GraphicState,
+        PdfCurve,
+        PdfForm,
+        PdfFormula,
+        PdfLine,
+        PdfSameStyleCharacters,
+        VisualBbox,
+    )
+
+    cfg = _make_config(with_progress=True)
+    style = PdfStyle(font_id="F1", font_size=10.0)
+
+    p0_top = _make_paragraph(
+        "المقدمة العامة للتقرير الفني " * 8,
+        Box(50.0, 560.0, 545.0, 780.0),
+        debug_id=401,
+    )
+    f_char = PdfCharacter(
+        char_unicode="1",
+        pdf_character_id=49,
+        box=Box(120.0, 56.0, 126.0, 66.0),
+        visual_bbox=VisualBbox(box=Box(120.0, 56.0, 126.0, 66.0)),
+        pdf_style=style,
+        xobj_id=7,
+    )
+    f_curve = PdfCurve(
+        box=Box(120.0, 55.0, 126.0, 56.0),
+        graphic_state=GraphicState(),
+        xobj_id=7,
+    )
+    f_form = PdfForm(
+        box=Box(120.0, 55.0, 126.0, 66.0),
+        graphic_state=GraphicState(),
+        xobj_id=7,
+    )
+    formula = PdfFormula(
+        box=Box(120.0, 55.0, 126.0, 66.0),
+        pdf_character=[f_char],
+        pdf_curve=[f_curve],
+        pdf_form=[f_form],
+        x_offset=0.0,
+        y_offset=0.0,
+        x_advance=6.0,
+    )
+    direct_char = PdfCharacter(
+        char_unicode="أ",
+        pdf_character_id=101,
+        box=Box(100.0, 54.0, 110.0, 66.0),
+        visual_bbox=VisualBbox(box=Box(100.0, 54.0, 110.0, 66.0)),
+        pdf_style=style,
+        xobj_id=7,
+    )
+    p0_overflow_with_formula = PdfParagraph(
+        debug_id=402,
+        box=Box(50.0, 50.0, 545.0, 95.0),
+        unicode="فقرة تفيض مع معادلة 1",
+        pdf_style=style,
+        xobj_id=7,
+        layout_label="body",
+        pdf_paragraph_composition=[
+            PdfParagraphComposition(pdf_character=direct_char),
+            PdfParagraphComposition(pdf_formula=formula),
+        ],
+    )
+    p0_fn = _make_paragraph(
+        "1 حاشية ثابتة في أسفل الصفحة.",
+        Box(50.0, 52.0, 545.0, 88.0),
+        debug_id=403,
+        layout_label="footnote",
+    )
+    il_doc = Document(
+        page=[_make_page([p0_top, p0_overflow_with_formula, p0_fn], page_number=0)],
+        total_pages=1,
+    )
+    ts = Typesetting(cfg)
+    # Trigger pagination directly on the pre-rendered paragraph containing PdfFormula
+    p0_overflow_with_formula.pipeline_trace = {"page_overflow": True}
+    created = ts._paginate_overflowing_pages(il_doc)
+    assert created == 1
+    assert len(il_doc.page) == 2
+    cont_page = il_doc.page[1]
+    assert cont_page.continuation_of_page == 0
+    moved_paras = [p for p in cont_page.pdf_paragraph if p.debug_id == 402]
+    assert len(moved_paras) == 1
+    moved = moved_paras[0]
+    assert moved.xobj_id is None
+    formulas_on_cont = [c.pdf_formula for c in moved.pdf_paragraph_composition if c.pdf_formula is not None]
+    assert len(formulas_on_cont) == 1
+    for comp in moved.pdf_paragraph_composition:
+        if comp.pdf_character is not None:
+            assert comp.pdf_character.xobj_id is None
+        if comp.pdf_formula is not None:
+            assert all(ch.xobj_id is None for ch in comp.pdf_formula.pdf_character)
+            assert all(cv.xobj_id is None for cv in comp.pdf_formula.pdf_curve)
+            assert all(fm.xobj_id is None for fm in comp.pdf_formula.pdf_form)
+
+    # Also verify PdfLine and PdfSameStyleCharacters ownership cleanup directly
+    line_char = PdfCharacter(char_unicode="x", box=Box(10, 10, 15, 20), pdf_style=style, xobj_id=9)
+    ssc_char = PdfCharacter(char_unicode="y", box=Box(16, 10, 21, 20), pdf_style=style, xobj_id=9)
+    mixed_para = PdfParagraph(
+        debug_id=404,
+        box=Box(10, 10, 50, 20),
+        xobj_id=9,
+        pdf_style=style,
+        pdf_paragraph_composition=[
+            PdfParagraphComposition(pdf_line=PdfLine(box=Box(10, 10, 15, 20), pdf_character=[line_char])),
+            PdfParagraphComposition(
+                pdf_same_style_characters=PdfSameStyleCharacters(
+                    box=Box(16, 10, 21, 20), pdf_style=style, pdf_character=[ssc_char]
+                )
+            ),
+        ],
+    )
+    ts._clear_paragraph_xobj_id(mixed_para)
+    assert mixed_para.xobj_id is None
+    assert line_char.xobj_id is None
+    assert ssc_char.xobj_id is None

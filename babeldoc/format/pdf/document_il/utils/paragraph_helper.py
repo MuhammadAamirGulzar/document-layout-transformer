@@ -36,7 +36,7 @@ def is_cid_paragraph(paragraph: il_version_1.PdfParagraph):
     return cid_count > len(chars) * 0.8
 
 
-NUMERIC_PATTERN = re.compile(r"^-?\d+(\.\d+)?$")
+NUMERIC_PATTERN = re.compile(r"^-?(?:\d{1,3}(?:[, \u00a0]\d{3})+|\d+)(?:\.\d+)?$")
 
 
 def is_pure_numeric_paragraph(paragraph) -> bool:

@@ -269,3 +269,99 @@ def test_substitution_counting_logging_and_quality_report(caplog, tmp_path):
     assert report["summary"]["unsupported_glyph_count"] == 1
     assert report["summary"]["glyph_substitution_count"] == summary["total_substitutions"]
     assert report["glyph_substitutions"]["total_substitutions"] == summary["total_substitutions"]
+
+
+def test_format_controls_drive_bidi_and_shaping_without_emitting_visible_glyphs():
+    """BiDi/shaping Cf controls must order/shape text during layout and never emit PdfCharacter glyphs."""
+    import unicodedata
+
+    ts = Typesetting(_make_config())
+    page = Page(
+        page_number=1,
+        cropbox=Cropbox(box=Box(x=0.0, y=0.0, x2=595.0, y2=842.0)),
+        pdf_font=[PdfFont(font_id="F1", name="Times-Roman")],
+    )
+    fonts = {"F1": PdfFont(font_id="F1", name="Times-Roman"), **ts.font_mapper.fontid2font}
+
+    # 1. LRM (\u200e) and RLM (\u200f) around Latin citations and formulas:
+    #    - create_typesetting_units retains \u200e/\u200f with 0 width so BiDi ordering sees them.
+    #    - render_paragraph orders the citation/formula LTR and emits zero Cf PdfCharacters.
+    lrm_para = _make_paragraph("نتائج \u200e(Smith, 2020; x = 1 + 2)\u200e\u200f مؤكدة.", font_id="F1", debug_id=101)
+    lrm_units = ts.create_typesetting_units(lrm_para, fonts, page=page)
+    assert any(u.unicode == "\u200e" for u in lrm_units)
+    assert all(u.width == 0.0 for u in lrm_units if u.unicode and unicodedata.category(u.unicode) == "Cf")
+
+    ts.render_paragraph(lrm_para, page, fonts)
+    rendered_chars = [
+        c.pdf_character
+        for c in lrm_para.pdf_paragraph_composition
+        if c.pdf_character is not None
+    ]
+    assert rendered_chars
+    assert not any(
+        ch.char_unicode and unicodedata.category(ch.char_unicode) == "Cf"
+        for ch in rendered_chars
+    )
+    # Verify "Smith" characters progress strictly left-to-right in X coordinate
+    smith_xs = [ch.box.x for ch in rendered_chars if ch.char_unicode in ("S", "m", "i", "t", "h")]
+    assert len(smith_xs) == 5
+    assert smith_xs == sorted(smith_xs)
+
+    # 2. ZWJ (\u200d) and ZWNJ (\u200c) Arabic shaping:
+    #    - "ب\u200d" shapes beh to initial form (\uFE91), whereas isolated "ب" is \uFE8F.
+    #    - "ب\u200cه" keeps beh isolated (\uFE8F) and heh isolated (\uFEE9), whereas "به" joins (\uFE91\uFEEA).
+    shaped_zwj = ts.shape_arabic_text("ب\u200d")
+    shaped_iso = ts.shape_arabic_text("ب")
+    assert "\uFE91" in shaped_zwj
+    assert "\uFE8F" in shaped_iso
+
+    shaped_zwnj = ts.shape_arabic_text("ب\u200cه")
+    shaped_joined = ts.shape_arabic_text("به")
+    assert "\uFE8F" in shaped_zwnj and "\uFEE9" in shaped_zwnj
+    assert "\uFE91" in shaped_joined and "\uFEEA" in shaped_joined
+
+    zwj_para = _make_paragraph("ب\u200d و ب\u200cه", font_id="F1", debug_id=102)
+    ts.render_paragraph(zwj_para, page, fonts)
+    zwj_rendered = [
+        c.pdf_character.char_unicode
+        for c in zwj_para.pdf_paragraph_composition
+        if c.pdf_character is not None
+    ]
+    assert "\u200d" not in zwj_rendered and "\u200c" not in zwj_rendered
+    assert "\uFE91" in zwj_rendered and "\uFE8F" in zwj_rendered
+
+    # 3. Word joiner (\u2060) and directional isolates (\u2066..\u2069):
+    isolate_para = _make_paragraph(
+        "المرجع \u2066E/ICEF/2025/P/L.5\u2069 ورمز A\u2060B.",
+        font_id="F1",
+        debug_id=103,
+    )
+    iso_units = ts.create_typesetting_units(isolate_para, fonts, page=page)
+    a_unit = next(u for u in iso_units if u.unicode == "A")
+    assert getattr(a_unit, "no_break_after", False) is True
+    ts.render_paragraph(isolate_para, page, fonts)
+    iso_chars = [
+        c.pdf_character
+        for c in isolate_para.pdf_paragraph_composition
+        if c.pdf_character is not None
+    ]
+    assert not any(
+        ch.char_unicode and unicodedata.category(ch.char_unicode) == "Cf"
+        for ch in iso_chars
+    )
+    # Verify E, /, I, C, E, F inside the LRI..PDI isolate progress left-to-right
+    icef_xs = [ch.box.x for ch in iso_chars if ch.char_unicode in ("I", "C", "F")]
+    assert len(icef_xs) == 3 and icef_xs == sorted(icef_xs)
+
+    # 4. Mixed Arabic, numbers, and acronyms:
+    mixed_para = _make_paragraph("بلغت ميزانية UNICEF نحو 192,714 دولاراً في عام 2025.", font_id="F1", debug_id=104)
+    ts.render_paragraph(mixed_para, page, fonts)
+    mixed_chars = [
+        c.pdf_character
+        for c in mixed_para.pdf_paragraph_composition
+        if c.pdf_character is not None
+    ]
+    unicef_xs = [ch.box.x for ch in mixed_chars if ch.char_unicode in ("U", "N", "I", "C", "E", "F")]
+    num_xs = [ch.box.x for ch in mixed_chars if ch.char_unicode in ("1", "9", "7", "4")]
+    assert unicef_xs == sorted(unicef_xs)
+    assert num_xs == sorted(num_xs)

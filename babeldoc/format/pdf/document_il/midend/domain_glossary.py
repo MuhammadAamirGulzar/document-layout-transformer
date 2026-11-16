@@ -70,6 +70,11 @@ _PRE_RULES: list[tuple[re.Pattern, str]] = [
      r'Selecting \2 of \1 neurons'),
     # Institutional / policy / UN report terminology
     (re.compile(r'\bCountry\s+programme\s+document\b', _I), 'وثيقة البرنامج القطري'),
+    (re.compile(r'\bProgramme\s+rationale\b', _I), 'الأساس المنطقي للبرنامج'),
+    (re.compile(r'\bProgramme\s+priorities\s+and\s+partnerships\b', _I), 'أولويات البرنامج والشراكات'),
+    (re.compile(r'\bSummary\s+budget\s+table\b', _I), 'جدول الميزانية الموجز'),
+    (re.compile(r'\bUNSDCF\s+outcomes?\b', _I), 'حصائل إطار الأمم المتحدة للتعاون من أجل التنمية المستدامة (UNSDCF)'),
+    (re.compile(r'\bUNICEF\s+outcomes?\b', _I), 'حصائل اليونيسف'),
     (re.compile(r'\bDistr\.\s*:\s*Limited\b', _I), 'توزيع: محدود'),
     (re.compile(r'\bDistr\.\s*:\s*General\b', _I), 'توزيع: عام'),
     (re.compile(r"\bUnited\s+Nations\s+Children['\u2019]s\s+Fund\b", _I), 'منظمة الأمم المتحدة للطفولة (اليونيسف)'),
@@ -83,6 +88,7 @@ _PRE_RULES: list[tuple[re.Pattern, str]] = [
 ]
 
 _PRE_WHOLE_TEXT = [
+    (re.compile(r'\s*Summary\s*', _I), 'موجز'),
     (re.compile(r'\s*Validation\s*', _I), 'التحقق من الصحة'),
     (re.compile(r'\s*Edition\s*', _I), 'الطبعة'),
     (re.compile(r'\s*Discovering\s+Salient\s+Neurons\s+in\s+deep\s+NLP\s+models\s*', _I),
@@ -147,6 +153,8 @@ _POST_RULES: list[tuple[re.Pattern, str]] = [
     (re.compile(_B + r'تحديث\s+التاريخ\b'), r'\1سجل التحديثات'),
     (re.compile(_B + r'نموذج\s+العرض\b'), r'\1صيغة العرض'),
     (re.compile(_B + r'الملف\s+الدولي\b'), r'\1الغلاف الدولي'),
+    (re.compile(_B + r'نتائج\s+المعهد\s+الدولي\s+للصحة\s+والتنمية\b'), r'\1حصائل إطار التعاون (UNSDCF)'),
+    (re.compile(_B + r'أسباب\s+البرنامج\b'), r'\1الأساس المنطقي للبرنامج'),
 ]
 
 
@@ -207,10 +215,16 @@ _DOMAIN_CUES: dict[str, re.Pattern] = {
         r"arbitration|confidentiality|liability|termination|agreement|clause)\b",
         _I,
     ),
+    "policy_un": re.compile(
+        r"\b(?:unicef|unsdcf|executive\s+board|economic\s+and\s+social\s+council|"
+        r"country\s+programme|sustainable\s+development\s+cooperation|"
+        r"united\s+nations\s+children)\b",
+        _I,
+    ),
 }
 
 _ABBREV_DEF_RE = re.compile(
-    r"([A-Za-z][A-Za-z\-']*(?:\s+(?:of|and|for|the|in|on|to|[A-Za-z][A-Za-z\-']*)){0,7})\s*\(\s*([A-Z][A-Z0-9]{1,9})\s*\)"
+    r"([A-Za-z][A-Za-z\-',]*(?:\s+(?:of|and|for|the|in|on|to|[A-Za-z][A-Za-z\-',]*)){0,7})\s*\(\s*([A-Z][A-Z0-9]{1,9})\s*\)"
 )
 _IGNORED_ABBREVS = {"USA", "USD", "EUR", "GBP", "SAR", "AED", "QAR", "PDF", "URL", "DOI"}
 _INTERNAL_PLACEHOLDER_RE = re.compile(r"\{\d{1,3}\}|<\s*/?\s*b\s*\d+\s*>")
@@ -220,7 +234,7 @@ def _abbrev_matches_expansion(expansion: str, acronym: str) -> bool:
     """Return True when an uppercase acronym plausibly abbreviates ``expansion``."""
     if not acronym or acronym in _IGNORED_ABBREVS:
         return False
-    words = [w for w in re.split(r"[\s\-]+", expansion.strip()) if w]
+    words = [w for w in re.split(r"[\s\-,]+", expansion.strip()) if w]
     content_words = [
         w for w in words if w.lower() not in {"of", "and", "for", "the", "in", "on", "to"}
     ]
@@ -268,10 +282,17 @@ def classify_document_domain(texts: Iterable[str]) -> str:
     return "general"
 
 
+_LEADING_EXPANSION_STOPWORDS = {
+    "the", "a", "an", "and", "or", "on", "in", "of", "for", "to", "by", "with", "from", "at", "as",
+}
+
+
 def _trim_matching_expansion(raw_span: str, acronym: str) -> str | None:
     """Return the suffix of ``raw_span`` whose words match ``acronym``, or None."""
     tokens = [t for t in raw_span.strip().split() if t]
     for start in range(len(tokens)):
+        if tokens[start].strip(" ,;:-").lower() in _LEADING_EXPANSION_STOPWORDS:
+            continue
         candidate = " ".join(tokens[start:]).strip(" ,;:-")
         if _abbrev_matches_expansion(candidate, acronym):
             return candidate

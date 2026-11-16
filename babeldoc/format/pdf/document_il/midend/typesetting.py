@@ -420,6 +420,12 @@ class TypesettingUnit:
         self,
     ) -> tuple[list[PdfCharacter], list[PdfCurve], list[PdfForm]]:
         if self.char:
+            if (
+                self.char.char_unicode
+                and len(self.char.char_unicode) == 1
+                and unicodedata.category(self.char.char_unicode) == "Cf"
+            ):
+                return [], [], []
             return [self.char], [], []
         elif self.formular:
             return (
@@ -487,7 +493,10 @@ class TypesettingUnit:
                 )
             return Box(0, 0, 0, 0)
         elif self.unicode:
-            char_width = self.font.char_lengths(self.unicode, self.font_size)[0]
+            if len(self.unicode) == 1 and unicodedata.category(self.unicode) == "Cf":
+                char_width = 0.0
+            else:
+                char_width = self.font.char_lengths(self.unicode, self.font_size)[0]
             if self.x is None or self.y is None or self.scale is None:
                 return Box(0, 0, char_width, self.font_size)
             return Box(self.x, self.y, self.x + char_width, self.y + self.font_size)
@@ -811,6 +820,13 @@ class TypesettingUnit:
         if self.can_passthrough:
             return self.passthrough()
         elif self.unicode:
+            # Format control characters (Unicode category Cf: LRM, RLM, ALM,
+            # ZWJ, ZWNJ, Word Joiner, LRI/RLI/FSI/PDI, LRE/RLE/PDF/LRO/RLO)
+            # must remain present through shaping, tokenization, and BiDi
+            # ordering, but must NEVER be emitted as painted glyphs in the PDF
+            # (fonts such as NotoSerif map U+200E/U+200F to visible hook glyphs).
+            if len(self.unicode) == 1 and unicodedata.category(self.unicode) == "Cf":
+                return [], [], []
             assert self.x is not None, (
                 "x position must be set, should be set by `relocate`"
             )
@@ -983,9 +999,13 @@ class Typesetting:
         if centered_display:
             return min(source_size, paragraph.pdf_style.font_size)
 
-        if "fallback_line" in label or (
-            any(marker in label for marker in ("figure", "chart", "axis", "diagram"))
-            and "caption" not in label
+        if (
+            "fallback_line" in label
+            or "abandon" in label
+            or (
+                any(marker in label for marker in ("figure", "chart", "axis", "diagram"))
+                and "caption" not in label
+            )
         ):
             if 0 < source_size <= 9.5:
                 return round(min(9.5, source_size * 1.05), 2)
@@ -1278,7 +1298,19 @@ class Typesetting:
                         'ZWNJ': True,
                     }
                     reshaper = ArabicReshaper(configuration=configuration)
-                    reshaped_text = reshaper.reshape(text)
+                    if "\u200d" in text:
+                        # ZWJ (U+200D) requests contextual Arabic joining without
+                        # rendering a visible tatweel. Substitute U+0640 during
+                        # reshape so adjacent letters take initial/medial/final
+                        # forms, then restore the original U+200D vs U+0640 sequence.
+                        joiner_seq = iter([ch for ch in text if ch in ("\u0640", "\u200d")])
+                        reshaped_tmp = reshaper.reshape(text.replace("\u200d", "\u0640"))
+                        reshaped_text = "".join(
+                            next(joiner_seq, "\u200d") if ch == "\u0640" else ch
+                            for ch in reshaped_tmp
+                        )
+                    else:
+                        reshaped_text = reshaper.reshape(text)
                     # DO NOT call get_display() - PDF layout engine handles positioning
                     return reshaped_text
                 else:
@@ -2148,7 +2180,10 @@ class Typesetting:
     @staticmethod
     def _is_fixed_table_paragraph(paragraph: il_version_1.PdfParagraph) -> bool:
         """Whether a paragraph owns a physical cell in a preserved table grid."""
-        return "table" in (paragraph.layout_label or "").lower()
+        return (
+            "table" in (paragraph.layout_label or "").lower()
+            or bool((paragraph.pipeline_trace or {}).get("table_id"))
+        )
 
     @staticmethod
     def _ensure_pipeline_trace(paragraph: il_version_1.PdfParagraph) -> dict:
@@ -2267,7 +2302,12 @@ class Typesetting:
         paragraphs = [p for p in page.pdf_paragraph or [] if p.box is not None]
         bottom_footers = [p for p in paragraphs if self._is_bottom_band_footer(p, page)]
         top_headers = [p for p in paragraphs if self._is_top_band_header(p, page)]
-        footnotes = [p for p in paragraphs if self._is_footnote_paragraph(p)]
+        footnotes = [
+            p for p in paragraphs
+            if self._is_footnote_paragraph(p)
+            and "table_footnote" not in (p.layout_label or "").lower()
+            and p.box.y2 <= crop.y + page_height * 0.42
+        ]
 
         content_floor = page_floor
         if bottom_footers:
@@ -2617,7 +2657,27 @@ class Typesetting:
             if composition.pdf_character and composition.pdf_character.box:
                 boxes.append(composition.pdf_character.box)
             elif composition.pdf_formula:
+                if composition.pdf_formula.box:
+                    boxes.append(composition.pdf_formula.box)
                 for char in composition.pdf_formula.pdf_character or []:
+                    if char.box:
+                        boxes.append(char.box)
+                for curve in composition.pdf_formula.pdf_curve or []:
+                    if curve.box:
+                        boxes.append(curve.box)
+                for form in composition.pdf_formula.pdf_form or []:
+                    if form.box:
+                        boxes.append(form.box)
+            elif composition.pdf_line:
+                if composition.pdf_line.box:
+                    boxes.append(composition.pdf_line.box)
+                for char in composition.pdf_line.pdf_character or []:
+                    if char.box:
+                        boxes.append(char.box)
+            elif composition.pdf_same_style_characters:
+                if composition.pdf_same_style_characters.box:
+                    boxes.append(composition.pdf_same_style_characters.box)
+                for char in composition.pdf_same_style_characters.pdf_character or []:
                     if char.box:
                         boxes.append(char.box)
         if not boxes:
@@ -2638,6 +2698,18 @@ class Typesetting:
         transform[4] += dx
         transform[5] += dy
         curve.relocation_transform = transform
+
+    @staticmethod
+    def _translate_rendered_form(form: PdfForm, dx: float = 0.0, dy: float = 0.0) -> None:
+        if form.box:
+            form.box.x += dx
+            form.box.x2 += dx
+            form.box.y += dy
+            form.box.y2 += dy
+        transform = list(form.relocation_transform or [1, 0, 0, 1, 0, 0])
+        transform[4] += dx
+        transform[5] += dy
+        form.relocation_transform = transform
 
     @staticmethod
     def _translate_rendered_paragraph(
@@ -2669,6 +2741,20 @@ class Typesetting:
                         shift_box(char.visual_bbox.box)
                 for curve in formula.pdf_curve or []:
                     Typesetting._translate_rendered_curve(curve, dx=dx, dy=dy)
+                for form in formula.pdf_form or []:
+                    Typesetting._translate_rendered_form(form, dx=dx, dy=dy)
+            elif composition.pdf_line:
+                shift_box(composition.pdf_line.box)
+                for char in composition.pdf_line.pdf_character or []:
+                    shift_box(char.box)
+                    if char.visual_bbox:
+                        shift_box(char.visual_bbox.box)
+            elif composition.pdf_same_style_characters:
+                shift_box(composition.pdf_same_style_characters.box)
+                for char in composition.pdf_same_style_characters.pdf_character or []:
+                    shift_box(char.box)
+                    if char.visual_bbox:
+                        shift_box(char.visual_bbox.box)
 
     @staticmethod
     def _shift_rendered_paragraph_vertically(
@@ -3081,14 +3167,21 @@ class Typesetting:
     def _clear_paragraph_xobj_id(paragraph: il_version_1.PdfParagraph) -> None:
         paragraph.xobj_id = None
         for comp in paragraph.pdf_paragraph_composition or []:
-            if comp.pdf_character:
+            if comp.pdf_character is not None:
                 comp.pdf_character.xobj_id = None
-            elif comp.pdf_formula:
-                comp.pdf_formula.xobj_id = None
+            if comp.pdf_formula is not None:
                 for ch in comp.pdf_formula.pdf_character or []:
                     ch.xobj_id = None
                 for curve in comp.pdf_formula.pdf_curve or []:
                     curve.xobj_id = None
+                for form in comp.pdf_formula.pdf_form or []:
+                    form.xobj_id = None
+            if comp.pdf_line is not None:
+                for ch in comp.pdf_line.pdf_character or []:
+                    ch.xobj_id = None
+            if comp.pdf_same_style_characters is not None:
+                for ch in comp.pdf_same_style_characters.pdf_character or []:
+                    ch.xobj_id = None
 
     def _paginate_overflowing_pages(self, document: il_version_1.Document) -> int:
         """Reflow overflowing body prose cleanly onto inserted continuation pages.
@@ -3117,10 +3210,14 @@ class Typesetting:
 
             movable: list[tuple[il_version_1.PdfParagraph, Box]] = []
             for para in src_page.pdf_paragraph or []:
+                para_label = (para.layout_label or "").lower()
                 if (
                     self._is_fixed_table_paragraph(para)
+                    or self._is_table_cell(para, src_page)
                     or self._is_bottom_fixed_paragraph(para, src_page)
                     or self._is_top_band_header(para, src_page)
+                    or "abandon" in para_label
+                    or "footnote" in para_label
                     or para.vertical
                     or (para.box is not None and self._is_inside_table_or_figure_region(para.box, src_page, figures_only=True))
                 ):
@@ -4504,7 +4601,7 @@ class Typesetting:
             # ParagraphFinder reconstructed these cells from the ruled grid.
             # Their physical slots must stay aligned with the grid retained in
             # the page base operations; only text inside each slot becomes RTL.
-            if cells and all(
+            if cells and any(
                 "fixed_rtl" in (cell.layout_label or "").lower()
                 for cell in cells
             ):
@@ -4884,12 +4981,21 @@ class Typesetting:
         
         # OPTIMIZED ARABIC WORD-LEVEL PROCESSING WITH PER-LINE BIDI
         if is_arabic:
+            _isolate_to_embed = {
+                0x2066: 0x202A,  # LRI -> LRE
+                0x2067: 0x202B,  # RLI -> RLE
+                0x2068: 0x202A,  # FSI -> LRE
+                0x2069: 0x202C,  # PDI -> PDF
+                0x061C: 0x200F,  # ALM -> RLM
+            }
+
             def get_bidi_indices_and_chars(text: str, base_dir: str = 'R') -> list[tuple[int, str]]:
                 try:
+                    compat_text = text.translate(_isolate_to_embed)
                     storage = ba.get_empty_storage()
                     storage['base_level'] = 1 if base_dir == 'R' else 0
                     storage['base_dir'] = base_dir
-                    ba.get_embedding_levels(text, storage, False, False)
+                    ba.get_embedding_levels(compat_text, storage, False, False)
                     for i, c in enumerate(storage['chars']):
                         c['orig_idx'] = i
                     ba.explicit_embed_and_overrides(storage, False)
@@ -4898,7 +5004,13 @@ class Typesetting:
                     ba.resolve_implicit_levels(storage, False)
                     ba.reorder_resolved_levels(storage, False)
                     ba.apply_mirroring(storage, False)
-                    return [(c['orig_idx'], c['ch']) for c in storage['chars']]
+                    return [
+                        (
+                            c['orig_idx'],
+                            text[c['orig_idx']] if ord(text[c['orig_idx']]) in _isolate_to_embed else c['ch'],
+                        )
+                        for c in storage['chars']
+                    ]
                 except Exception as e:
                     logger.warning(f"Error in per-line bidi: {e}")
                     return [(i, ch) for i, ch in enumerate(text)]
@@ -4922,8 +5034,8 @@ class Typesetting:
                     idx += 1
                     continue
                 u_str = u.try_get_unicode() or ""
-                if u_str in {"\u200e", "\u2066"}:
-                    close_marker = "\u2069" if u_str == "\u2066" else "\u200e"
+                if u_str in {"\u200e", "\u2066", "\u2067", "\u2068"}:
+                    close_marker = "\u200e" if u_str == "\u200e" else "\u2069"
                     close_idx = None
                     scan_w = u.width * scale
                     for probe in range(idx + 1, n):
@@ -4953,8 +5065,13 @@ class Typesetting:
                         next_u = typesetting_units[idx]
                         if next_u.forced_line_break:
                             break
+                        if getattr(word[-1], "no_break_after", False):
+                            word.append(next_u)
+                            word_w += next_u.width * scale
+                            idx += 1
+                            continue
                         next_str = next_u.try_get_unicode() or ""
-                        if next_str in {"\u200e", "\u2066"}:
+                        if next_str in {"\u200e", "\u2066", "\u2067", "\u2068"}:
                             break
                         if next_u.is_space:
                             # Keep adjacent PdfFormula segments connected by an internal
@@ -5627,6 +5744,18 @@ class Typesetting:
                     return fallback_value, target_font
 
             if unicodedata.category(value) == "Cf":
+                # Preserve BiDi directional controls and isolates as zero-width
+                # layout units when a real base font is available so per-line
+                # BiDi ordering and island grouping see them before render()
+                # omits them from glyph drawing.
+                if value in {
+                    "\u200e", "\u200f", "\u061c",
+                    "\u202a", "\u202b", "\u202c", "\u202d", "\u202e",
+                    "\u2066", "\u2067", "\u2068", "\u2069",
+                }:
+                    carrier_font = getattr(self.font_mapper, "base_font", None)
+                    if carrier_font is not None:
+                        return value, carrier_font
                 self._skipped_format_chars[value] = self._skipped_format_chars.get(value, 0) + 1
                 logger.debug(
                     "Skipped uncovered format control U+%04X in paragraph %s",
@@ -5753,32 +5882,41 @@ class Typesetting:
                         style.font_size * optical_factor,
                         centered_display=centered_display,
                     )
+                    pending_no_break = False
                     for char_unicode in shaped_text:
                         if char_unicode in "\r\n":
                             if char_unicode == "\n":
                                 result.append(TypesettingUnit(forced_line_break=True))
+                            pending_no_break = False
                             continue
+                        if char_unicode == "\u2060":
+                            if result:
+                                result[-1].no_break_after = True
+                            pending_no_break = True
                         target_value, target_font = resolve_unicode(font, char_unicode)
                         if target_value is None:
                             continue
-                        result.append(
-                            TypesettingUnit(
-                                unicode=target_value,
-                                font=target_font,
-                                arabic_fallback_font=(self.font_mapper.arabic_fonts[0] if self.is_arabic else None),
-                                original_font=font,
-                                # Contact rectangles in older PDFs commonly
-                                # inherit a tiny label font.  A translated card
-                                # is a field block and must remain readable.
-                                font_size=max(
-                                    target_font_size,
-                                    11.5 if "contact_card" in (paragraph.layout_label or "").lower() else 0.0,
-                                ),
-                                style=style,
-                                xobj_id=paragraph_xobj_id,
-                                debug_info=composition.pdf_same_style_unicode_characters.debug_info or False,
-                            )
+                        new_tu = TypesettingUnit(
+                            unicode=target_value,
+                            font=target_font,
+                            arabic_fallback_font=(self.font_mapper.arabic_fonts[0] if self.is_arabic else None),
+                            original_font=font,
+                            # Contact rectangles in older PDFs commonly
+                            # inherit a tiny label font.  A translated card
+                            # is a field block and must remain readable.
+                            font_size=max(
+                                target_font_size,
+                                11.5 if "contact_card" in (paragraph.layout_label or "").lower() else 0.0,
+                            ),
+                            style=style,
+                            xobj_id=paragraph_xobj_id,
+                            debug_info=composition.pdf_same_style_unicode_characters.debug_info or False,
                         )
+                        if pending_no_break:
+                            new_tu.can_break_line_cache = False
+                            if char_unicode != "\u2060":
+                                pending_no_break = False
+                        result.append(new_tu)
             elif composition.pdf_formula:
                 formula_chars = composition.pdf_formula.pdf_character or []
                 has_pua_bullet = any(

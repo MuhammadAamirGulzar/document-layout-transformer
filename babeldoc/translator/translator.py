@@ -68,6 +68,7 @@ _NUMERAL_PATTERN = re.compile(
     r'(\b\d{4}[-/]\d{1,2}[-/]\d{1,2}\b)|'
     r'(\b\d{1,2}[-/]\d{1,2}[-/]\d{2,4}\b)|'
     r'(\b(?:INV|PO|REF|TXN|VAT|TIN|EIN|DOC|ID)\s*#\s*\d[A-Z0-9\-/]*\b)|'
+    r'(\b[A-Z]{1,6}(?:/[A-Z0-9.\-]+){2,}\b)|'
     r'(\[\s*\d{1,3}(?:\s*[,\u2013\u2014-]\s*\d{1,3})*\s*\])|'
     rf"({AUTHOR_YEAR_CITATION.pattern})|"
     # 1. Parenthetical mixed tokens: (2018=100), (NDS3), (281211210/97 =62), (Chart 7-1)
@@ -401,6 +402,8 @@ def _is_pure_passthrough(text: str) -> bool:
     if _PHONE_PATTERN.match(stripped):
         return True
     if re.fullmatch(r'^(?:MOD\s*\d+(?:-\d+)?|ISO(?:/IEC)?\s*\d+(?:-\d+)?)$', stripped, re.IGNORECASE):
+        return True
+    if re.fullmatch(r'^[A-Z]{1,6}(?:/[A-Z0-9.\-]+){2,}$', stripped):
         return True
     if re.fullmatch(r'^\d+\s*[/÷\-–—+*×]\s*\d+\s*(?:=\s*\d+)?$', stripped):
         return True

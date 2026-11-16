@@ -539,7 +539,15 @@ class ILTranslator:
                     }
                     reshaper = ArabicReshaper(configuration=configuration)
                     # reshape() handles glyph joining while preserving spaces
-                    reshaped_text = reshaper.reshape(text)
+                    if "\u200d" in text:
+                        joiner_seq = iter([ch for ch in text if ch in ("\u0640", "\u200d")])
+                        reshaped_tmp = reshaper.reshape(text.replace("\u200d", "\u0640"))
+                        reshaped_text = "".join(
+                            next(joiner_seq, "\u200d") if ch == "\u0640" else ch
+                            for ch in reshaped_tmp
+                        )
+                    else:
+                        reshaped_text = reshaper.reshape(text)
                     # DO NOT call get_display() — the PDF layout engine
                     # handles RTL positioning via coordinates
                     return reshaped_text
@@ -584,6 +592,15 @@ class ILTranslator:
         )
         text = re.sub(r'\b(\d+)isa\b', r'\1 is a', text, flags=re.I)
         text = re.sub(r'\bw\.?r\.?t\.?(?=\s|$|[.,;:)\]])', 'with respect to', text, flags=re.I)
+
+        # Rejoin URLs that wrapped across PDF lines and acquired a space at a
+        # slash, hyphen, query, or parameter boundary.
+        for _ in range(3):
+            text = re.sub(
+                r'(https?://[^\s<>"]+?[/\?&=\-_])\s+((?:\?[A-Za-z0-9_]+=|[A-Za-z0-9_]+\-[A-Za-z0-9_\-\(\)%./?&=:]+|[A-Za-z0-9_]+=[A-Za-z0-9_\-\(\)%./?&=:]+|[A-Za-z0-9_\-\(\)%]+/[A-Za-z0-9_\-\(\)%./?&=:]*))',
+                r'\1\2',
+                text,
+            )
 
         # Strip English ordinal suffixes on calendar dates before month names
         # ("as of 23rd June 2013" -> "as of 23 June 2013") so numeric shielding
@@ -855,11 +872,17 @@ class ILTranslator:
                 direct_contact = contact_fn(segment)
                 if direct_contact is not None:
                     return ("literal", direct_contact, "")
-            # List and section numbering is document structure.
+            # Peel section numbering and sentence-final <bN> footnote superscripts
+            # (immediately after .!?) so NLLB never blends them with {N}, while
+            # leaving ordinary inline formula placeholders inside the segment.
             marker = re.match(r"^[ \t]*\d{1,3}(?:\.\d{1,3})*\.(?:[ \t]+|$)", segment)
             prefix = marker.group() if marker else ""
             body = segment[len(prefix):]
-            if marker and not body:
+            trail_b_match = re.search(r"(?<=[.!?])[ \t]*(?:<b\d+>\s*)+$", body)
+            suffix = trail_b_match.group() if trail_b_match else ""
+            if suffix:
+                body = body[: len(body) - len(suffix)]
+            if not body.strip():
                 return ("literal", segment, "")
             engine = self.translate_engine
             if (
@@ -883,11 +906,19 @@ class ILTranslator:
                 body += (subtraction["tail"] or "") + subtraction["punctuation"]
             inline_list = self._inline_numbered_list(body)
             if inline_list:
-                return ("inline_list", inline_list, prefix)
-            return ("plain", body, prefix)
+                return ("inline_list", inline_list, (prefix, suffix))
+            return ("plain", body, (prefix, suffix))
+
+        def _attach_affixes(translated: str, affixes) -> str:
+            if isinstance(affixes, tuple):
+                prefix, suffix = affixes
+            else:
+                prefix, suffix = affixes or "", ""
+            out = f"{prefix}{translated}" if prefix else translated
+            return f"{out}{suffix}" if suffix else out
 
         def translate_segment(segment: str) -> str:
-            kind, payload, prefix = prepare_segment(segment)
+            kind, payload, affixes = prepare_segment(segment)
             engine = self.translate_engine
             if kind == "literal":
                 return payload
@@ -903,7 +934,7 @@ class ILTranslator:
                 translated = " ".join(translated_parts)
             else:
                 translated = engine.translate(payload, rate_limit_params=rate_limit_params)
-            return prefix + translated if prefix else translated
+            return _attach_affixes(translated, affixes)
 
         # Check if text contains Table of Contents (TOC) entries with dotted leader lines
         # e.g. "1. Introduction ................................................................................................. 1306"
@@ -958,8 +989,40 @@ class ILTranslator:
             # from truncating sentences at the tail of long paragraphs.
             # Periods in an author–year reference do not end a sentence.
             citations = [match.span() for match in AUTHOR_YEAR_CITATION.finditer(normalized_text)]
-            sentences = split_sentences(normalized_text, citation_spans=citations)
-            if len(sentences) > 1 and len(normalized_text) > 150:
+            raw_sentences = split_sentences(normalized_text, citation_spans=citations)
+            sentences: list[str] = []
+            for raw_sent in raw_sentences:
+                # Split at sentence-ending punctuation followed by <bN> footnote superscripts
+                # ("...school age.<b1>Results from..." -> "...school age.<b1>", "Results from...")
+                parts = re.split(
+                    r"(?<=[.!?])((?:\s*<b\d+>)+)\s*(?=[A-Z0-9\"\u201c(])",
+                    raw_sent,
+                )
+                rebuilt: list[str] = []
+                idx_p = 0
+                while idx_p < len(parts):
+                    chunk = parts[idx_p]
+                    if idx_p + 1 < len(parts) and re.fullmatch(r"(?:\s*<b\d+>)+", parts[idx_p + 1] or ""):
+                        chunk = f"{chunk}{parts[idx_p + 1]}"
+                        idx_p += 2
+                    else:
+                        idx_p += 1
+                    if chunk and chunk.strip():
+                        rebuilt.append(chunk.strip())
+                for sub in (rebuilt or [raw_sent]):
+                    if len(sub) > 160 and re.search(r"\b(?:B|T|Baseline|Target):\s+", sub):
+                        clauses = [
+                            c.strip()
+                            for c in re.split(
+                                r"\s+(?=(?:B|T|Baseline|Target):\s+)|(?<=\)\.)\s+(?=[A-Z])",
+                                sub,
+                            )
+                            if c and c.strip()
+                        ]
+                        sentences.extend(clauses if len(clauses) > 1 else [sub])
+                    else:
+                        sentences.append(sub)
+            if len(sentences) > 1 and len(normalized_text) > 120:
                 config = getattr(self, "translation_config", None)
                 cancel_fn = getattr(config, "raise_if_cancelled", None)
                 if callable(cancel_fn):
@@ -977,8 +1040,8 @@ class ILTranslator:
                             plain_bodies, rate_limit_params=rate_limit_params
                         )
                         for idx, tr_body in zip(plain_indices, batch_out):
-                            prefix = prepared[idx][2]
-                            translated_sentences[idx] = prefix + tr_body if prefix else tr_body
+                            affixes = prepared[idx][2]
+                            translated_sentences[idx] = _attach_affixes(tr_body, affixes)
                     for idx, sentence in enumerate(sentences):
                         if translated_sentences[idx] is None:
                             if callable(cancel_fn):
@@ -1588,6 +1651,143 @@ class ILTranslator:
 
         return placeholder
 
+    @staticmethod
+    def _is_footnote_superscript_placeholder(
+        placeholder: FormulaPlaceholder,
+        src_unicode: str,
+    ) -> bool:
+        """Return True only when ``placeholder`` is a verified footnote/superscript marker.
+
+        Ordinary inline formulas (such as variables, equations, or multi-letter
+        symbols like ``twN``, ``wi``, ``x + 1``) must never have their position
+        guessed if dropped by the translation model.
+        """
+        tag_str = getattr(placeholder, "placeholder", "") or ""
+        if not re.fullmatch(r"<b[0-9]+>", tag_str):
+            return False
+        formula = getattr(placeholder, "formula", None)
+        if formula is not None:
+            if getattr(formula, "pdf_curve", None) or getattr(formula, "pdf_form", None):
+                return False
+            formula_text = "".join(
+                c.char_unicode or "" for c in (getattr(formula, "pdf_character", None) or [])
+            ).strip()
+            is_corner = bool(getattr(formula, "is_corner_mark", False))
+            is_fn_token = bool(
+                re.fullmatch(
+                    r"(?:\d{1,3}(?:\s*[,\u2013\u2014-]\s*\d{1,3})*|[⁰¹²³⁴⁵⁶⁷⁸⁹]{1,3}|[*†‡§])",
+                    formula_text,
+                )
+            )
+            if not (is_corner or is_fn_token):
+                return False
+
+        esc = re.escape(tag_str)
+        # Must sit at paragraph start, paragraph end, or immediately after sentence punctuation (.!?)
+        if re.match(rf"^\s*(?:<b\d+>\s*)*{esc}", src_unicode):
+            return True
+        if re.search(rf"{esc}(?:\s*<b\d+>)*\s*$", src_unicode):
+            return True
+        if re.search(rf"[.!?](?:\s*<b\d+>)*\s*{esc}(?=\s|$|[A-Z0-9\"\u201c(])", src_unicode):
+            return True
+        return False
+
+    @classmethod
+    def _recover_and_clean_formula_placeholders(
+        cls,
+        input_text: TranslateInput,
+        output: str,
+    ) -> str:
+        if not output:
+            return output
+        placeholders = getattr(input_text, "placeholders", None) or []
+        src_unicode = getattr(input_text, "unicode", "") or ""
+
+        # 1. Repair unambiguous blended/transliterated tags (<b1}, {b1}, [b1>, <ب1>)
+        # only when the placeholder is currently missing and the alias occurs once.
+        for placeholder in placeholders:
+            if not isinstance(placeholder, FormulaPlaceholder):
+                continue
+            pattern = placeholder.regex_pattern
+            tag = re.fullmatch(r"<b([0-9]+)>", placeholder.placeholder)
+            if tag and not re.search(pattern, output, flags=re.IGNORECASE):
+                idx = tag[1]
+                alias = rf"(?:<\s*[bB\u0628\ufe8f-\ufe92]\s*{idx}\s*[>}}\]\)]|[\{{\[\(]\s*[bB\u0628\ufe8f-\ufe92]\s*{idx}\s*[>}}\]\)]|<\s*[bB\u0628\ufe8f-\ufe92]\s*{idx}\b)"
+                if (
+                    not re.search(alias, src_unicode)
+                    and len(re.findall(alias, output)) == 1
+                ):
+                    output = re.sub(alias, placeholder.placeholder, output, count=1)
+
+        # 2. Deterministic position recovery is strictly restricted to verified
+        # footnote/superscript markers. Ordinary inline formulas are never guessed.
+        src_sent_puncts = list(
+            re.finditer(
+                r"[.!?](?=(?:\s*<b\d+>)*\s*(?:$|[A-Z0-9\"\u201c(]))",
+                src_unicode,
+            )
+        )
+        leading_to_prepend: list[str] = []
+        for placeholder in placeholders:
+            if not isinstance(placeholder, FormulaPlaceholder):
+                continue
+            pattern = placeholder.regex_pattern
+            if re.search(pattern, output, flags=re.IGNORECASE):
+                continue
+            if not cls._is_footnote_superscript_placeholder(placeholder, src_unicode):
+                continue
+            tag_str = placeholder.placeholder
+            esc = re.escape(tag_str)
+
+            if re.match(rf"^\s*(?:<b\d+>\s*)*{esc}", src_unicode):
+                leading_to_prepend.append(tag_str)
+                continue
+
+            # Check which sentence-ending punctuation mark in src_unicode precedes this marker
+            sent_idx = None
+            for k, m_punct in enumerate(src_sent_puncts):
+                tail_after_punct = src_unicode[m_punct.end() :]
+                if re.match(rf"^\s*(?:<b\d+>\s*)*{esc}", tail_after_punct):
+                    sent_idx = k
+                    break
+
+            if sent_idx is not None:
+                out_sent_puncts = list(
+                    re.finditer(
+                        r"[.!?؟](?:(?:\s*<\s*b\s*\d+\s*>)+)?",
+                        output,
+                        flags=re.IGNORECASE,
+                    )
+                )
+                if sent_idx < len(out_sent_puncts) and (
+                    len(src_sent_puncts) == 1
+                    or len(out_sent_puncts) >= len(src_sent_puncts)
+                ):
+                    pos = out_sent_puncts[sent_idx].end()
+                    tail = output[pos:]
+                    sep = "" if (not tail or tail[0].isspace()) else " "
+                    output = f"{output[:pos]}{tag_str}{sep}{tail}"
+                elif re.search(rf"{esc}(?:\s*<b\d+>)*\s*$", src_unicode) and len(src_sent_puncts) == 1:
+                    output = f"{output.rstrip()}{tag_str}"
+            elif re.search(rf"{esc}(?:\s*<b\d+>)*\s*$", src_unicode):
+                output = f"{output.rstrip()} {tag_str}"
+
+        if leading_to_prepend:
+            prefix_tags = " ".join(leading_to_prepend)
+            output = f"{prefix_tags} {output.lstrip()}"
+
+        # 3. Strip any residual malformed <bN} / {bN> artifacts not present in source
+        for bad_m in list(
+            re.finditer(
+                r"<\s*/?\s*[bB]\s*\d+\s*[}\]\)]|[\{\[]\s*/?\s*[bB]\s*\d+\s*>",
+                output,
+            )
+        ):
+            tok = bad_m.group(0)
+            if tok not in src_unicode:
+                output = output.replace(tok, "", 1)
+        return output
+
     def parse_translate_output(
         self,
         input_text: TranslateInput,
@@ -1595,6 +1795,7 @@ class ILTranslator:
         llm_translate_tracker: LLMTranslateTracker | None = None,
     ) -> [PdfParagraphComposition]:
         result = []
+        output = ILTranslator._recover_and_clean_formula_placeholders(input_text, output)
 
         # å¦‚æžœæ²¡æœ‰å ä½ç¬¦ï¼Œç›´æŽ¥è¿”å›žæ•´ä¸ªæ–‡æœ¬
         if not input_text.placeholders:
@@ -2282,6 +2483,9 @@ Now, please carefully read the following text to be translated and directly outp
                     return
 
                 # Post-translation processing
+                translated_text = self._recover_and_clean_formula_placeholders(
+                    translate_input, translated_text
+                )
                 post_ok = self.post_translate_paragraph(
                     paragraph, tracker, translate_input, translated_text
                 )

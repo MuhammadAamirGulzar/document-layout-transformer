@@ -484,6 +484,9 @@ class ParagraphFinder:
         # as a heading even when font metadata is incomplete.  This gives the
         # typesetter a protected lane instead of allowing the following body
         # paragraph to reflow through the label.
+        # Identify bottom-of-page footnotes before heading classification so small
+        # numbered footnote rows ("20 MICS Iraq, 2018.") are never promoted to 14pt headings.
+        self.classify_bottom_page_footnotes(page, paragraphs)
         self.classify_numbered_section_headings(paragraphs)
         self.classify_structured_text_blocks(paragraphs)
 
@@ -1024,6 +1027,12 @@ class ParagraphFinder:
                     }
                 )
 
+        table_layout_boxes = [
+            region.box
+            for region in (page.page_layout or [])
+            if region.box and (region.class_name or "").lower() in {"table", "wired_table", "wireless_table"}
+        ]
+
         for ridx, region in enumerate(page.page_layout or []):
             box = region.box
             cname = (region.class_name or "").lower()
@@ -1050,7 +1059,16 @@ class ParagraphFinder:
             _preserve_members(f"layout_{ridx}", body_members)
 
         # Fallback: cluster unenclosed contiguous multi-line code paragraphs if any remain
-        remaining_paras = [p for p in paragraphs if id(p) not in preserved_ids and p.box is not None]
+        remaining_paras = [
+            p for p in paragraphs
+            if id(p) not in preserved_ids
+            and p.box is not None
+            and not any(
+                tbox.x - 2 <= p.box.x <= p.box.x2 <= tbox.x2 + 2
+                and tbox.y - 2 <= p.box.y <= p.box.y2 <= tbox.y2 + 2
+                for tbox in table_layout_boxes
+            )
+        ]
         if len(remaining_paras) >= 2:
             remaining_paras.sort(key=lambda p: (-p.box.y2, p.box.x))
             clusters: list[list[PdfParagraph]] = []
@@ -1631,24 +1649,32 @@ class ParagraphFinder:
                 or abs(box_a.x - box_b.x) < 45.0
             )
 
+            in_wrapped_url = bool(
+                re.search(r"(?:https?://|www\.)\S+$", text_a, re.IGNORECASE)
+            )
             is_hyphen_split = (
                 text_a.endswith(("-", "\u2010", "\u00ad"))
-                and text_b[0].isalpha()
+                and (text_b[0].isalpha() or (in_wrapped_url and text_b[0] in "([A-Za-z0-9_"))
                 and same_column
                 and -5.0 <= vert_gap <= 25.0
             )
 
             is_lowercase_continuation = (
-                text_b[0].islower()
+                (text_b[0].islower() or (in_wrapped_url and text_b[0] in "([A-Za-z0-9_?=&/-"))
                 and not text_a.endswith((".", ":", "!", "?", "؛", ";"))
                 and same_column
                 and -5.0 <= vert_gap <= 25.0
             )
 
             if is_hyphen_split or is_lowercase_continuation:
-                if is_hyphen_split:
+                if is_hyphen_split and not in_wrapped_url:
                     self._remove_trailing_hyphen(a)
-                elif is_lowercase_continuation and not text_a.endswith(" ") and not text_b.startswith(" "):
+                elif (
+                    is_lowercase_continuation
+                    and not in_wrapped_url
+                    and not text_a.endswith(" ")
+                    and not text_b.startswith(" ")
+                ):
                     from babeldoc.format.pdf.document_il.il_version_1 import VisualBbox
                     adjacent_chars = (
                         self._paragraph_source_characters(a)
@@ -2471,6 +2497,74 @@ class ParagraphFinder:
                 " Some overlaps might remain."
             )
 
+    def classify_bottom_page_footnotes(
+        self, page: Page, paragraphs: list[PdfParagraph]
+    ) -> None:
+        """Relabel small-font bottom-of-page footnote blocks that layout detectors tag 'abandon'."""
+        crop = page.cropbox.box if page.cropbox and page.cropbox.box else None
+        if crop is None or not paragraphs:
+            return
+        page_h = max(1.0, crop.y2 - crop.y)
+        page_w = max(1.0, crop.x2 - crop.x)
+        bottom_cutoff = crop.y + page_h * 0.46
+
+        # Find short horizontal footnote separator rules in the lower half of the page.
+        sep_rule_y: float | None = None
+        for curve in page.pdf_curve or []:
+            cbox = curve.box
+            if not cbox:
+                continue
+            cw = cbox.x2 - cbox.x
+            ch = abs(cbox.y2 - cbox.y)
+            if ch <= 2.5 and 24.0 <= cw <= page_w * 0.55 and crop.y + page_h * 0.08 <= cbox.y2 <= bottom_cutoff + 40.0:
+                sep_rule_y = max(sep_rule_y or 0.0, cbox.y2)
+
+        page_num_re = re.compile(r"^\s*(?:\d{1,3}\s*/\s*\d{1,3}|\*?\d{2}-\d{4,6}\*?)\s*$")
+        doc_code_re = re.compile(r"^\s*[A-Z]{1,6}(?:/[A-Z0-9.\-]+){2,}\s*$")
+        fn_start_re = re.compile(
+            r"^\s*(?:\d{1,2}\s+(?:[A-Z\u0600-\u06FF]|Ibid|http|www)|"
+            r"(?:WHO|UNICEF|MICS|United\s+Nations|Ministry\s+of|World\s+Bank|ILO|CSO|Data\s+from)\b)",
+            re.IGNORECASE,
+        )
+
+        for p in paragraphs:
+            if not p.box:
+                continue
+            lbl = (p.layout_label or "").lower()
+            if any(k in lbl for k in ("table", "footnote", "caption", "header", "footer", "title")):
+                continue
+            if p.box.y2 > (sep_rule_y + 2.0 if sep_rule_y is not None else bottom_cutoff):
+                continue
+            text = " ".join((p.unicode or "").split()).strip()
+            if not text or page_num_re.match(text) or doc_code_re.match(text):
+                continue
+            chars = self._paragraph_source_characters(p)
+            sizes = [
+                c.pdf_style.font_size
+                for c in chars
+                if c.pdf_style and c.pdf_style.font_size and (c.char_unicode or "").strip()
+            ]
+            dom_size = statistics.median(sizes) if sizes else (p.pdf_style.font_size if p.pdf_style and p.pdf_style.font_size else 0.0)
+            has_leading_formula = bool(
+                p.pdf_paragraph_composition
+                and p.pdf_paragraph_composition[0].pdf_formula
+            )
+            is_small_font = 0.0 < dom_size <= 9.6
+            below_sep = sep_rule_y is not None and p.box.y2 <= sep_rule_y + 2.0
+            if (
+                is_small_font
+                and (
+                    lbl == "abandon"
+                    or below_sep
+                    or has_leading_formula
+                    or fn_start_re.match(text)
+                )
+            ) or (
+                (lbl == "abandon" or below_sep)
+                and (has_leading_formula or fn_start_re.match(text))
+            ):
+                p.layout_label = "footnote"
+
     @staticmethod
     def classify_numbered_section_headings(paragraphs: list[PdfParagraph]) -> None:
         """Mark short decimal/roman numbered labels as headings.
@@ -2481,15 +2575,28 @@ class ParagraphFinder:
         table entry into a heading.
         """
         section_pattern = re.compile(
-            r"^\s*(?:\d+(?:\.\d+){0,4}|[IVXLCDM]+\.?)(?:\s+|\.)\S",
+            r"^\s*(?:\d{1,2}(?:\.\d{1,2}){1,3}\.?|\d{1,2}\.|[IVXLCDM]{1,6}\.)\s+[A-Z][A-Za-z]",
+        )
+        non_heading_after_num = re.compile(
+            r"^\s*\d+(?:\.\d+)*\.?\s+(?:per\s*cent|percent|million|billion|thousand|years?|months?|days?|hours?|"
+            r"points?|dollars?|deaths?|children|people|women|girls|boys|ibid|mics|january|february|march|"
+            r"april|may|june|july|august|september|october|november|december)\b",
             re.IGNORECASE,
         )
         for paragraph in paragraphs:
             label = (paragraph.layout_label or "").lower()
-            if "table" in label or "heading" in label:
+            if any(k in label for k in ("table", "heading", "footnote", "abandon", "caption", "header", "footer")):
                 continue
-            text = " ".join((paragraph.unicode or "").split())
-            if text and len(text) <= 110 and section_pattern.match(text):
+            if paragraph.pdf_style and paragraph.pdf_style.font_size and 0.0 < paragraph.pdf_style.font_size <= 9.5:
+                continue
+            text = " ".join((paragraph.unicode or "").split()).strip()
+            if (
+                text
+                and len(text) <= 95
+                and not text.endswith((".", "!", "?", ";", ","))
+                and section_pattern.match(text)
+                and not non_heading_after_num.match(text)
+            ):
                 paragraph.layout_label = "heading"
 
     def merge_same_line_sentence_fragments(
@@ -2649,7 +2756,12 @@ class ParagraphFinder:
             r"\b(?:tel(?:ephone)?|fax|e[ -]?mail|email)\s*[:：]", re.IGNORECASE
         )
         section_pattern = re.compile(
-            r"^\s*\d+(?:\.\d+){1,4}(?:\s+|\.)\S", re.IGNORECASE
+            r"^\s*\d{1,2}(?:\.\d{1,2}){1,3}\.?\s+[A-Z][A-Za-z]",
+        )
+        quantity_line_pattern = re.compile(
+            r"^\s*\d+(?:\.\d+)*\s*(?:per\s*cent|percent|%|million|billion|thousand|years?|months?|days?|"
+            r"points?|dollars?|deaths?)\b",
+            re.IGNORECASE,
         )
 
         def line_text(composition: PdfParagraphComposition) -> str:
@@ -2681,6 +2793,7 @@ class ParagraphFinder:
             return clone
 
         for paragraph in list(paragraphs):
+            para_label = (paragraph.layout_label or "").lower()
             compositions = list(paragraph.pdf_paragraph_composition or [])
             visual_lines = [
                 (index, line_text(composition))
@@ -2693,10 +2806,15 @@ class ParagraphFinder:
             texts = [text for _, text in visual_lines]
             procedure_mode = any(procedure_pattern.match(text) for text in texts)
             contact_mode = any(contact_pattern.search(text) for text in texts)
+            if any(k in para_label for k in ("table", "footnote", "abandon")) and not (procedure_mode or contact_mode):
+                continue
             section_indices = [
                 index
                 for index, text in visual_lines
-                if len(text) <= 110 and section_pattern.match(text)
+                if len(text) <= 95
+                and not text.endswith((".", "!", "?", ";", ","))
+                and section_pattern.match(text)
+                and not quantity_line_pattern.match(text)
             ]
             if not (procedure_mode or contact_mode or section_indices):
                 continue

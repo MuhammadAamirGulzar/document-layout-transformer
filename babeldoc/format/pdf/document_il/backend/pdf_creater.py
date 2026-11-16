@@ -918,20 +918,43 @@ class PDFCreater:
                 height = max(1.0, crop.y2 - crop.y) if crop else 842.0
                 new_page = pdf.new_page(pno=idx, width=width, height=height)
                 try:
+                    inherited_font_dict = "<< >>"
+                    if idx > 0 and idx - 1 < pdf.page_count:
+                        src_xref = pdf[idx - 1].xref
+                        src_res_type, src_res_val = pdf.xref_get_key(src_xref, "Resources")
+                        if src_res_type == "xref":
+                            m_res = re.search(r"(\d+)\s+0\s+R", src_res_val)
+                            if m_res:
+                                _, src_font_val = pdf.xref_get_key(int(m_res.group(1)), "Font")
+                            else:
+                                src_font_val = "null"
+                        elif src_res_type == "dict":
+                            _, src_font_val = pdf.xref_get_key(src_xref, "Resources/Font")
+                        else:
+                            src_font_val = "null"
+                        if src_font_val and src_font_val != "null":
+                            m_fxref = re.fullmatch(r"\s*(\d+)\s+0\s+R\s*", src_font_val)
+                            if m_fxref:
+                                resolved = pdf.xref_object(int(m_fxref.group(1)))
+                                if resolved and resolved.strip().startswith("<<"):
+                                    inherited_font_dict = resolved.strip()
+                            elif src_font_val.strip().startswith("<<"):
+                                inherited_font_dict = src_font_val.strip()
+
                     res_type, res_val = pdf.xref_get_key(new_page.xref, "Resources")
                     if res_type == "null":
-                        pdf.xref_set_key(new_page.xref, "Resources", "<< /Font << >> >>")
+                        pdf.xref_set_key(new_page.xref, "Resources", f"<< /Font {inherited_font_dict} >>")
                     elif res_type == "dict":
                         font_type, _ = pdf.xref_get_key(new_page.xref, "Resources/Font")
-                        if font_type == "null":
-                            pdf.xref_set_key(new_page.xref, "Resources/Font", "<< >>")
+                        if font_type == "null" or inherited_font_dict != "<< >>":
+                            pdf.xref_set_key(new_page.xref, "Resources/Font", inherited_font_dict)
                     elif res_type == "xref":
                         match = re.search(r"(\d+)\s+0\s+R", res_val)
                         if match:
                             res_xref = int(match.group(1))
                             font_type, _ = pdf.xref_get_key(res_xref, "Font")
-                            if font_type == "null":
-                                pdf.xref_set_key(res_xref, "Font", "<< >>")
+                            if font_type == "null" or inherited_font_dict != "<< >>":
+                                pdf.xref_set_key(res_xref, "Font", inherited_font_dict)
                 except Exception:
                     logger.debug("Failed to pre-initialize Resources/Font on continuation page %s", idx)
 
