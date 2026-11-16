@@ -282,7 +282,7 @@ def _restore_numerals(text: str, mapping: dict[str, str]) -> str:
 # and/or known short financial codes — no translatable natural-language words.
 # These cells should bypass the translation model entirely.
 _PURE_PASSTHROUGH_PATTERN = re.compile(
-    r'^[\s\d,.\-+±×÷=()/%$€£¥٪\u2013\u2014\u00B1\u2019\u2018:;\'\"]*$'
+    r'^[\s\d,.\-+±×÷=()/%$€£¥٪#\u2013\u2014\u00B1\u2019\u2018:;\'\"]*$'
 )
 
 # Explicit SWIFT BIC regex: 4-letter bank code + 2-letter country + 2-char location + opt 3-char branch

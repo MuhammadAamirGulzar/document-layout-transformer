@@ -3475,6 +3475,47 @@ class Typesetting:
             if not overflow_queue:
                 continue
 
+            # Eliminate accidental near-empty continuation pages for tiny buffer encroachment:
+            # only suppress when NO item carries an explicit collision/overflow flag and
+            # every queued item stays clear above both footnote boxes and rendered ink.
+            has_explicit_overflow = any((qp.pipeline_trace or {}).get("page_overflow") for qp, _, _ in overflow_queue)
+            footnote_barrier_top = None
+            if has_footnotes:
+                fn_tops = [
+                    max(
+                        (rb.y2 if (rb := self._rendered_text_box(p)) is not None else p.box.y2),
+                        p.box.y2 if p.box is not None else 0.0,
+                    )
+                    for p in (src_page.pdf_paragraph or [])
+                    if self._is_footnote_paragraph(p) and (p.box is not None or self._rendered_text_box(p) is not None)
+                ]
+                if fn_tops:
+                    footnote_barrier_top = max(fn_tops)
+            min_clear_floor = max(
+                content_floor + 1.5,
+                (footnote_barrier_top + 2.5) if footnote_barrier_top is not None else content_floor,
+            )
+            total_q_h = sum(max(0.0, rb.y2 - rb.y) for _, rb, _ in overflow_queue)
+            if (
+                not has_explicit_overflow
+                and total_q_h <= 28.0
+                and all(rb.y >= min_clear_floor and rb.y >= crop.y + 8.0 for _, rb, _ in overflow_queue)
+            ):
+                continue
+            if not has_explicit_overflow and len(overflow_queue) == 1 and total_q_h <= 28.0:
+                qp, qrb, _ = overflow_queue[0]
+                deficit = body_floor - qrb.y
+                if 0.0 < deficit <= 14.0:
+                    above_bottoms = [
+                        rb.y
+                        for ap in (src_page.pdf_paragraph or [])
+                        if ap is not qp and (rb := self._rendered_text_box(ap)) is not None and rb.y >= qrb.y2 - 0.5
+                    ]
+                    headroom = (min(above_bottoms) - qrb.y2 - 3.0) if above_bottoms else (zones["body_ceiling"] - qrb.y2)
+                    if headroom >= deficit and (qrb.y + deficit) >= min_clear_floor:
+                        self._translate_rendered_paragraph(qp, dy=deficit)
+                        continue
+
             src_page.pdf_paragraph = [
                 p for p in (src_page.pdf_paragraph or []) if id(p) in keep_paragraphs
             ]

@@ -904,22 +904,43 @@ def migrate_toc(
 
     exports = (
         ({translate_result.mono_pdf_path, translate_result.no_watermark_mono_pdf_path},
-         output_toc, len(page_map)),
+         output_toc, len(page_map), False),
         ({translate_result.dual_pdf_path, translate_result.no_watermark_dual_pdf_path},
-         dual_toc, dual_pages),
+         dual_toc, dual_pages, True),
     )
-    for paths, bookmarks, expected_pages in exports:
+    continuation_pages = getattr(
+        getattr(translation_config, "shared_context_cross_split_part", None),
+        "continuation_pages",
+        None,
+    ) or {}
+    for paths, bookmarks, expected_pages, is_dual in exports:
         for path in paths - {None}:
             with Document(path) as output:
-                if len(output) != expected_pages:
-                    logger.warning("Skipping bookmark migration for %s: unexpected page count", path)
-                    continue
-                if output.get_toc() == bookmarks:
+                actual_pages = len(output)
+                remapped_bookmarks = bookmarks
+                if actual_pages != expected_pages:
+                    if continuation_pages and not is_dual and actual_pages == expected_pages + len(continuation_pages):
+                        cont_indices = set(continuation_pages.keys())
+                        base_to_out: dict[int, int] = {}
+                        base_idx = 1
+                        for out_zero in range(actual_pages):
+                            if out_zero in cont_indices:
+                                continue
+                            base_to_out[base_idx] = out_zero + 1
+                            base_idx += 1
+                        remapped_bookmarks = [
+                            [lvl, t, base_to_out.get(pg, pg) if pg > 0 else pg]
+                            for lvl, t, pg in bookmarks
+                        ]
+                    else:
+                        logger.warning("Skipping bookmark migration for %s: unexpected page count", path)
+                        continue
+                if output.get_toc() == remapped_bookmarks:
                     continue
             temporary = translation_config.get_working_file_path("mig_toc_temp.pdf")
             shutil.copy(path, temporary)
             with Document(temporary) as output:
-                output.set_toc(bookmarks)
+                output.set_toc(remapped_bookmarks)
                 PDFCreater.save_pdf_with_timeout(
                     output,
                     path.as_posix(),

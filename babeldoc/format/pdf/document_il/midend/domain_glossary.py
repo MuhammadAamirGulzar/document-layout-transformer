@@ -85,6 +85,9 @@ _PRE_RULES: list[tuple[re.Pattern, str]] = [
         _I,
     ), 'إطار الأمم المتحدة للتعاون في مجال التنمية المستدامة'),
     (re.compile(r'\bEarly\s+Childhood\s+Development\b', _I), 'تنمية الطفولة المبكرة'),
+    (re.compile(r'\bChild\s+Welfare\s+Commission\b', _I), 'هيئة رعاية الطفولة'),
+    (re.compile(r'^\s*Qty\s*$', _I), 'الكمية'),
+    (re.compile(r'^\s*ibid\.?\s*$', _I), 'المرجع نفسه'),
 ]
 
 _PRE_WHOLE_TEXT = [
@@ -450,6 +453,97 @@ def apply_post_glossary(
                 'وثيقة البرنامج القطري',
                 text,
             )
+        if re.search(r'\bcountry\s+programme\b', src_lower):
+            text = re.sub(
+                _B + r'(?:البرنامج\s+الدولي|برنامج\s+البلد(?:ان)?|برنامج\s+الدول)\b',
+                r'\1البرنامج القطري',
+                text,
+            )
+        if re.search(r'\bprogramme\s+priorities\s+and\s+partnerships\b', src_lower):
+            text = re.sub(_B + r'أولويات\s+البرنامج\s+والشركات\b', r'\1أولويات البرنامج والشراكات', text)
+        if re.search(r'\bunicef\s+outcomes?\b', src_lower):
+            text = re.sub(_B + r'(?:جزء|أجزاء)\s+من\s+اليونيسف\b', r'\1حصائل اليونيسف', text)
+            text = re.sub(_B + r'نتائج\s+اليونيسف\b', r'\1حصائل اليونيسف', text)
+        if re.search(r'\bvulnerable\b', src_lower) and (
+            domain == "policy_un"
+            or re.search(r'\b(?:children|groups|situations?|families|communities|populations?|people)\b', src_lower)
+        ):
+            text = re.sub(_B + r'(?:الأوضاع|أوضاع)\s+الضعيفة\b', r'\1الأوضاع الهشّة', text)
+            text = re.sub(_B + r'الفئات\s+الضعيفة\b', r'\1الفئات الأكثر هشاشة', text)
+            text = re.sub(_B + r'الأطفال\s+الضعفاء\b', r'\1الأطفال الأكثر هشاشة', text)
+        if re.search(r'\bmonitoring\b', src_lower) and (
+            domain == "policy_un"
+            or re.search(r'\b(?:programme|evaluation|reporting|framework|results?|unicef)\b', src_lower)
+        ):
+            text = re.sub(_B + r'المراقبة\s+والتقييم\b', r'\1الرصد والتقييم', text)
+            text = re.sub(_B + r'المراقبة\s+والإبلاغ\b', r'\1الرصد والإبلاغ', text)
+            text = re.sub(_B + r'إطار\s+المراقبة\b', r'\1إطار الرصد', text)
+        if re.search(r'\breturnees?\b', src_lower):
+            text = re.sub(_B + r'(?:المعتادين|العائدات)\b', r'\1العائدين', text)
+        if re.search(r'\bearly\s+childhood\s+development\b', src_lower):
+            text = re.sub(_B + r'تطوير\s+الطفولة\s+المبكرة\b', r'\1تنمية الطفولة المبكرة', text)
+        if re.search(r'\bpre[\s-]primary\b', src_lower):
+            text = re.sub(
+                _B + r'(?:التعليم\s+)?(?:ما\s+)?قبل\s+(?:الأولي|الأولية|الأساسي)\b',
+                r'\1التعليم ما قبل الابتدائي',
+                text,
+            )
+        if re.search(r'\bwasting\b', src_lower) and (
+            domain == "policy_un"
+            or re.search(r'\b(?:nutrition|malnutrition|stunting|children|under[\s-]+(?:5|five)|acute|mics|unicef)\b', src_lower)
+        ):
+            text = re.sub(_B + r'(?:الإهدار|التبذير|النفايات)\b', r'\1الهزال', text)
+        if re.search(r'\bstunting\b', src_lower) and (
+            domain == "policy_un"
+            or re.search(r'\b(?:nutrition|malnutrition|wasting|children|under[\s-]+(?:5|five)|mics|unicef)\b', src_lower)
+        ):
+            text = re.sub(_B + r'(?:التأخير|التوقف\s+عن\s+النمو|التعثر)\b', r'\1التقزّم', text)
+        if re.search(r'\bunder[\s-]+(?:5|five)\b', src_lower):
+            text = re.sub(r'(?:دون|تحت)\s+(?:سن\s+)?0\b', 'دون سن الخامسة', text)
+        if re.search(r'\bdo\s+no\s+harm\b', src_lower):
+            text = re.sub(
+                _B + r'(?:لن\s+يفعل\s+أي\s+شيء\s+الضرر|لا\s+يفعل\s+أي\s+ضرر|عدم\s+فعل\s+الضرر)\b',
+                r'\1عدم إلحاق الضرر',
+                text,
+            )
+        if re.search(r'\bMICS\b', source_text or ""):
+            text = re.sub(_B + r'(?:ميكس|مايكس|Mics)\b', r'\1MICS', text)
+        if re.search(r'\bchild\s+welfare\s+commission\b', src_lower):
+            text = re.sub(_B + r'(?:لجنة|مفوضية)\s+رعاية\s+(?:الطفل|الطفولة)\b', r'\1هيئة رعاية الطفولة', text)
+        if re.search(r'\bibid\.?', src_lower):
+            text = re.sub(r'(?:إيبيد|\(الـ\s*\(الـ\))', 'المرجع نفسه', text)
+        if re.search(r'\bglossary\b', src_lower):
+            text = re.sub(_B + r'(?:الجلسة|مسرد\s+الجلسة)\b', r'\1قائمة المصطلحات', text)
+        if re.search(r'\bpayer\b', src_lower) and not re.search(r'\bpayee\b', src_lower):
+            text = re.sub(_B + r'(?:المدفوع|الدافع\s+له)\b', r'\1الدافع', text)
+        if (domain == "invoice_form" or re.search(r'\binvoice\b', src_lower)) and not re.search(r'\bnoti(?:ce|fication)\b', src_lower):
+            text = re.sub(_B + r'الإشعار\b', r'\1الفاتورة', text)
+        if (
+            re.search(r'\bclearing\b', src_lower)
+            and (domain == "financial_banking" or re.search(r'\b(?:clearing\s+house|ach|qatch|settlement|iban|payment|bank|cheque|check)\b', src_lower))
+            and not re.search(r'\b(?:cache|forest|brush|land|throat)\b', src_lower)
+        ):
+            text = re.sub(_B + r'(?:التنظيف|تنظيف)\b', r'\1المقاصة', text)
+        if re.search(r'\bcheck\s+digit\b', src_lower):
+            text = re.sub(_B + r'(?:تولد\s+المال\s+التحقق|تحديدات\s+الاختبار)\b', r'\1رقم التحقق', text)
+        if re.search(r'\bqty\b', src_lower):
+            text = re.sub(_B + r'القيادة\b', r'\1الكمية', text)
+        if re.search(r'\bequation\b', src_lower) and not re.search(r'\bequality\b', src_lower):
+            text = re.sub(_B + r'(?:التساوي|المساواة)\b', r'\1المعادلة', text)
+        if (
+            re.search(r'\bagents?\b', src_lower)
+            and re.search(r'\b(?:ai|llm|autonomous|software|multi-agent|tool|agentic|bot)\b', src_lower)
+            and not re.search(r'\b(?:change|real\s+estate|travel|insurance)\b', src_lower)
+        ):
+            text = re.sub(_B + r'عامل\b', r'\1وكيل برمجي', text)
+        if (
+            re.search(r'\bstrings?\b', src_lower)
+            and re.search(r'\b(?:utf-?8|ascii|unicode|text|character|char|code|parse|json|yaml|sql|bytes?|tokens?|regex|concatenat)\b', src_lower)
+            and not re.search(r'\b(?:guitar|violin|piano|harp|orchestra|music|instrument)\b', src_lower)
+        ):
+            text = re.sub(_B + r'(?:أوتار|خيوط)\b', r'\1سلاسل نصية', text)
+        if re.search(r'\bsalient\s+neurons?\b', src_lower):
+            text = re.sub(_B + r'الخلايا\s+العصبية\s+الصلبة\b', r'\1الخلايا العصبية البارزة', text)
         if re.search(r'\binterjections?\b', src_lower):
             text = re.sub(_B + r'(?:التقاطعات|تقاطعات)\b', r'\1صيغ التعجب', text)
         if re.search(r'\bsyntax\b', src_lower) and "translation" not in src_lower:
