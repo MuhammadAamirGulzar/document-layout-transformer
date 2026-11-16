@@ -361,6 +361,9 @@ class ParagraphFinder:
         #     ]
 
         # ç¬¬äºŒæ­¥ï¼šå°†æ®µè½å†…çš„å­—ç¬¦æ‹†åˆ†ä¸ºè¡Œ
+        paragraphs = self._split_multicolumn_paragraphs(paragraphs)
+        page.pdf_paragraph = paragraphs
+
         for paragraph in paragraphs:
             if (
                 paragraph.xobj_id
@@ -1351,17 +1354,7 @@ class ParagraphFinder:
                         ),
                     ):
                         char_box = char.visual_bbox.box if char.visual_bbox and char.visual_bbox.box else char.box
-                        group = next(
-                            (
-                                group
-                                for group in line_groups
-                                if abs(
-                                    (group[0].visual_bbox.box.y if group[0].visual_bbox and group[0].visual_bbox.box else group[0].box.y)
-                                    - char_box.y
-                                ) <= 2.0
-                            ),
-                            None,
-                        )
+                        group = self._find_matching_line_group(line_groups, char_box)
                         if group is None:
                             line_groups.append([char])
                         else:
@@ -2082,7 +2075,11 @@ class ParagraphFinder:
         for line_chars in lines:
             if line_chars:
                 # Sort characters within each line by x-coordinate (left-to-right).
-                # line_chars.sort(key=lambda c: c.visual_bbox.box.x)
+                line_chars.sort(
+                    key=lambda c: c.visual_bbox.box.x
+                    if c.visual_bbox and c.visual_bbox.box
+                    else c.box.x
+                )
                 new_line_compositions.append(self.create_line(line_chars))
 
         # The lines are already sorted vertically due to the scanning process.
@@ -3376,3 +3373,138 @@ class ParagraphFinder:
                 reordered.extend(grp)
             new_chars[start:end] = reordered
         line.pdf_character = new_chars
+
+    @staticmethod
+    def _find_matching_line_group(
+        line_groups: list[list[PdfCharacter]], char_box: Box
+    ) -> list[PdfCharacter] | None:
+        """Match a glyph into an existing visual line allowing descenders and mid-height punctuation."""
+        char_h = max(0.5, char_box.y2 - char_box.y)
+        char_cy = (char_box.y + char_box.y2) * 0.5
+        best_group: list[PdfCharacter] | None = None
+        best_dist = float("inf")
+        for group in line_groups:
+            anchor_boxes = [
+                g.visual_bbox.box if g.visual_bbox and g.visual_bbox.box else g.box
+                for g in group
+            ]
+            # Anchor band from typical non-punctuation glyphs if available, else all glyphs.
+            body_boxes = [b for b in anchor_boxes if (b.y2 - b.y) >= 3.5] or anchor_boxes
+            band_y = min(b.y for b in body_boxes)
+            band_y2 = max(b.y2 for b in body_boxes)
+            band_h = max(1.0, band_y2 - band_y)
+            band_cy = (band_y + band_y2) * 0.5
+            overlap = min(band_y2, char_box.y2) - max(band_y, char_box.y)
+            is_small_punct = char_h < band_h * 0.45
+            matches = (
+                overlap > 0.30 * min(band_h, char_h)
+                or (
+                    is_small_punct
+                    and (band_y - max(2.0, band_h * 0.25)) <= char_cy <= (band_y2 + max(2.0, band_h * 0.25))
+                )
+                or abs(band_y - char_box.y) <= max(2.0, band_h * 0.25)
+            )
+            if matches:
+                dist = abs(band_cy - char_cy)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_group = group
+        return best_group
+
+    def _split_multicolumn_paragraphs(
+        self, paragraphs: list[PdfParagraph]
+    ) -> list[PdfParagraph]:
+        """Split pre-line paragraphs that accidentally merged side-by-side columns."""
+        result: list[PdfParagraph] = []
+        for para in paragraphs:
+            comps = para.pdf_paragraph_composition or []
+            chars = [
+                c.pdf_character
+                for c in comps
+                if c.pdf_character and (c.pdf_character.char_unicode or "").strip()
+            ]
+            if len(chars) < 6 or len(comps) != len([c for c in comps if c.pdf_character]):
+                result.append(para)
+                continue
+
+            boxes = [
+                (c.visual_bbox.box if c.visual_bbox and c.visual_bbox.box else c.box, c)
+                for c in chars
+            ]
+            font_sizes = sorted(
+                c.pdf_style.font_size
+                for c in chars
+                if c.pdf_style and c.pdf_style.font_size
+            )
+            med_fs = font_sizes[len(font_sizes) // 2] if font_sizes else 10.0
+            gutter_thresh = max(22.0, med_fs * 2.3)
+
+            # Merge overlapping X intervals of non-space glyphs to detect clean vertical gutters.
+            intervals = sorted((b.x, b.x2) for b, _ in boxes)
+            merged: list[list[float]] = []
+            for x0, x1 in intervals:
+                if not merged or x0 > merged[-1][1] + 0.5:
+                    merged.append([x0, x1])
+                else:
+                    merged[-1][1] = max(merged[-1][1], x1)
+
+            cut_xs = [
+                (merged[k][1] + merged[k + 1][0]) * 0.5
+                for k in range(len(merged) - 1)
+                if (merged[k + 1][0] - merged[k][1]) >= gutter_thresh
+            ]
+            if not cut_xs:
+                result.append(para)
+                continue
+
+            # Partition all compositions (including spaces) into X buckets around cut_xs.
+            buckets: list[list[PdfParagraphComposition]] = [[] for _ in range(len(cut_xs) + 1)]
+            for comp in comps:
+                c = comp.pdf_character
+                cb = c.visual_bbox.box if c.visual_bbox and c.visual_bbox.box else c.box
+                cx = (cb.x + cb.x2) * 0.5
+                bidx = 0
+                while bidx < len(cut_xs) and cx > cut_xs[bidx]:
+                    bidx += 1
+                buckets[bidx].append(comp)
+
+            non_empty_buckets = [b for b in buckets if any((comp.pdf_character.char_unicode or "").strip() for comp in b)]
+            if len(non_empty_buckets) < 2:
+                result.append(para)
+                continue
+
+            # Validate genuine multi-column content (not bullet label+value, TOC dots, or tiny single formula gap):
+            def _bucket_rows_and_width(bucket: list[PdfParagraphComposition]) -> tuple[int, float]:
+                b_chars = [comp.pdf_character for comp in bucket if (comp.pdf_character.char_unicode or "").strip()]
+                ys = sorted((c.visual_bbox.box if c.visual_bbox and c.visual_bbox.box else c.box).y for c in b_chars)
+                rows = 1 if ys else 0
+                for idx_y in range(1, len(ys)):
+                    if ys[idx_y] - ys[idx_y - 1] > max(4.5, med_fs * 0.45):
+                        rows += 1
+                xs0 = min((c.visual_bbox.box if c.visual_bbox and c.visual_bbox.box else c.box).x for c in b_chars)
+                xs1 = max((c.visual_bbox.box if c.visual_bbox and c.visual_bbox.box else c.box).x2 for c in b_chars)
+                return rows, xs1 - xs0
+
+            stats = [_bucket_rows_and_width(b) for b in non_empty_buckets]
+            all_text = "".join((c.char_unicode or "") for c in chars)
+            if re.search(r"(?:\.\s*){8,}", all_text):
+                result.append(para)
+                continue
+
+            multi_row_cols = sum(1 for rows, _ in stats if rows >= 2)
+            wide_cols = sum(1 for _, w in stats if w >= 42.0)
+            if multi_row_cols >= 2 or (multi_row_cols >= 1 and wide_cols >= 2):
+                for b in non_empty_buckets:
+                    sub_p = PdfParagraph(
+                        pdf_paragraph_composition=b,
+                        layout_id=para.layout_id,
+                        layout_label=para.layout_label,
+                        debug_id=generate_base58_id(),
+                        xobj_id=para.xobj_id,
+                        render_order=para.render_order,
+                    )
+                    self.update_paragraph_data(sub_p)
+                    result.append(sub_p)
+            else:
+                result.append(para)
+        return result

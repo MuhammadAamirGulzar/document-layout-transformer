@@ -22,6 +22,10 @@ from babeldoc.format.pdf.document_il.utils.fontmap import FontMapper, is_arabic_
 from babeldoc.format.pdf.document_il.utils.arabic_shaper import shape_arabic_run
 from babeldoc.format.pdf.document_il.utils.formular_helper import update_formula_data
 from babeldoc.format.pdf.document_il.utils.layout_helper import box_to_tuple
+from babeldoc.format.pdf.document_il.utils.layout_semantics import (
+    is_standalone_code_text,
+    paragraph_semantic_zone,
+)
 from babeldoc.format.pdf.document_il.utils.semantic_table import (
     SemanticTable,
     annotate_page_semantic_tables,
@@ -1071,6 +1075,56 @@ class Typesetting:
                     frames.append((left.x2, right.x))
         return min(frames, key=lambda bounds: bounds[1] - bounds[0], default=None)
 
+    def _find_enclosing_region_box(
+        self, paragraph: il_version_1.PdfParagraph, page: il_version_1.Page
+    ) -> Box | None:
+        """Find the tightest drawn box/card enclosing this paragraph (code, form, badge, callout, receipt)."""
+        pbox = getattr(paragraph, "box", None)
+        if pbox is None or not page.cropbox or not page.cropbox.box:
+            return None
+        page_box = page.cropbox.box
+        page_w = max(1.0, page_box.x2 - page_box.x)
+        page_h = max(1.0, page_box.y2 - page_box.y)
+        pw = max(0.5, pbox.x2 - pbox.x)
+        ph = max(0.5, pbox.y2 - pbox.y)
+        cx = (pbox.x + pbox.x2) * 0.5
+        cy = (pbox.y + pbox.y2) * 0.5
+        tol = 1.5
+        candidates: list[Box] = []
+
+        def _consider(box: Box | None) -> None:
+            if box is None:
+                return
+            bw = box.x2 - box.x
+            bh = box.y2 - box.y
+            if bw < max(8.0, pw * 0.72) or bh < max(8.0, ph * 0.72):
+                return
+            # Exclude full-page border frames / backgrounds so normal body prose can still mirror.
+            if bw > page_w * 0.85 and bh > page_h * 0.85:
+                return
+            if bw > page_w * 0.88:
+                return
+            if (box.x - tol) <= cx <= (box.x2 + tol) and (box.y - tol) <= cy <= (box.y2 + tol):
+                candidates.append(box)
+
+        for rect in getattr(page, "pdf_rectangle", None) or []:
+            rx = getattr(rect, "xobj_id", None)
+            if rx is not None and paragraph.xobj_id is not None and rx != paragraph.xobj_id:
+                continue
+            _consider(getattr(rect, "box", None))
+
+        for curve in getattr(page, "pdf_curve", None) or []:
+            cxobj = getattr(curve, "xobj_id", None)
+            if cxobj is not None and paragraph.xobj_id is not None and cxobj != paragraph.xobj_id:
+                continue
+            cbox = getattr(curve, "box", None)
+            if cbox is not None and (cbox.x2 - cbox.x) > 3.0 and (cbox.y2 - cbox.y) > 3.0:
+                _consider(cbox)
+
+        if not candidates:
+            return None
+        return min(candidates, key=lambda b: (b.x2 - b.x) * (b.y2 - b.y))
+
     def _expand_structured_text_boxes(self, page: il_version_1.Page) -> None:
         """Provide full-width lanes for structured records and short headings.
 
@@ -1107,10 +1161,37 @@ class Typesetting:
             if self._is_arabic_output() and (frame := self._contact_frame_bounds(paragraph, page)):
                 paragraph.box = Box(frame[0] + 4, paragraph.box.y, frame[1] - 4, paragraph.box.y2)
                 continue
+            if (enclosing := self._find_enclosing_region_box(paragraph, page)) is not None:
+                pad = 1.5 if (enclosing.x2 - enclosing.x) < 40.0 else 3.0
+                paragraph.box = Box(
+                    max(paragraph.box.x, enclosing.x + pad),
+                    paragraph.box.y,
+                    min(paragraph.box.x2, enclosing.x2 - pad),
+                    paragraph.box.y2,
+                )
+                continue
+            # Do not expand laterally across images/barcodes or side-by-side cards/paragraphs.
+            cand_left = min(paragraph.box.x, content_left)
+            cand_right = max(paragraph.box.x2, content_right)
+            for form in getattr(page, "pdf_form", None) or []:
+                fbox = getattr(form, "box", None)
+                if fbox and min(fbox.y2, paragraph.box.y2) - max(fbox.y, paragraph.box.y) > 2.0:
+                    if fbox.x2 <= paragraph.box.x + 2.0:
+                        cand_left = max(cand_left, fbox.x2 + 4.0)
+                    elif fbox.x >= paragraph.box.x2 - 2.0:
+                        cand_right = min(cand_right, fbox.x - 4.0)
+            for other in page.pdf_paragraph or []:
+                if other is paragraph or not other.box:
+                    continue
+                if min(other.box.y2, paragraph.box.y2) - max(other.box.y, paragraph.box.y) > 2.0:
+                    if other.box.x2 <= paragraph.box.x + 2.0:
+                        cand_left = max(cand_left, other.box.x2 + 4.0)
+                    elif other.box.x >= paragraph.box.x2 - 2.0:
+                        cand_right = min(cand_right, other.box.x - 4.0)
             paragraph.box = Box(
-                min(paragraph.box.x, content_left),
+                cand_left,
                 paragraph.box.y,
-                max(paragraph.box.x2, content_right),
+                max(cand_left + 10.0, cand_right),
                 paragraph.box.y2,
             )
 
@@ -3839,7 +3920,20 @@ class Typesetting:
         """
         if not page.cropbox or not page.cropbox.box:
             return original_box
-        
+
+        enclosing = self._find_enclosing_region_box(paragraph, page)
+        if enclosing is not None:
+            pad = 1.0 if (enclosing.x2 - enclosing.x) < 35.0 else 2.0
+            cx0 = enclosing.x + pad
+            cx1 = enclosing.x2 - pad
+            if cx1 > cx0 + 2.0:
+                original_box = Box(
+                    x=max(original_box.x, cx0),
+                    y=original_box.y,
+                    x2=min(original_box.x2, cx1),
+                    y2=original_box.y2,
+                )
+
         page_box = page.cropbox.box
         
         # Get the margin shift that will be applied later
@@ -3913,8 +4007,11 @@ class Typesetting:
         if self._is_centered_display_text(paragraph, page):
             return 0.0
 
-        # Framed contact rows are already right-aligned within their own lane.
-        if self._is_arabic_output() and self._contact_frame_bounds(paragraph, page):
+        # Framed contact rows and boxed/code/figure containers stay anchored in their region.
+        if self._is_arabic_output() and (
+            self._contact_frame_bounds(paragraph, page)
+            or self._should_skip_margin_mirroring(paragraph, page)
+        ):
             return 0.0
 
         # Symmetrical page-level mirroring for running headers, footers, and page numbers
@@ -4187,6 +4284,15 @@ class Typesetting:
         """Check if a paragraph should NOT have margin mirroring applied."""
         if self._is_header_or_footer(paragraph, page):
             return False  # Always mirror running headers, footers, and page numbers!
+        trace = getattr(paragraph, "pipeline_trace", None) or {}
+        if trace.get("preserved_code") or trace.get("in_figure_region"):
+            return True
+        if paragraph_semantic_zone(paragraph, page) in {"code", "figure"}:
+            return True
+        if is_standalone_code_text(paragraph.unicode, paragraph.layout_label or ""):
+            return True
+        if self._find_enclosing_region_box(paragraph, page) is not None:
+            return True
         return self._is_paragraph_inside_table(paragraph, page)
 
     def _is_paragraph_inside_table(self, paragraph: il_version_1.PdfParagraph, page: il_version_1.Page) -> bool:
@@ -4853,8 +4959,8 @@ class Typesetting:
             )
             
             # Apply RTL margin mirroring for Arabic output on passthrough paragraphs
-            # Skip table content to maintain table structure
-            if is_arabic_output and not is_table_content:
+            # Skip table, code, figure, and boxed container content to preserve structure
+            if is_arabic_output and not self._should_skip_margin_mirroring(paragraph, page):
                 shift_x = self._calculate_rtl_margin_shift(paragraph, page)
                 if shift_x != 0:
                     self._apply_rtl_margin_shift_to_composition(
@@ -6106,6 +6212,11 @@ class Typesetting:
             if "fixed" in lbl or trace.get("preserve_irregular_table"):
                 min_y = max(min_y, current_box.y)
 
+        if paragraph is not None:
+            enclosing = self._find_enclosing_region_box(paragraph, page)
+            if enclosing is not None:
+                min_y = max(min_y, enclosing.y + 1.5)
+
         # Check for content below that may interfere
         for para in page.pdf_paragraph:
             if para.box == current_box or para.box is None:  # Skip current paragraph
@@ -6120,12 +6231,18 @@ class Typesetting:
                 char.box.x >= current_box.x2 or char.box.x2 <= current_box.x
             ):
                 min_y = max(min_y, char.box.y2)
-        # Check figures
+        # Check figures and bitmap/XObject images
         for figure in page.pdf_figure:
             if figure.box.y2 < current_box.y and not (
                 figure.box.x >= current_box.x2 or figure.box.x2 <= current_box.x
             ):
                 min_y = max(min_y, figure.box.y2)
+        for form in getattr(page, "pdf_form", None) or []:
+            fbox = getattr(form, "box", None)
+            if fbox and fbox.y2 < current_box.y and not (
+                fbox.x >= current_box.x2 or fbox.x2 <= current_box.x
+            ):
+                min_y = max(min_y, fbox.y2)
 
         return min_y
 
