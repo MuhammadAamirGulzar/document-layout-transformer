@@ -1031,7 +1031,7 @@ class ILTranslator:
                 toc_match = toc_leader_pattern.match(stripped_line) if stripped_line else None
                 if toc_match:
                     title, dots, page_num = toc_match.group(1).strip(), toc_match.group(2), toc_match.group(3)
-                    compact_dots = "." * max(8, dots.count("."))
+                    compact_dots = "." * dots.count(".") if " " in dots else dots
                     tr_title = translate_segment(title) if title else ""
                     translated_lines.append(f"{tr_title} {compact_dots} {page_num}")
                 elif stripped_line:
@@ -1046,7 +1046,7 @@ class ILTranslator:
                 toc_match = toc_leader_pattern.match(non_empty[0])
                 if toc_match:
                     title, dots, page_num = toc_match.group(1).strip(), toc_match.group(2), toc_match.group(3)
-                    compact_dots = "." * max(8, dots.count("."))
+                    compact_dots = "." * dots.count(".") if " " in dots else dots
                     tr_title = translate_segment(title) if title else ""
                     return f"{tr_title} {compact_dots} {page_num}"
 
