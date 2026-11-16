@@ -2,6 +2,7 @@ import logging
 import random
 import re
 import statistics
+import unicodedata
 from dataclasses import replace
 
 import numpy as np
@@ -449,6 +450,7 @@ class ParagraphFinder:
                         composition.pdf_line.pdf_character.sort(
                             key=self._get_char_sort_key
                         )
+                        self._normalize_visual_rtl_runs(composition.pdf_line)
                         self.update_line_data(composition.pdf_line)
                 self._deduplicate_artificial_header_characters(paragraph, page)
 
@@ -2255,7 +2257,7 @@ class ParagraphFinder:
 
                 # æ£€æŸ¥æ˜¯å¦åŒ…å«è¿žç»­çš„ç‚¹ï¼ˆè‡³å°‘ 20 ä¸ªï¼‰
                 # å¦‚æžœæœ‰è‡³å°‘è¿žç»­ 20 ä¸ªç‚¹ï¼Œåˆ™ä»£è¡¨è¿™æ˜¯ç›®å½•æ¡ç›®
-                if re.search(r"\.{20,}", prev_text):
+                if re.search(r"(?:\.\s*){12,}", prev_text):
                     # åˆ›å»ºæ–°çš„æ®µè½
                     new_paragraph = PdfParagraph(
                         box=Box(0, 0, 0, 0),  # ä¸´æ—¶è¾¹ç•Œæ¡†
@@ -3246,3 +3248,131 @@ class ParagraphFinder:
         # Sort by y coordinate first (top to bottom), then x coordinate (left to right)
         # Note: In PDF coordinate system, y increases upward, so we negate y for top-to-bottom sorting
         return (box.x, -box.y)
+
+    @staticmethod
+    def _is_arabic_letter(ch: str) -> bool:
+        if not ch:
+            return False
+        o = ord(ch[0])
+        return (
+            (0x0621 <= o <= 0x064A)
+            or (0x066E <= o <= 0x06D3)
+            or o == 0x06D5
+            or (0xFB50 <= o <= 0xFDFF)
+            or (0xFE70 <= o <= 0xFEFF)
+        )
+
+    @staticmethod
+    def _is_visual_ltr_arabic_span(raw_texts: list[str]) -> bool:
+        """Return True if an Arabic span in X-sorted order is in visual-LTR order."""
+        tokens: list[list[str]] = []
+        curr: list[str] = []
+        for t in raw_texts:
+            if t and ParagraphFinder._is_arabic_letter(t[0]):
+                curr.append(t[0])
+            else:
+                if curr:
+                    tokens.append(curr)
+                    curr = []
+        if curr:
+            tokens.append(curr)
+
+        for tok in tokens:
+            first_final = None
+            last_nonfinal = None
+            for idx, ch in enumerate(tok):
+                o = ord(ch)
+                if 0xFB50 <= o <= 0xFEFF:
+                    name = unicodedata.name(ch, "")
+                    if "FINAL FORM" in name and first_final is None:
+                        first_final = idx
+                    elif ("INITIAL FORM" in name or "MEDIAL FORM" in name):
+                        last_nonfinal = idx
+            if first_final is not None and last_nonfinal is not None and first_final < last_nonfinal:
+                return True
+
+        nfkc_tokens = [unicodedata.normalize("NFKC", "".join(tok)) for tok in tokens]
+        for ntok in nfkc_tokens:
+            if len(ntok) >= 2 and ntok[0] in {"\u0629", "\u0649"}:
+                return True
+            if len(ntok) >= 4 and ntok.endswith("\u0644\u0627") and not ntok.startswith("\u0627\u0644"):
+                return True
+        return False
+
+    def _normalize_visual_rtl_runs(self, line: PdfLine) -> None:
+        """Normalize visually-LTR extracted Arabic presentation runs into logical RTL order."""
+        chars = line.pdf_character
+        if not chars or not any(self._is_arabic_letter(c.char_unicode or "") for c in chars):
+            return
+        # Bridge across digits/spaces/punctuation when embedded in a pure-Arabic line
+        has_latin = any((c.char_unicode or "").isascii() and (c.char_unicode or "").isalpha() for c in chars)
+        spans: list[tuple[int, int]] = []
+        if not has_latin:
+            spans.append((0, len(chars)))
+        else:
+            idx = 0
+            while idx < len(chars):
+                if self._is_arabic_letter(chars[idx].char_unicode or ""):
+                    start = idx
+                    last_ar = idx
+                    j = idx + 1
+                    while j < len(chars):
+                        u = chars[j].char_unicode or ""
+                        if self._is_arabic_letter(u):
+                            last_ar = j
+                            j += 1
+                        elif u.isspace() or u in {"-", "\u2010", "\u2013", "/", ",", "\u060C"} or u.isdigit():
+                            # Look ahead to ensure more Arabic follows without crossing Latin letters
+                            k = j + 1
+                            while k < len(chars) and ((chars[k].char_unicode or "").isspace() or (chars[k].char_unicode or "").isdigit()):
+                                k += 1
+                            if k < len(chars) and self._is_arabic_letter(chars[k].char_unicode or ""):
+                                j += 1
+                            else:
+                                break
+                        else:
+                            break
+                    spans.append((start, last_ar + 1))
+                    idx = last_ar + 1
+                else:
+                    idx += 1
+
+        new_chars = list(chars)
+        for start, end in spans:
+            sub = chars[start:end]
+            raw_texts = [c.char_unicode or "" for c in sub]
+            if not self._is_visual_ltr_arabic_span(raw_texts):
+                # Still normalize isolated presentation forms to NFKC logical base letters
+                for c in sub:
+                    if c.char_unicode and any(0xFB50 <= ord(ch) <= 0xFEFF for ch in c.char_unicode):
+                        c.char_unicode = unicodedata.normalize("NFKC", c.char_unicode)
+                continue
+            # Keep digit subruns internally LTR while reversing the overall span visually->logically
+            grouped: list[list[PdfCharacter]] = []
+            k = 0
+            while k < len(sub):
+                ch_u = sub[k].char_unicode or ""
+                if ch_u.isdigit():
+                    num_grp: list[PdfCharacter] = []
+                    while k < len(sub) and (
+                        (sub[k].char_unicode or "").isdigit()
+                        or (
+                            (sub[k].char_unicode or "") in {".", ",", "\u066B", "\u066C"}
+                            and k + 1 < len(sub)
+                            and (sub[k + 1].char_unicode or "").isdigit()
+                        )
+                    ):
+                        num_grp.append(sub[k])
+                        k += 1
+                    grouped.append(num_grp)
+                else:
+                    c = sub[k]
+                    if c.char_unicode and any(0xFB50 <= ord(ch) <= 0xFEFF for ch in c.char_unicode):
+                        c.char_unicode = unicodedata.normalize("NFKC", c.char_unicode)
+                    grouped.append([c])
+                    k += 1
+            reordered: list[PdfCharacter] = []
+            for grp in reversed(grouped):
+                reordered.extend(grp)
+            new_chars[start:end] = reordered
+        line.pdf_character = new_chars

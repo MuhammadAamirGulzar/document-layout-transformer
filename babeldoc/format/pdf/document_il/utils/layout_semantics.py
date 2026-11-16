@@ -24,6 +24,27 @@ _CODE_DEF_OR_BLOCK_RE = re.compile(
     r"(?:return|yield|raise|throw)\b(?:\s+[\w\(\[\{\'\"\-]|\s*;?\s*$)|"
     r"#include\s*[<\"])"
 )
+_SQL_CLAUSE_RE = re.compile(
+    r"\b(?:SELECT\s+.+?\s+FROM\s+[A-Za-z_][\w.]*|FROM\s+[A-Za-z_][\w.]*|WHERE\s+[A-Za-z_][\w.]*\s*(?:=|!=|<>|<|>|\bIN\b|\bLIKE\b|\bIS\b)|"
+    r"(?:INNER|LEFT|RIGHT)?\s*JOIN\s+[A-Za-z_][\w.]*\s+ON\b|GROUP\s+BY\s+[A-Za-z_]|ORDER\s+BY\s+[A-Za-z_]|"
+    r"INSERT\s+INTO\s+[A-Za-z_]|CREATE\s+TABLE\s+[A-Za-z_]|ALTER\s+TABLE\s+[A-Za-z_])\b",
+    re.IGNORECASE,
+)
+_JSON_KEY_RE = re.compile(r'^\s*"[^"\n]{1,64}"\s*:\s*\S?')
+_YAML_KV_RE = re.compile(
+    r"^\s*(?:-\s+)?(?!(?:Name|Role|Phone|Email|Address|Website|Note|Title|Date|Invoice|Subtotal|Total|Warning|Summary)\b)"
+    r"[a-z_][a-z0-9_.\-]{1,40}\s*:(?:\s+(?:true|false|null|\d[\d.]*|\"[^\"]*\"|\'[^\']*\'|\[[^\]]*\]|\S+[/_.\-]\S*)|\s*$)"
+)
+_HTML_TAG_RE = re.compile(
+    r"(?:<!DOCTYPE\s+\w+|</[a-zA-Z][a-zA-Z0-9\-]{0,20}\s*>|<(?!(?:b|B)\d+\s*>)[a-zA-Z][a-zA-Z0-9\-]{1,20}(?:\s+[a-zA-Z_:][a-zA-Z0-9_.:-]*\s*=\s*(?:\"[^\"]*\"|\'[^\']*\')|\s*/)*\s*>)"
+)
+_DIFF_HEADER_RE = re.compile(
+    r"^\s*(?:---\s+(?:a/|/dev/null|\S+\.\w+)|\+\+\+\s+(?:b/|/dev/null|\S+\.\w+)|@@\s+-\d+(?:,\d+)?\s+\+\d+(?:,\d+)?\s+@@|diff\s+--git\s+)"
+)
+_SHELL_LINE_RE = re.compile(
+    r"^\s*(?:\$\s+(?:[A-Za-z_][\w.\-/]*(?:\s|$))|(?:export\s+[A-Za-z_][A-Za-z0-9_]*=|(?:curl|wget|git|pytest|python3?|pip|docker|kubectl|grep|awk|sed)\s+-\S*))"
+)
+_REGEX_LITERAL_RE = re.compile(r"^\s*/(?:[^/\n\\]|\\.)+/[gimsuvy]*\s*$")
 
 _CODE_CONTROL_RE = re.compile(
     r"^\s*(?:\d+\s*[:.)]?\s*)?(?:"
@@ -105,6 +126,13 @@ def is_standalone_code_text(text: str | None, layout_label: str = "") -> bool:
     op_hits = sum(1 for ln in lines if _CODE_OP_RE.search(ln))
     assign_hits = sum(1 for ln in lines if _CODE_ASSIGN_RE.match(ln))
     fn_hits = len(_FUNCTION_CALL_OR_SNAKE_RE.findall(raw))
+    sql_hits = len(_SQL_CLAUSE_RE.findall(raw))
+    json_hits = sum(1 for ln in lines if _JSON_KEY_RE.match(ln) or ln.strip() in {"{", "}", "},", "[", "]", "],"})
+    yaml_hits = sum(1 for ln in lines if _YAML_KV_RE.match(ln))
+    html_hits = len(_HTML_TAG_RE.findall(raw))
+    diff_hits = sum(1 for ln in lines if _DIFF_HEADER_RE.match(ln))
+    shell_hits = sum(1 for ln in lines if _SHELL_LINE_RE.match(ln))
+    regex_hits = sum(1 for ln in lines if _REGEX_LITERAL_RE.match(ln))
 
     if len(lines) == 1:
         ln = lines[0]
@@ -112,9 +140,32 @@ def is_standalone_code_text(text: str | None, layout_label: str = "") -> bool:
             "(" in ln or ":" in ln or "{" in ln or "SELECT" in ln.upper()
         ):
             return True
+        if sql_hits >= 1 and (";" in ln or re.search(r"\b(?:WHERE|JOIN|GROUP\s+BY|ORDER\s+BY)\b", ln, re.I)):
+            return True
+        if regex_hits >= 1 or shell_hits >= 1 or diff_hits >= 1:
+            return True
+        if html_hits >= 2 and re.search(r"</[a-zA-Z][a-zA-Z0-9\-]*>", ln):
+            return True
+        if json_hits >= 1 and ln.strip().startswith("{") and ln.strip().endswith("}"):
+            return True
         if assign_hits >= 1 and _CODE_OP_RE.search(ln) and not ln.endswith("."):
             return True
         return False
+
+    if sql_hits >= 2:
+        return True
+    if json_hits >= max(2, int(len(lines) * 0.6)) and ("{" in raw or "}" in raw or re.search(r'^\s*"[^"\n]+"\s*:', raw, re.M)):
+        return True
+    if yaml_hits >= max(2, int(len(lines) * 0.6)) and not raw.endswith("."):
+        return True
+    if html_hits >= 2 and re.search(r"</[a-zA-Z][a-zA-Z0-9\-]*>", raw):
+        return True
+    if diff_hits >= 1 and (len(lines) >= 2 or any(ln.lstrip().startswith(("+", "-", "@@")) for ln in lines)):
+        return True
+    if shell_hits >= 1 and (shell_hits >= 2 or any("--" in ln or "|" in ln or "\\" in ln for ln in lines)):
+        return True
+    if regex_hits >= 1:
+        return True
 
     code_lines = sum(
         1
@@ -124,7 +175,7 @@ def is_standalone_code_text(text: str | None, layout_label: str = "") -> bool:
         or _CODE_OP_RE.search(ln)
         or _CODE_ASSIGN_RE.match(ln)
     )
-    if def_hits >= 1 and (ctrl_hits + op_hits + assign_hits >= 1 or len(lines) <= 4):
+    if def_hits >= 1 and (ctrl_hits + op_hits + assign_hits + sql_hits >= 1 or len(lines) <= 4):
         return True
     if code_lines >= 2 and (op_hits >= 1 or assign_hits >= 1 or ctrl_hits >= 2) and fn_hits >= 1:
         return True

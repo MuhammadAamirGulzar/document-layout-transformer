@@ -521,6 +521,18 @@ class StylesAndFormulas:
             # Superscripted English ordinal suffixes (1st, 2nd, 3rd, 4th, 23rd, 29th)
             # in Word-generated PDFs use smaller font sizes (< 0.79x), which would
             # otherwise be misclassified as mathematical corner-mark formulas (<b1>).
+            if is_corner_mark and (char.char_unicode or "") == "/":
+                prev_u = (previous_char.char_unicode or "") if previous_char else ""
+                tail_u = "".join(
+                    (c.char_unicode or "") for c in line.pdf_character[i:] if c.char_unicode
+                ).split()[0] if i < len(line.pdf_character) else ""
+                if (
+                    prev_u.isascii()
+                    and prev_u.isupper()
+                    and re.fullmatch(r"/[A-Za-z0-9][A-Za-z0-9./\-]{2,}", tail_u)
+                ):
+                    is_corner_mark = False
+
             if is_corner_mark and (char.char_unicode or "").isascii() and (char.char_unicode or "").isalpha():
                 prev_u = (previous_char.char_unicode or "") if previous_char else ""
                 next_u = (next_char.char_unicode or "") if next_char else ""
@@ -1001,7 +1013,7 @@ class StylesAndFormulas:
         if formula.y_offset > 0.1:
             return False
         return bool(
-            re.match(r"^\+?[0-9, .\-()]+$", text)
+            re.match(r"^(?:[<>≤≥=±]\s*)?[+\-\u2212]?\s*[0-9, .()]+$", text.strip())
             and any(ch.isdigit() for ch in text)
         )
 

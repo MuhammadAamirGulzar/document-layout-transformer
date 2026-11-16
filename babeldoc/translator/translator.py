@@ -60,22 +60,30 @@ AUTHOR_YEAR_CITATION = re.compile(
 
 _NUMERAL_PATTERN = re.compile(
     # 0. Bibliographic and contact atoms that must survive byte-for-byte:
-    # URLs, DOIs, emails, ISO/numeric calendar dates, prefixed invoice/PO IDs,
+    # URLs, DOIs, emails, ISO/numeric calendar dates, Unix paths, filenames,
+    # UUIDs/hex hashes, prefixed invoice/PO IDs, multi-hyphen IDs, p-values,
     # and numeric bracket citations such as [12], [3, 7] or [4-9].
     r'(https?://[^\s<>"\u201d\u2019]*[^\s<>"\u201d\u2019.,;:!?)\]]|www\.[^\s<>"\u201d\u2019]*[^\s<>"\u201d\u2019.,;:!?)\]])|'
     r'(\b10\.\d{4,9}/[^\s<>"\u201d\u2019]*[^\s<>"\u201d\u2019.,;:!?)\]])|'
     r'([A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})|'
+    r'((?<![A-Za-z0-9_])(?:/|\.\.?/)[A-Za-z0-9._\-]+(?:/[A-Za-z0-9._\-]+)+/?)|'
+    r'((?<![A-Za-z0-9_])[A-Za-z0-9][A-Za-z0-9._\-]*\.(?:pdf|xlsx?|csv|tsv|json|ya?ml|xml|html?|sql|py|sh|txt|md|docx?|pptx?|png|jpe?g|svg|zip|tar\.gz|log|ini|cfg|env)\b)|'
+    r'(\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b)|'
+    r'(\b(?:sha256:)?[0-9a-f]{16,64}\b|\b0x[0-9a-fA-F]{4,}\b)|'
+    r'(\b\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:?\d{2})?)?\b)|'
     r'(\b\d{4}[-/]\d{1,2}[-/]\d{1,2}\b)|'
     r'(\b\d{1,2}[-/]\d{1,2}[-/]\d{2,4}\b)|'
     r'(\b(?:INV|PO|REF|TXN|VAT|TIN|EIN|DOC|ID)\s*#\s*\d[A-Z0-9\-/]*\b)|'
+    r'((?<![\w\-\u2010\u2011])(?=[A-Z0-9\-\u2010\u2011]*\d)[A-Z0-9]{2,}(?:[-\u2010\u2011][A-Z0-9]{1,}){2,}(?!\w|[-\u2010\u2011]\w))|'
+    r'(\b[pP]\s*(?:<=|>=|[<>≤≥=])\s*0?\.\d+\b)|'
     r'(\b[A-Z]{1,6}(?:/[A-Z0-9.\-]+){2,}\b)|'
     r'(\[\s*\d{1,3}(?:\s*[,\u2013\u2014-]\s*\d{1,3})*\s*\])|'
     rf"({AUTHOR_YEAR_CITATION.pattern})|"
-    # 1. Parenthetical mixed tokens: (2018=100), (NDS3), (281211210/97 =62), (Chart 7-1)
+    # 1. Parenthetical mixed tokens: (2018=100), (NDS3), (281211210/97 =62), (Chart 7-1), (-0.7, -0.1)
     # Exclude prose parentheticals with lowercase words such as (First 4 character of BIC),
     # (e.g. QA00 for QATAR), or (29 characters for QATAR) so their text is translated while
     # inner numbers and codes remain shielded by rules 2-14.
-    r'(\(\s*(?:(?:Chart|Table|Fig(?:ure)?)\s+)?[A-Z0-9\s,.\-+±×÷=/%$€£¥٪\u2013\u2014:;_]*\d[A-Z0-9\s,.\-+±×÷=/%$€£¥٪\u2013\u2014:;_]*\))|'
+    r'(\(\s*(?:(?:Chart|Table|Fig(?:ure)?)\s+)?[A-Z0-9\s,.\-+\u2212±×÷=/%$€£¥٪\u2013\u2014:;_]*\d[A-Z0-9\s,.\-+\u2212±×÷=/%$€£¥٪\u2013\u2014:;_]*\))|'
     # 2. Arithmetic division / equations: 281211210/97 = 62, 502560126/97 = 22, 221000/97= 34
     r'(\b\d+\s*[/÷]\s*\d+\s*(?:=\s*\d+)?\b)|'
     # 3. Arithmetic operations with equals: 98-34=64, 2018=100
@@ -369,6 +377,49 @@ _KNOWN_CODES = frozenset({
 })
 
 
+_PASSTHROUGH_ATOM_RE = re.compile(
+    r"^(?:"
+    r"https?://\S+|www\.\S+|10\.\d{4,9}/\S+|"
+    r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}|"
+    r"(?:/|\.\.?/)[A-Za-z0-9._\-]+(?:/[A-Za-z0-9._\-]+)+/?|"
+    r"[A-Za-z0-9][A-Za-z0-9._\-]*\.(?:pdf|xlsx?|csv|tsv|json|ya?ml|xml|html?|sql|py|sh|txt|md|docx?|pptx?|png|jpe?g|svg|zip|tar\.gz|log|ini|cfg|env)|"
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}|"
+    r"(?:sha256:)?[0-9a-f]{16,64}|0x[0-9a-fA-F]{4,}|"
+    r"(?=[A-Z0-9\-\u2010\u2011]*\d)[A-Z0-9]{2,}(?:[-\u2010\u2011][A-Z0-9]{1,}){2,}|"
+    r"\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:?\d{2})?)?|"
+    r"[pP]\s*(?:<=|>=|[<>≤≥=])\s*0?\.\d+"
+    r")$"
+)
+
+
+def _is_degenerate_translation(source_text: str, translated_text: str) -> bool:
+    """Detect repetitive hallucinated Arabic output or heavy unrequested vocalization loops."""
+    if not translated_text:
+        return False
+    arabic_chars = re.findall(r"[\u0600-\u06FF]", translated_text)
+    if len(arabic_chars) < 16:
+        return False
+    diacritics = re.findall(r"[\u064B-\u065F\u0670]", translated_text)
+    src_diacritics = re.findall(r"[\u064B-\u065F\u0670]", source_text or "")
+    if not src_diacritics and len(diacritics) / max(1, len(arabic_chars)) > 0.22:
+        return True
+    words = [w for w in re.findall(r"[\u0621-\u064AA-Za-z0-9]{2,}", translated_text)]
+    if len(words) >= 6:
+        run_len = 1
+        for i in range(1, len(words)):
+            if words[i] == words[i - 1]:
+                run_len += 1
+                if run_len >= 4:
+                    return True
+            else:
+                run_len = 1
+        if len(words) >= 9:
+            trigrams = Counter(tuple(words[i : i + 3]) for i in range(len(words) - 2))
+            if trigrams and trigrams.most_common(1)[0][1] >= 3:
+                return True
+    return False
+
+
 def _is_pure_passthrough(text: str) -> bool:
     """Return True if text contains no translatable natural-language words.
 
@@ -394,7 +445,15 @@ def _is_pure_passthrough(text: str) -> bool:
     if _PURE_PASSTHROUGH_PATTERN.match(stripped):
         return True
 
-    # Direct match for SWIFT/BIC, IBAN, Phone numbers, or Modulo algorithm strings
+    # Direct match for SWIFT/BIC, IBAN, Phone numbers, Modulo algorithm strings,
+    # URLs, DOIs, emails, Unix file paths, filenames, UUIDs, hashes, or multi-hyphen IDs.
+    if _PASSTHROUGH_ATOM_RE.match(stripped):
+        return True
+    if (
+        re.search(r"[\u0600-\u06FF\uFB50-\uFDFF\uFE70-\uFEFF]", stripped)
+        and not re.search(r"[A-Za-z]", stripped)
+    ):
+        return True
     if _is_valid_bic(stripped):
         return True
     if _IBAN_PATTERN.match(stripped):
@@ -419,6 +478,8 @@ def _is_pure_passthrough(text: str) -> bool:
             continue
         # Is it purely digits/numeric?
         if re.fullmatch(r'[\d,.%+\-±]+', clean):
+            continue
+        if _PASSTHROUGH_ATOM_RE.match(clean):
             continue
         # Scientific notation: "2e-5", "-1.5E+10", "2e-5%"
         if re.fullmatch(r'[+-]?(?:\d+(?:\.\d+)?|\.\d+)[eE][+-]?\d+%?', clean):
@@ -808,6 +869,28 @@ class BaseTranslator(ABC):
             or getattr(self, "untranslated_count", 0) > before_untranslated
         ):
             return first, False
+
+        if _is_degenerate_translation(text, first):
+            if getattr(self, "_retry_missing_values", False) and hasattr(self, "_generate_translation"):
+                clean_retry_text = re.sub(r"\s+", " ", text).strip()
+                try:
+                    regenerated = _restore_numerals(self._generate_translation(clean_retry_text), mapping)
+                    if mapping:
+                        regenerated = self._canonicalize_literal_values(regenerated, mapping.values())
+                    if (
+                        not _is_degenerate_translation(clean_retry_text, regenerated)
+                        and not self._find_unresolved_placeholders(clean_retry_text, regenerated, mapping)
+                    ):
+                        first = regenerated
+                except Exception:
+                    logger.warning("Degenerate-output retry failed")
+            if _is_degenerate_translation(text, first):
+                self._inc_incomplete_once()
+                logger.warning(
+                    "Detected degenerate hallucinated translation output; falling back safely to source content."
+                )
+                safe_source = _restore_numerals(text, mapping) if mapping else text
+                return safe_source, False
 
         unresolved = self._find_unresolved_placeholders(text, first, mapping)
         if not mapping:

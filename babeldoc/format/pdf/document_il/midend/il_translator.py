@@ -116,6 +116,64 @@ def _init_doc_terminology_context(docs: Document, translation_config: Any) -> No
         )
 
 
+_BIO_CONTEXT_RE = re.compile(
+    r"\b(?:codons?|mRNA|tRNA|rRNA|amino\s+acids?|polypeptides?|genetic\s+code|start\s+codon|stop\s+codon)\b",
+    re.IGNORECASE,
+)
+_BIO_RNA_CODON_RE = re.compile(r"\b[ACGU]{3}\b")
+_BIO_TOKEN_RE = re.compile(
+    r"\b(?:[ACGU]{3}|Ala|Arg|Asn|Asp|Cys|Gln|Glu|Gly|His|Ile|Leu|Lys|Met|Phe|Pro|Ser|Thr|Trp|Tyr|Val)\b"
+)
+
+
+def _page_has_bio_context(page: Page | None) -> bool:
+    """Return True when the page exhibits genetics/codon/amino-acid scientific context."""
+    if page is None:
+        return False
+    codons_seen: set[str] = set()
+    for p in getattr(page, "pdf_paragraph", None) or []:
+        u = getattr(p, "unicode", None) or ""
+        if _BIO_CONTEXT_RE.search(u):
+            return True
+        codons_seen.update(_BIO_RNA_CODON_RE.findall(u))
+        if len(codons_seen) >= 3:
+            return True
+    return False
+
+
+def _paragraph_bio_tokens_active(paragraph: PdfParagraph, page: Page | None, text: str) -> bool:
+    if not _page_has_bio_context(page):
+        return False
+    lbl = (getattr(paragraph, "layout_label", None) or "").lower()
+    if "table" in lbl:
+        return True
+    return bool(_BIO_CONTEXT_RE.search(text) or _BIO_RNA_CODON_RE.search(text))
+
+
+def _protect_bio_tokens(text: str) -> tuple[str, dict[str, str]]:
+    existing = set(re.findall(r"\{\d+\}", text))
+    idx = 9100
+    mapping: dict[str, str] = {}
+
+    def _sub(match: re.Match) -> str:
+        nonlocal idx
+        while f"{{{idx}}}" in existing:
+            idx += 1
+        tag = f"{{{idx}}}"
+        idx += 1
+        mapping[tag] = match.group(0)
+        return tag
+
+    return _BIO_TOKEN_RE.sub(_sub, text), mapping
+
+
+def _restore_bio_tokens(text: str, mapping: dict[str, str]) -> str:
+    for tag, tok in mapping.items():
+        num = tag.strip("{}")
+        text = re.sub(rf"\{{\s*{num}\s*\}}", tok, text)
+    return text
+
+
 def _sync_terminology_to_ledger(translation_config: Any) -> None:
     shared = getattr(translation_config, "shared_context_cross_split_part", None)
     if shared is None:
@@ -565,6 +623,19 @@ class ILTranslator:
         if not text:
             return text
 
+        # Collapse artificial letter-spaced words (>= 4 single ASCII letters separated
+        # by single spaces, e.g. "L E T T E R - S P A C E D") while keeping initials
+        # like "L. Okafor-Reyes" or spaced words with dots intact.
+        def _collapse_letter_spaced(m: re.Match) -> str:
+            collapsed = re.sub(r" ", "", m.group(0))
+            return re.sub(r"\s*-\s*", "-", collapsed)
+
+        text = re.sub(
+            r"(?<![A-Za-z0-9.])(?:[A-Za-z](?: [A-Za-z]){3,})(?:\s*-\s*[A-Za-z](?: [A-Za-z]){2,})*(?![A-Za-z0-9.])",
+            _collapse_letter_spaced,
+            text,
+        )
+
         # Collapse doubled running-header banner glyphs before translation so
         # NLLB never receives raw doubled character streams ("IIBBAANN...").
         text = re.sub(
@@ -938,7 +1009,8 @@ class ILTranslator:
 
         # Check if text contains Table of Contents (TOC) entries with dotted leader lines
         # e.g. "1. Introduction ................................................................................................. 1306"
-        toc_leader_pattern = re.compile(r'^(.*?)\s*(\.{4,})\s*(\d+)\s*$')
+        # or spaced leaders: "1. Introduction . . . . . . . . 1306"
+        toc_leader_pattern = re.compile(r'^(.*?)\s*((?:\.\s*){3,}\.)\s*(\d+)\s*$')
 
         # If text has multiple non-empty lines
         lines = text.split("\n")
@@ -959,8 +1031,9 @@ class ILTranslator:
                 toc_match = toc_leader_pattern.match(stripped_line) if stripped_line else None
                 if toc_match:
                     title, dots, page_num = toc_match.group(1).strip(), toc_match.group(2), toc_match.group(3)
+                    compact_dots = "." * max(8, dots.count("."))
                     tr_title = translate_segment(title) if title else ""
-                    translated_lines.append(f"{tr_title} {dots} {page_num}")
+                    translated_lines.append(f"{tr_title} {compact_dots} {page_num}")
                 elif stripped_line:
                     tr = translate_segment(line)
                     translated_lines.append(tr)
@@ -973,8 +1046,9 @@ class ILTranslator:
                 toc_match = toc_leader_pattern.match(non_empty[0])
                 if toc_match:
                     title, dots, page_num = toc_match.group(1).strip(), toc_match.group(2), toc_match.group(3)
+                    compact_dots = "." * max(8, dots.count("."))
                     tr_title = translate_segment(title) if title else ""
-                    return f"{tr_title} {dots} {page_num}"
+                    return f"{tr_title} {compact_dots} {page_num}"
 
             # For flowing body text paragraphs, join soft linebreaks with a space so
             # the translation model receives complete, grammatically coherent sentences
@@ -1675,7 +1749,7 @@ class ILTranslator:
             is_corner = bool(getattr(formula, "is_corner_mark", False))
             is_fn_token = bool(
                 re.fullmatch(
-                    r"(?:\d{1,3}(?:\s*[,\u2013\u2014-]\s*\d{1,3})*|[⁰¹²³⁴⁵⁶⁷⁸⁹]{1,3}|[*†‡§])",
+                    r"(?:\[\s*\d{1,3}(?:\s*[,\u2013\u2014-]\s*\d{1,3})*\s*\]|\d{1,3}(?:\s*[,\u2013\u2014-]\s*\d{1,3})*|[⁰¹²³⁴⁵⁶⁷⁸⁹]{1,3}|[*†‡§])",
                     formula_text,
                 )
             )
@@ -2344,7 +2418,10 @@ Now, please carefully read the following text to be translated and directly outp
                 # Perform translation
                 direct_translation = None
                 index_reference = ""
-                if "contact_card" in lbl.lower():
+                bio_active = _paragraph_bio_tokens_active(paragraph, page, text)
+                if bio_active and _BIO_TOKEN_RE.fullmatch(text.strip()):
+                    direct_translation = text.strip()
+                elif "contact_card" in lbl.lower():
                     direct_translation = self._translate_contact_field_directly(source_unicode or text)
                 elif (
                     not self.support_llm_translate
@@ -2411,6 +2488,9 @@ Now, please carefully read the following text to be translated and directly outp
                         body, index_reference, translate_input = self._split_trailing_document_reference(
                             body, source_unicode, translate_input,
                         )
+                    bio_map: dict[str, str] = {}
+                    if bio_active:
+                        body, bio_map = _protect_bio_tokens(body)
                     translated_text = self._translate_with_line_preservation(
                         body,
                         rate_limit_params={
@@ -2421,6 +2501,8 @@ Now, please carefully read the following text to be translated and directly outp
                             for marker in ("procedure_step", "contact_card")
                         ),
                     )
+                    if bio_map:
+                        translated_text = _restore_bio_tokens(translated_text, bio_map)
                     if marker:
                         translated_text = f"{marker} {translated_text}"
                 if tm_cached is None:
