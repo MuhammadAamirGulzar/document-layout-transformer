@@ -59,10 +59,15 @@ AUTHOR_YEAR_CITATION = re.compile(
 )
 
 _NUMERAL_PATTERN = re.compile(
-    # 0. Bibliographic atoms that must survive byte-for-byte: URLs, DOIs,
+    # 0. Bibliographic and contact atoms that must survive byte-for-byte:
+    # URLs, DOIs, emails, ISO/numeric calendar dates, prefixed invoice/PO IDs,
     # and numeric bracket citations such as [12], [3, 7] or [4-9].
     r'(https?://[^\s<>"\u201d\u2019]*[^\s<>"\u201d\u2019.,;:!?)\]]|www\.[^\s<>"\u201d\u2019]*[^\s<>"\u201d\u2019.,;:!?)\]])|'
     r'(\b10\.\d{4,9}/[^\s<>"\u201d\u2019]*[^\s<>"\u201d\u2019.,;:!?)\]])|'
+    r'([A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})|'
+    r'(\b\d{4}[-/]\d{1,2}[-/]\d{1,2}\b)|'
+    r'(\b\d{1,2}[-/]\d{1,2}[-/]\d{2,4}\b)|'
+    r'(\b(?:INV|PO|REF|TXN|VAT|TIN|EIN|DOC|ID)\s*#\s*\d[A-Z0-9\-/]*\b)|'
     r'(\[\s*\d{1,3}(?:\s*[,\u2013\u2014-]\s*\d{1,3})*\s*\])|'
     rf"({AUTHOR_YEAR_CITATION.pattern})|"
     # 1. Parenthetical mixed tokens: (2018=100), (NDS3), (281211210/97 =62), (Chart 7-1)

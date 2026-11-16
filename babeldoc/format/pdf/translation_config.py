@@ -36,6 +36,9 @@ class SharedContextCrossSplitPart:
         self.content_ledger = ContentLedger()
         self.continuation_pages: dict[int, int] = {}
         self.layout_issues: list[dict] = []
+        self.detected_domain: str = "general"
+        self.document_abbreviations: dict[str, str] = {}
+        self.translation_memory = None
 
     def initialize_glossaries(self, initial_glossaries: list[Glossary] | None):
         with self._lock:

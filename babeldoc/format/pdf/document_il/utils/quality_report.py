@@ -59,6 +59,38 @@ class ContentLedger:
         self._glyph_substitutions: dict[tuple[str, str, str], int] = {}
         self._unsupported_glyph_count = 0
         self._layout_issues: list[dict[str, Any]] = []
+        self._tables: dict[tuple[Any, str], dict[str, Any]] = {}
+        self._preserved_regions: list[dict[str, Any]] = []
+        self._reading_order_assigned_count: int = 0
+        self._preflight: dict[str, Any] | None = None
+        self._terminology: dict[str, Any] | None = None
+        self._output_qa: dict[str, Any] | None = None
+
+    def record_preserved_regions(self, regions: list[dict[str, Any]] | None) -> None:
+        """Record protected code/algorithm and figure-data regions preserved verbatim."""
+        if not regions:
+            return
+        with self._lock:
+            self._preserved_regions.extend(dict(item) for item in regions)
+
+    def record_reading_order(self, assigned_count: int) -> None:
+        """Track total paragraphs assigned canonical reading order provenance."""
+        if assigned_count <= 0:
+            return
+        with self._lock:
+            self._reading_order_assigned_count += int(assigned_count)
+
+    def record_tables(self, tables: list[dict[str, Any]] | None) -> None:
+        """Record canonical semantic table summaries discovered during processing."""
+        if not tables:
+            return
+        with self._lock:
+            for item in tables:
+                table_id = str(item.get("table_id", ""))
+                page = item.get("page")
+                if not table_id:
+                    continue
+                self._tables[(page, table_id)] = dict(item)
 
     def record_layout_issue(
         self,
@@ -135,6 +167,31 @@ class ContentLedger:
                 key = block_key
             self._entries[key] = entry
 
+    def record_preflight(self, preflight_report: dict[str, Any]) -> None:
+        """Store document/page preflight classification telemetry."""
+        with self._lock:
+            self._preflight = dict(preflight_report)
+
+    def record_terminology(
+        self,
+        domain: str,
+        abbreviations: dict[str, str] | None = None,
+        tm_stats: dict[str, Any] | None = None,
+    ) -> None:
+        """Store document-level domain, abbreviation disambiguation, and TM stats."""
+        with self._lock:
+            self._terminology = {
+                "domain": domain,
+                "abbreviations": dict(abbreviations or {}),
+                "abbreviation_count": len(abbreviations or {}),
+                "translation_memory": dict(tm_stats or {}),
+            }
+
+    def record_output_qa(self, qa_report: dict[str, Any]) -> None:
+        """Store post-write PDF sanity audit telemetry."""
+        with self._lock:
+            self._output_qa = dict(qa_report)
+
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
             entries = list(self._entries.values())
@@ -173,7 +230,19 @@ class ContentLedger:
             glyph_items = dict(self._glyph_substitutions)
             unsupported_glyph_count = self._unsupported_glyph_count
             layout_issues = list(self._layout_issues)
+            tables = list(self._tables.values())
+            preserved_regions = list(self._preserved_regions)
+            reading_order_assigned_count = self._reading_order_assigned_count
+            preflight = dict(self._preflight) if self._preflight is not None else None
+            terminology = dict(self._terminology) if self._terminology is not None else None
+            output_qa = dict(self._output_qa) if self._output_qa is not None else None
         summary = self.snapshot()
+        code_algorithm_preserved_count = sum(
+            1 for r in preserved_regions if r.get("kind") == "code_or_algorithm"
+        )
+        figure_preserved_count = sum(
+            1 for r in preserved_regions if r.get("kind") == "figure_data_or_token"
+        )
         clipped_content_count = sum(
             1
             for issue in layout_issues
@@ -183,6 +252,14 @@ class ContentLedger:
                 "page_overflow_unpaginated",
                 "footnote_overflow",
             }
+        )
+        table_cell_overflow_count = sum(
+            1
+            for issue in layout_issues
+            if issue.get("kind") in {"table_cell_overflow", "table_cell_collision"}
+        )
+        irregular_table_count = sum(
+            1 for table in tables if not table.get("is_coherent", True)
         )
         flagged = [
             entry
@@ -198,6 +275,11 @@ class ContentLedger:
                 and entry["source_len"] > 0
             )
         ]
+        broken_tounicode_pages = int(
+            (preflight or {}).get("broken_tounicode_page_count", 0) or 0
+        )
+        qa_leaked_pages = len((output_qa or {}).get("leaked_placeholder_pages") or [])
+        qa_page_mismatch = bool((output_qa or {}).get("page_count_mismatch", False))
         needs_review = (
             summary["untranslated_count"] > 0
             or summary["incomplete_count"] > 0
@@ -207,6 +289,11 @@ class ContentLedger:
             or (engine_incomplete_count or 0) > 0
             or unsupported_glyph_count > 0
             or clipped_content_count > 0
+            or irregular_table_count > 0
+            or table_cell_overflow_count > 0
+            or broken_tounicode_pages > 0
+            or qa_leaked_pages > 0
+            or qa_page_mismatch
         )
         glyph_by_reason: dict[str, int] = {}
         glyph_list = []
@@ -242,13 +329,29 @@ class ContentLedger:
                 "unsupported_glyph_count": unsupported_glyph_count,
                 "layout_issue_count": len(layout_issues),
                 "clipped_content_count": clipped_content_count,
+                "table_count": len(tables),
+                "irregular_table_count": irregular_table_count,
+                "table_cell_overflow_count": table_cell_overflow_count,
+                "code_algorithm_preserved_count": code_algorithm_preserved_count,
+                "figure_preserved_count": figure_preserved_count,
+                "reading_order_assigned_count": reading_order_assigned_count,
+                "broken_tounicode_page_count": broken_tounicode_pages,
+                "detected_domain": (terminology or {}).get("domain"),
+                "translation_memory_hits": (
+                    ((terminology or {}).get("translation_memory") or {}).get("hits", 0)
+                ),
             },
+            "preflight": preflight,
+            "terminology": terminology,
+            "output_qa": output_qa,
             "glyph_substitutions": {
                 "total_substitutions": sum(glyph_items.values()),
                 "unsupported_replacement_count": unsupported_glyph_count,
                 "by_reason": glyph_by_reason,
                 "substitutions": glyph_list,
             },
+            "tables": tables,
+            "preserved_regions": preserved_regions,
             "layout_issues": layout_issues,
             "flagged_blocks": flagged,
             "blocks": entries,

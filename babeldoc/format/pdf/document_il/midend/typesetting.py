@@ -22,6 +22,10 @@ from babeldoc.format.pdf.document_il.utils.fontmap import FontMapper, is_arabic_
 from babeldoc.format.pdf.document_il.utils.arabic_shaper import shape_arabic_run
 from babeldoc.format.pdf.document_il.utils.formular_helper import update_formula_data
 from babeldoc.format.pdf.document_il.utils.layout_helper import box_to_tuple
+from babeldoc.format.pdf.document_il.utils.semantic_table import (
+    SemanticTable,
+    annotate_page_semantic_tables,
+)
 from babeldoc.format.pdf.document_il.utils.style_helper import GRAY80
 from babeldoc.format.pdf.translation_config import TranslationConfig
 from babeldoc.format.pdf.translation_config import WatermarkOutputMode
@@ -927,6 +931,8 @@ class Typesetting:
         self._unsupported_glyph_count: int = 0
         self._skipped_format_chars: dict[str, int] = {}
         self._footnote_zone_stabilized_pages: set[int] = set()
+        self._semantic_table_audited_pages: set[int] = set()
+        self._semantic_tables_by_page: dict[int, list[SemanticTable]] = {}
         self._layout_issues: list[dict[str, object]] = []
         self._reported_layout_issue_keys: set[tuple[object, ...]] = set()
         self._in_typesetting_document: bool = False
@@ -1153,6 +1159,7 @@ class Typesetting:
             # Finalize table geometry before measuring text. Adjusting cell
             # heights after text placement creates the jagged/overlapping rows
             # seen in the Qatar IBAN sample.
+            self._ensure_semantic_table_models(page)
             self._synchronize_table_row_heights(page)
             # Balance table row widths before optimal scale calculation
             self._balance_table_row_widths(page, fonts)
@@ -1937,6 +1944,7 @@ class Typesetting:
                 upper_label = (p_upper.layout_label or "").lower()
                 if (
                     "fallback_line" in upper_label
+                    or self._is_table_cell(p_upper, page)
                     or self._is_inside_table_or_figure_region(p_upper.box, page, figures_only=True)
                 ):
                     continue
@@ -1959,11 +1967,13 @@ class Typesetting:
                     if para_id == i:
                         continue
                     p_lower = para_map[para_id]
+                    if self._is_table_cell(p_lower, page):
+                        continue
                     if not self._shares_reflow_layer(p_upper, p_lower):
                         continue
                     if not (
-                        p_lower.box.x2 < p_upper.box.x
-                        or p_lower.box.x > p_upper.box.x2
+                        p_lower.box.x2 <= p_upper.box.x + 0.5
+                        or p_lower.box.x >= p_upper.box.x2 - 0.5
                     ):
                         conflicting_paras.append(p_lower)
 
@@ -1983,6 +1993,7 @@ class Typesetting:
             )
         # A direct render_page() call (used by tests and API retries) may not
         # have passed through preprocessing, so finalize table geometry here too.
+        self._ensure_semantic_table_models(page)
         self._synchronize_table_row_heights(page)
         # Balance table row widths before rendering
         self._balance_table_row_widths(page, fonts)
@@ -2000,6 +2011,8 @@ class Typesetting:
             self.render_paragraph(paragraph, page, fonts)
         self._audit_arabic_font_ownership(page)
         self._resolve_rendered_text_collisions(page)
+        self._resolve_table_row_and_body_clearance(page)
+        self._audit_table_cells_after_render(page)
         self._anchor_inline_highlight_curves(page)
         self._report_clipped_content(
             page,
@@ -2801,6 +2814,119 @@ class Typesetting:
             logger.warning(
                 "Resolved %d rendered glyph collision(s) on page %s.", moved, page.page_number
             )
+
+    def _resolve_table_row_and_body_clearance(self, page: il_version_1.Page) -> None:
+        """Keep expanded non-fixed table rows aligned and prevent tables overlapping body text."""
+        zones = self._get_page_vertical_zones(page)
+        table_cells = [
+            p for p in page.pdf_paragraph or []
+            if p.box is not None and self._is_table_cell(p, page)
+        ]
+        if not table_cells:
+            return
+
+        by_table: dict[str, list[il_version_1.PdfParagraph]] = {}
+        for cell in table_cells:
+            trace = cell.pipeline_trace or {}
+            tid = str(trace.get("table_id") or "_default_table")
+            by_table.setdefault(tid, []).append(cell)
+
+        table_extents: list[tuple[float, float, float, float]] = []
+        for cells in by_table.values():
+            orig_sboxes = [c.box for c in cells if c.box is not None]
+            orig_src_bottom = min((b.y for b in orig_sboxes), default=None)
+            is_fixed_or_irregular = any(
+                "fixed_rtl" in (c.layout_label or "").lower()
+                or (c.pipeline_trace or {}).get("preserve_irregular_table")
+                for c in cells
+            )
+            if not is_fixed_or_irregular:
+                row_groups: dict[int, list[il_version_1.PdfParagraph]] = {}
+                unindexed: list[il_version_1.PdfParagraph] = []
+                for c in cells:
+                    sem = (c.pipeline_trace or {}).get("semantic_table") or {}
+                    ridx = sem.get("row_index")
+                    if isinstance(ridx, int):
+                        row_groups.setdefault(ridx, []).append(c)
+                    else:
+                        unindexed.append(c)
+                if unindexed and not row_groups:
+                    for idx, row_list in enumerate(self._cluster_table_cells_into_rows(page)):
+                        in_this = [c for c in row_list if c in cells]
+                        if in_this:
+                            row_groups[idx] = in_this
+                ordered_rows = [row_groups[k] for k in sorted(row_groups)]
+                for r_idx in range(len(ordered_rows) - 1):
+                    upper_boxes = [
+                        b for c in ordered_rows[r_idx]
+                        if (b := self._rendered_text_box(c)) is not None
+                    ]
+                    if not upper_boxes:
+                        continue
+                    upper_bottom = min(b.y for b in upper_boxes)
+                    lower_boxes = [
+                        b for c in ordered_rows[r_idx + 1]
+                        if (b := self._rendered_text_box(c)) is not None
+                    ]
+                    if not lower_boxes:
+                        continue
+                    lower_top = max(b.y2 for b in lower_boxes)
+                    overlap = lower_top - (upper_bottom - 3.0)
+                    if overlap > 0.25:
+                        for tail_row in ordered_rows[r_idx + 1:]:
+                            for cell in tail_row:
+                                self._shift_rendered_paragraph_vertically(cell, overlap)
+                                tr = self._ensure_pipeline_trace(cell)
+                                tr["table_row_shifted"] = True
+
+            rboxes = [b for c in cells if (b := self._rendered_text_box(c)) is not None]
+            sboxes = [c.box for c in cells if c.box is not None]
+            if rboxes and sboxes and orig_src_bottom is not None:
+                table_extents.append((
+                    min(min(b.x for b in rboxes), min(b.x for b in sboxes)),
+                    min(b.y for b in rboxes),
+                    max(max(b.x2 for b in rboxes), max(b.x2 for b in sboxes)),
+                    orig_src_bottom,
+                ))
+
+        if not table_extents:
+            return
+
+        body_paras = [
+            p for p in page.pdf_paragraph or []
+            if not self._is_table_cell(p, page)
+            and not self._is_bottom_fixed_paragraph(p, page)
+            and not self._is_top_band_header(p, page)
+            and p.box is not None
+            and not self._is_inside_table_or_figure_region(p.box, page, figures_only=True)
+        ]
+        body_paras.sort(key=lambda p: -(p.box.y2 if p.box and p.box.y2 is not None else 0.0))
+        moved_body = False
+        for tx0, r_bottom, tx2, src_bottom in table_extents:
+            for para in body_paras:
+                if para.box.y2 > src_bottom + 2.0:
+                    continue
+                p_rbox = self._rendered_text_box(para)
+                if p_rbox is None:
+                    continue
+                h_ov = max(0.0, min(p_rbox.x2, tx2) - max(p_rbox.x, tx0))
+                min_w = max(1.0, min(p_rbox.x2 - p_rbox.x, tx2 - tx0))
+                if h_ov < min_w * 0.20:
+                    continue
+                if p_rbox.y2 > r_bottom - 4.0:
+                    dy = p_rbox.y2 - (r_bottom - 4.0)
+                    if dy > 0.25:
+                        self._shift_rendered_paragraph_vertically(para, dy)
+                        tr = self._ensure_pipeline_trace(para)
+                        tr["collision_shifted"] = True
+                        moved_body = True
+                        after_box = self._rendered_text_box(para)
+                        if after_box is not None and after_box.y < zones["body_floor"] - 1.0:
+                            tr["page_overflow"] = True
+                            tr["body_floor"] = zones["body_floor"]
+        if moved_body:
+            self._rendered_collision_resolved_pages.discard(id(page))
+            self._resolve_rendered_text_collisions(page)
 
     @staticmethod
     def _composition_item_box(comp: PdfParagraphComposition) -> Box | None:
@@ -3944,8 +4070,12 @@ class Typesetting:
 
     def _is_header_or_footer(self, paragraph: il_version_1.PdfParagraph, page: il_version_1.Page) -> bool:
         """Detect if paragraph is a running header, footer, or page number."""
+        if self._is_table_cell(paragraph, page):
+            return False
         if paragraph.layout_label:
             lbl = paragraph.layout_label.lower()
+            if "table_" in lbl or "footnote" in lbl:
+                return False
             if any(h in lbl for h in ['header', 'footer', 'page_number', 'page_header', 'page_footer']):
                 return True
         if paragraph.box and page.cropbox and page.cropbox.box:
@@ -4233,6 +4363,127 @@ class Typesetting:
         box.x = table_box.x2 - (old_x2 - table_box.x)
         box.x2 = table_box.x2 - (old_x - table_box.x)
 
+    def _ensure_semantic_table_models(self, page: il_version_1.Page) -> list[SemanticTable]:
+        """Build/verify semantic table metadata (IDs, spans, headers, coherence) once per page."""
+        if not hasattr(self, "_semantic_table_audited_pages"):
+            self._semantic_table_audited_pages = set()
+        if not hasattr(self, "_semantic_tables_by_page"):
+            self._semantic_tables_by_page = {}
+
+        page_key = id(page)
+        if page_key in self._semantic_table_audited_pages:
+            return self._semantic_tables_by_page.get(page_key, [])
+
+        tables = annotate_page_semantic_tables(page)
+        self._semantic_tables_by_page[page_key] = tables
+        self._semantic_table_audited_pages.add(page_key)
+
+        shared = getattr(
+            getattr(self, "translation_config", None),
+            "shared_context_cross_split_part",
+            None,
+        )
+        ledger = getattr(shared, "content_ledger", None) if shared is not None else None
+        if ledger is not None and tables and hasattr(ledger, "record_tables"):
+            ledger.record_tables([t.to_summary_dict() for t in tables])
+
+        for table in tables:
+            if not table.is_coherent:
+                self._record_layout_issue(
+                    page_number=page.page_number,
+                    kind="irregular_table_preserved",
+                    detail=(
+                        f"Table {table.table_id} has irregular geometry "
+                        f"({', '.join(table.validation_issues)}); preserving layout safely"
+                    ),
+                    debug_id=table.table_id,
+                    severity="warning",
+                )
+        return tables
+
+    def _audit_table_cells_after_render(self, page: il_version_1.Page) -> None:
+        """Audit rendered table cells for cross-cell collisions or fixed-cell boundary escape."""
+        table_cells = [
+            p for p in page.pdf_paragraph or []
+            if p.box is not None and self._is_table_cell(p, page)
+        ]
+        if not table_cells:
+            return
+
+        rendered_map = {
+            id(p): self._rendered_text_box(p) for p in table_cells
+        }
+
+        # 1. Check fixed/wired cells against their own physical slot boundaries
+        for cell in table_cells:
+            trace = cell.pipeline_trace or {}
+            if trace.get("preserve_irregular_table"):
+                continue
+            rbox = rendered_map.get(id(cell))
+            if rbox is None or cell.box is None:
+                continue
+            is_fixed_slot = "fixed" in (cell.layout_label or "").lower()
+            if is_fixed_slot and (
+                rbox.x < cell.box.x - 4.0
+                or rbox.x2 > cell.box.x2 + 4.0
+                or rbox.y < cell.box.y - 4.0
+                or rbox.y2 > cell.box.y2 + 4.0
+            ):
+                p_trace = self._ensure_pipeline_trace(cell)
+                p_trace["table_cell_overflow"] = True
+                self._record_layout_issue(
+                    page_number=page.page_number,
+                    kind="table_cell_overflow",
+                    detail=(
+                        f"Table cell {trace.get('cell_id') or getattr(cell, 'debug_id', '?')} "
+                        f"rendered glyphs exceed fixed cell bounds"
+                    ),
+                    debug_id=getattr(cell, "debug_id", None),
+                    severity="warning",
+                )
+
+        # 2. Check rendered overlap between sibling cells in the same table
+        by_table: dict[str, list[il_version_1.PdfParagraph]] = {}
+        for cell in table_cells:
+            trace = cell.pipeline_trace or {}
+            if trace.get("preserve_irregular_table"):
+                continue
+            tid = str(trace.get("table_id") or "_default_table")
+            by_table.setdefault(tid, []).append(cell)
+
+        reported_pairs: set[tuple[int, int]] = set()
+        for tid, group in by_table.items():
+            for idx, first in enumerate(group):
+                r1 = rendered_map.get(id(first))
+                if r1 is None:
+                    continue
+                for second in group[idx + 1:]:
+                    if not self._shares_reflow_layer(first, second):
+                        continue
+                    r2 = rendered_map.get(id(second))
+                    if r2 is None:
+                        continue
+                    h_ov = max(0.0, min(r1.x2, r2.x2) - max(r1.x, r2.x))
+                    v_ov = max(0.0, min(r1.y2, r2.y2) - max(r1.y, r2.y))
+                    if h_ov > 1.5 and v_ov > 1.5:
+                        pair = (min(id(first), id(second)), max(id(first), id(second)))
+                        if pair in reported_pairs:
+                            continue
+                        reported_pairs.add(pair)
+                        for p in (first, second):
+                            self._ensure_pipeline_trace(p)["table_cell_collision"] = True
+                        self._record_layout_issue(
+                            page_number=page.page_number,
+                            kind="table_cell_collision",
+                            detail=(
+                                f"Rendered glyphs collide between table cells "
+                                f"{getattr(first, 'debug_id', '?')} and {getattr(second, 'debug_id', '?')} "
+                                f"in {tid}"
+                            ),
+                            debug_id=tid,
+                            severity="warning",
+                        )
+
     def _mirror_table_grids_for_rtl(self, page: il_version_1.Page) -> None:
         """Mirror cell geometry and table-local vector geometry for Arabic RTL.
 
@@ -4243,6 +4494,7 @@ class Typesetting:
         if not self._is_arabic_output() or id(page) in self._rtl_mirrored_table_pages:
             return
 
+        self._ensure_semantic_table_models(page)
         table_groups = self._table_cell_groups(page)
         if not table_groups:
             self._rtl_mirrored_table_pages.add(id(page))
@@ -4254,6 +4506,12 @@ class Typesetting:
             # the page base operations; only text inside each slot becomes RTL.
             if cells and all(
                 "fixed_rtl" in (cell.layout_label or "").lower()
+                for cell in cells
+            ):
+                continue
+            # Irregular / low-confidence tables keep original geometry safely.
+            if cells and any(
+                (cell.pipeline_trace or {}).get("preserve_irregular_table")
                 for cell in cells
             ):
                 continue
@@ -4291,7 +4549,11 @@ class Typesetting:
         """Redistribute unused horizontal space from sibling columns in the same row to overflowing cells."""
         rows = self._cluster_table_cells_into_rows(page)
         for row in rows:
-            if any("fixed_rtl" in (cell.layout_label or "").lower() for cell in row):
+            if any(
+                "fixed_rtl" in (cell.layout_label or "").lower()
+                or (cell.pipeline_trace or {}).get("preserve_irregular_table")
+                for cell in row
+            ):
                 continue
             if len(row) < 2:
                 continue
@@ -4300,6 +4562,16 @@ class Typesetting:
             for i in range(len(row) - 1):
                 cell_left = row[i]
                 cell_right = row[i + 1]
+                trace_left = cell_left.pipeline_trace or {}
+                trace_right = cell_right.pipeline_trace or {}
+                if (
+                    trace_left.get("table_id")
+                    and trace_right.get("table_id")
+                    and trace_left.get("table_id") != trace_right.get("table_id")
+                ):
+                    continue
+                if trace_left.get("col_span", 1) > 1 or trace_right.get("col_span", 1) > 1:
+                    continue
 
                 units_left = self.create_typesetting_units(cell_left, fonts)
                 units_right = self.create_typesetting_units(cell_right, fonts)
@@ -4310,11 +4582,19 @@ class Typesetting:
                 req_left = sum(u.width for u in units_left)
                 req_right = sum(u.width for u in units_right)
 
+                right_sem = trace_right.get("semantic_table") or {}
+                left_sem = trace_left.get("semantic_table") or {}
+                right_protected = bool(right_sem.get("protected_value"))
+                left_protected = bool(left_sem.get("protected_value"))
+
                 right_is_passthrough = all(u.can_passthrough for u in units_right)
                 left_is_passthrough = all(u.can_passthrough for u in units_left)
 
                 # Case 1: Left cell overflows, and Right cell has surplus
-                if req_left > w_left and (right_is_passthrough or req_right + 15.0 < w_right):
+                if req_left > w_left and (
+                    (not right_protected and right_is_passthrough)
+                    or req_right + 15.0 < w_right
+                ):
                     surplus_right = w_right - (req_right + 12.0)
                     deficit_left = req_left - w_left + 6.0
                     if surplus_right > 2.0:
@@ -4323,7 +4603,10 @@ class Typesetting:
                         cell_right.box.x += shift
 
                 # Case 2: Right cell overflows, and Left cell has surplus
-                elif req_right > w_right and (left_is_passthrough or req_left + 15.0 < w_left):
+                elif req_right > w_right and (
+                    (not left_protected and left_is_passthrough)
+                    or req_left + 15.0 < w_left
+                ):
                     surplus_left = w_left - (req_left + 12.0)
                     deficit_right = req_right - w_right + 6.0
                     if surplus_left > 2.0:
@@ -4332,18 +4615,26 @@ class Typesetting:
                         cell_right.box.x -= shift
 
     def _synchronize_table_row_heights(self, page: il_version_1.Page):
-        """Synchronize row height across all cells in each table row so the table does not look jagged."""
+        """Synchronize row height across single-row cells so rows align without clipping row_span cells."""
         rows = self._cluster_table_cells_into_rows(page)
         for row in rows:
-            if any("fixed_rtl" in (cell.layout_label or "").lower() for cell in row):
+            if any(
+                "fixed_rtl" in (cell.layout_label or "").lower()
+                or (cell.pipeline_trace or {}).get("preserve_irregular_table")
+                for cell in row
+            ):
                 continue
-            if len(row) < 2:
+            sync_cells = [
+                c for c in row
+                if ((c.pipeline_trace or {}).get("row_span", 1) == 1)
+            ]
+            if len(sync_cells) < 2:
                 continue
 
-            row_min_y = min(c.box.y for c in row if c.box and c.box.y is not None)
-            row_max_y2 = max(c.box.y2 for c in row if c.box and c.box.y2 is not None)
+            row_min_y = min(c.box.y for c in sync_cells if c.box and c.box.y is not None)
+            row_max_y2 = max(c.box.y2 for c in sync_cells if c.box and c.box.y2 is not None)
 
-            for cell in row:
+            for cell in sync_cells:
                 cell.box.y = row_min_y
                 cell.box.y2 = row_max_y2
 
@@ -4615,9 +4906,12 @@ class Typesetting:
             from babeldoc.format.pdf.document_il.utils.layout_helper import BULLET_POINT_PATTERN
 
             # 1. Break typesetting_units into tokens:
-            # Each token is either a single space unit, or a word (list of non-space units).
+            # Each token is either a single space unit, an undivided bounded inline
+            # LTR/formula island (when <= 72% of line width), or a word (list of non-space units).
             # Bullet points (standard or PUA like \uF0B7) are isolated into their own tokens
             # so they never glue to adjacent words.
+            effective_line_width = box.x2 - box.x
+            atomic_island_max_w = max(effective_line_width * 0.72, 24.0)
             tokens: list[list[TypesettingUnit]] = []
             idx = 0
             n = len(typesetting_units)
@@ -4628,6 +4922,22 @@ class Typesetting:
                     idx += 1
                     continue
                 u_str = u.try_get_unicode() or ""
+                if u_str in {"\u200e", "\u2066"}:
+                    close_marker = "\u2069" if u_str == "\u2066" else "\u200e"
+                    close_idx = None
+                    scan_w = u.width * scale
+                    for probe in range(idx + 1, n):
+                        pu = typesetting_units[probe]
+                        if pu.forced_line_break:
+                            break
+                        scan_w += pu.width * scale
+                        if (pu.try_get_unicode() or "") == close_marker:
+                            close_idx = probe
+                            break
+                    if close_idx is not None and scan_w <= atomic_island_max_w:
+                        tokens.append(typesetting_units[idx : close_idx + 1])
+                        idx = close_idx + 1
+                        continue
                 if u.is_space:
                     tokens.append([u])
                     idx += 1
@@ -4637,20 +4947,37 @@ class Typesetting:
                     idx += 1
                 else:
                     word = [u]
+                    word_w = u.width * scale
                     idx += 1
                     while idx < n:
                         next_u = typesetting_units[idx]
                         if next_u.forced_line_break:
                             break
                         next_str = next_u.try_get_unicode() or ""
-                        if next_u.is_space or BULLET_POINT_PATTERN.match(next_str) or (next_str and 0xE000 <= ord(next_str[0]) <= 0xF8FF):
+                        if next_str in {"\u200e", "\u2066"}:
+                            break
+                        if next_u.is_space:
+                            # Keep adjacent PdfFormula segments connected by an internal
+                            # formula space atomic when the combined expression fits.
+                            if (
+                                word[-1].formular
+                                and idx + 1 < n
+                                and typesetting_units[idx + 1].formular
+                                and word_w + next_u.width * scale + typesetting_units[idx + 1].width * scale <= atomic_island_max_w
+                            ):
+                                word.append(next_u)
+                                word_w += next_u.width * scale
+                                idx += 1
+                                continue
+                            break
+                        if BULLET_POINT_PATTERN.match(next_str) or (next_str and 0xE000 <= ord(next_str[0]) <= 0xF8FF):
                             break
                         word.append(next_u)
+                        word_w += next_u.width * scale
                         idx += 1
                     tokens.append(word)
 
             # 2. Wrap tokens into lines in LOGICAL order:
-            effective_line_width = box.x2 - box.x
             first_indent = space_width * 4 if paragraph.first_line_indent else 0.0
 
             # Detect bullet points and list markers for RTL hanging indent (Item 2)
@@ -4815,18 +5142,13 @@ class Typesetting:
                                 }
                             )
 
-                    # A formula can contain just the subscript of an identifier
-                    # whose base is a separate text unit. A neutral object in
-                    # that position can move ahead of the base in an RTL line.
+                    # Treat inline math/formula atoms containing Latin/Greek variables
+                    # or digits as strong LTR islands regardless of neighboring script,
+                    # so subscripts and grouped expressions never reverse beside Arabic.
                     for index, atom in enumerate(bidi_atoms):
                         if not atom["is_formula"]:
                             continue
-                        neighbors = bidi_atoms[max(0, index - 1):index] + bidi_atoms[index + 1:index + 2]
-                        if not any(
-                            not item["is_formula"]
-                            and unicodedata.bidirectional(item["text"]) in {"L", "EN"}
-                            for item in neighbors
-                        ):
+                        if any(getattr(u, "is_drawn_list_bullet", False) for u in atom["units"]):
                             continue
                         directions = {
                             unicodedata.bidirectional(glyph)
@@ -4834,7 +5156,16 @@ class Typesetting:
                             for char in unit.formular.pdf_character
                             for glyph in char.char_unicode or ""
                         }
-                        if directions & {"L", "EN"} and not directions & {"R", "AL", "AN"}:
+                        if directions & {"R", "AL", "AN"}:
+                            continue
+                        if directions & {"L", "EN"}:
+                            atom["text"] = "L"
+                            continue
+                        neighbors = bidi_atoms[max(0, index - 1):index] + bidi_atoms[index + 1:index + 2]
+                        if directions and any(
+                            unicodedata.bidirectional(item["text"]) in {"L", "EN"}
+                            for item in neighbors
+                        ):
                             atom["text"] = "L"
 
                     bidi_text = "".join(atom["text"] for atom in bidi_atoms)
@@ -4853,37 +5184,35 @@ class Typesetting:
                         visual_units.extend(atom_units)
                         visual_indices.extend([orig_idx] * len(atom_units))
 
-                    # LRM-delimited formulas/codes are semantic LTR islands.
-                    # Unicode BiDi correctly places the island in an Arabic
-                    # line, but some extracted PDF runs still have their
-                    # operators reversed afterwards. Restore each island's
-                    # *logical* unit sequence without moving the island.
-                    marker = "\u200e"
-                    start = 0
-                    while True:
-                        left = bidi_text.find(marker, start)
-                        if left < 0:
-                            break
-                        right = bidi_text.find(marker, left + 1)
-                        if right < 0:
-                            break
-                        positions = [
-                            pos for pos, source_index in enumerate(visual_indices)
-                            if left < source_index < right
-                        ]
-                        if len(positions) > 1:
-                            ordered = sorted(
-                                (
-                                    visual_indices[pos],
-                                    sequence,
-                                    visual_units[pos],
+                    # LRM-delimited and LRI/PDI-isolated formulas/codes are semantic
+                    # LTR islands. Restore each island's *logical* unit sequence
+                    # without moving the island within the RTL line.
+                    for open_marker, close_marker in (("\u200e", "\u200e"), ("\u2066", "\u2069")):
+                        start = 0
+                        while True:
+                            left = bidi_text.find(open_marker, start)
+                            if left < 0:
+                                break
+                            right = bidi_text.find(close_marker, left + 1)
+                            if right < 0:
+                                break
+                            positions = [
+                                pos for pos, source_index in enumerate(visual_indices)
+                                if left < source_index < right
+                            ]
+                            if len(positions) > 1:
+                                ordered = sorted(
+                                    (
+                                        visual_indices[pos],
+                                        sequence,
+                                        visual_units[pos],
+                                    )
+                                    for sequence, pos in enumerate(positions)
                                 )
-                                for sequence, pos in enumerate(positions)
-                            )
-                            for pos, (source_index, _sequence, unit) in zip(positions, ordered):
-                                visual_indices[pos] = source_index
-                                visual_units[pos] = unit
-                        start = right + 1
+                                for pos, (source_index, _sequence, unit) in zip(positions, ordered):
+                                    visual_indices[pos] = source_index
+                                    visual_units[pos] = unit
+                            start = right + 1
                 else:
                     visual_units = line
 
@@ -5630,6 +5959,14 @@ class Typesetting:
         else:
             # Reserve page bottom margin, running footers, and the footnote band.
             min_y = zones["body_floor"]
+
+        # Fixed/ruled or preserved irregular table cells must stay inside their own row floor
+        # instead of expanding downward into empty sibling slots or the next table row.
+        if paragraph is not None and self._is_fixed_table_paragraph(paragraph):
+            lbl = (paragraph.layout_label or "").lower()
+            trace = paragraph.pipeline_trace or {}
+            if "fixed" in lbl or trace.get("preserve_irregular_table"):
+                min_y = max(min_y, current_box.y)
 
         # Check for content below that may interfere
         for para in page.pdf_paragraph:

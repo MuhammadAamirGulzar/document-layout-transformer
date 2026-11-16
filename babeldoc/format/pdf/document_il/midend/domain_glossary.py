@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import os
 import re
+import threading
+from typing import Iterable
 
 _I = re.IGNORECASE
 
@@ -66,6 +68,18 @@ _PRE_RULES: list[tuple[re.Pattern, str]] = [
      r'retaining \2 of the \1 neurons'),
     (re.compile(r'\bSelecting\s+(all,\s*top,\s*random\s+and\s+bottom)\s+(\d+(?:\.\d+)?%)\s+neurons\b', _I),
      r'Selecting \2 of \1 neurons'),
+    # Institutional / policy / UN report terminology
+    (re.compile(r'\bCountry\s+programme\s+document\b', _I), 'وثيقة البرنامج القطري'),
+    (re.compile(r'\bDistr\.\s*:\s*Limited\b', _I), 'توزيع: محدود'),
+    (re.compile(r'\bDistr\.\s*:\s*General\b', _I), 'توزيع: عام'),
+    (re.compile(r"\bUnited\s+Nations\s+Children['\u2019]s\s+Fund\b", _I), 'منظمة الأمم المتحدة للطفولة (اليونيسف)'),
+    (re.compile(r'\bExecutive\s+Board\b', _I), 'المجلس التنفيذي'),
+    (re.compile(r'\bEconomic\s+and\s+Social\s+Council\b', _I), 'المجلس الاقتصادي والاجتماعي'),
+    (re.compile(
+        r'\bUnited\s+Nations\s+Sustainable\s+Development\s+Cooperation\s+Framework\b',
+        _I,
+    ), 'إطار الأمم المتحدة للتعاون في مجال التنمية المستدامة'),
+    (re.compile(r'\bEarly\s+Childhood\s+Development\b', _I), 'تنمية الطفولة المبكرة'),
 ]
 
 _PRE_WHOLE_TEXT = [
@@ -169,10 +183,225 @@ _SCIENTIFIC_POST_RULES: list[tuple[re.Pattern, str]] = [
 ]
 
 
-def apply_pre_glossary(text: str) -> str:
+_DOMAIN_CUES: dict[str, re.Pattern] = {
+    "scientific_nlp": re.compile(
+        r"\b(?:NLP|neural|neuron|neurons|transformer|BERT|RoBERTa|XLNet|"
+        r"ablation|selectivity|linguistics?|classifier|theorem|algorithm|"
+        r"hyperparameter|benchmark|abstract|arxiv|doi|corpus|tokenization)\b",
+        _I,
+    ),
+    "financial_banking": re.compile(
+        r"\b(?:IBAN|BBAN|SWIFT|BIC|central\s+bank|clearing\s+house|repo\s+rate|"
+        r"monetary|inflation|liquidity|gdp|balance\s+of\s+payments|MOD\s*97|"
+        r"treasury|remittance|settlement|fiscal|banking)\b",
+        _I,
+    ),
+    "invoice_form": re.compile(
+        r"\b(?:invoice|purchase\s+order|bill\s+to|ship\s+to|subtotal|"
+        r"tax\s+id|vat\s+no|receipt|due\s+date|payment\s+terms|authorized\s+signature|"
+        r"applicant|form\s+no|remit\s+to)\b",
+        _I,
+    ),
+    "legal_contract": re.compile(
+        r"\b(?:whereas|hereinafter|indemnify|jurisdiction|governing\s+law|"
+        r"arbitration|confidentiality|liability|termination|agreement|clause)\b",
+        _I,
+    ),
+}
+
+_ABBREV_DEF_RE = re.compile(
+    r"([A-Za-z][A-Za-z\-']*(?:\s+(?:of|and|for|the|in|on|to|[A-Za-z][A-Za-z\-']*)){0,7})\s*\(\s*([A-Z][A-Z0-9]{1,9})\s*\)"
+)
+_IGNORED_ABBREVS = {"USA", "USD", "EUR", "GBP", "SAR", "AED", "QAR", "PDF", "URL", "DOI"}
+_INTERNAL_PLACEHOLDER_RE = re.compile(r"\{\d{1,3}\}|<\s*/?\s*b\s*\d+\s*>")
+
+
+def _abbrev_matches_expansion(expansion: str, acronym: str) -> bool:
+    """Return True when an uppercase acronym plausibly abbreviates ``expansion``."""
+    if not acronym or acronym in _IGNORED_ABBREVS:
+        return False
+    words = [w for w in re.split(r"[\s\-]+", expansion.strip()) if w]
+    content_words = [
+        w for w in words if w.lower() not in {"of", "and", "for", "the", "in", "on", "to"}
+    ]
+    if len(content_words) < 2:
+        return False
+    initials = "".join(w[0].upper() for w in content_words if w[0].isalpha())
+    all_initials = "".join(w[0].upper() for w in words if w[0].isalpha())
+    acro_letters = "".join(c for c in acronym if c.isalpha())
+    if len(acro_letters) < 2:
+        return False
+    if acro_letters == initials or acro_letters == all_initials:
+        return True
+    # Subsequence check inside content initials / uppercase letters of expansion
+    exp_upper = re.sub(r"[^A-Za-z]", "", expansion).upper()
+    pos = 0
+    for ch in acro_letters:
+        found = exp_upper.find(ch, pos)
+        if found < 0:
+            return False
+        pos = found + 1
+    return acro_letters[0] == content_words[0][0].upper()
+
+
+def classify_document_domain(texts: Iterable[str]) -> str:
+    """Classify the overall document domain from its paragraph texts."""
+    scores: dict[str, int] = {name: 0 for name in _DOMAIN_CUES}
+    distinct_hits: dict[str, set[str]] = {name: set() for name in _DOMAIN_CUES}
+    for raw in texts:
+        if not raw:
+            continue
+        for domain, pattern in _DOMAIN_CUES.items():
+            matches = pattern.findall(raw)
+            if matches:
+                scores[domain] += len(matches)
+                for m in matches:
+                    distinct_hits[domain].add(m.lower().strip())
+    ranked = sorted(
+        scores.keys(),
+        key=lambda d: (len(distinct_hits[d]), scores[d]),
+        reverse=True,
+    )
+    best = ranked[0] if ranked else "general"
+    if len(distinct_hits.get(best, ())) >= 2 or scores.get(best, 0) >= 3:
+        return best
+    return "general"
+
+
+def _trim_matching_expansion(raw_span: str, acronym: str) -> str | None:
+    """Return the suffix of ``raw_span`` whose words match ``acronym``, or None."""
+    tokens = [t for t in raw_span.strip().split() if t]
+    for start in range(len(tokens)):
+        candidate = " ".join(tokens[start:]).strip(" ,;:-")
+        if _abbrev_matches_expansion(candidate, acronym):
+            return candidate
+    return None
+
+
+def extract_document_abbreviations(texts: Iterable[str]) -> dict[str, str]:
+    """Extract first-occurrence ``Expansion (ACRONYM)`` definitions per document."""
+    abbreviations: dict[str, str] = {}
+    for raw in texts:
+        if not raw:
+            continue
+        for match in _ABBREV_DEF_RE.finditer(raw):
+            expansion = " ".join(match.group(1).split()).strip(" ,;:-")
+            acronym = match.group(2).strip()
+            if acronym in abbreviations:
+                continue
+            matched_exp = _trim_matching_expansion(expansion, acronym)
+            if matched_exp is not None:
+                abbreviations[acronym] = matched_exp
+    return abbreviations
+
+
+def _abbreviations_indicate_scientific(abbreviations: dict[str, str] | None) -> bool:
+    if not abbreviations:
+        return False
+    combined = " ".join(f"{k} {v}" for k, v in abbreviations.items()).lower()
+    return any(
+        cue in combined
+        for cue in ("part-of-speech", "natural language", "neural", "transformer", "linguistic")
+    )
+
+
+class DocumentTranslationMemory:
+    """Thread-safe document-level translation memory for consistent repeated segments."""
+
+    def __init__(self, max_entries: int = 4096) -> None:
+        self._lock = threading.Lock()
+        self._entries: dict[tuple[str, str, str, str], str] = {}
+        self._max_entries = max_entries
+        self._hits = 0
+        self._misses = 0
+
+    @staticmethod
+    def _normalize_key(text: str) -> str:
+        return re.sub(r"\s+", " ", (text or "").strip())
+
+    @classmethod
+    def is_eligible(cls, text: str) -> bool:
+        norm = cls._normalize_key(text)
+        if not norm or len(norm) > 600:
+            return False
+        if _INTERNAL_PLACEHOLDER_RE.search(norm):
+            return False
+        return bool(re.search(r"[A-Za-z\u0600-\u06FF]", norm))
+
+    def lookup(
+        self,
+        source_text: str,
+        *,
+        lang_in: str = "",
+        lang_out: str = "",
+        engine_name: str = "",
+    ) -> str | None:
+        if not self.is_eligible(source_text):
+            return None
+        key = (
+            (lang_in or "").lower(),
+            (lang_out or "").lower(),
+            (engine_name or "").lower(),
+            self._normalize_key(source_text),
+        )
+        with self._lock:
+            hit = self._entries.get(key)
+            if hit is not None:
+                self._hits += 1
+            else:
+                self._misses += 1
+            return hit
+
+    def store(
+        self,
+        source_text: str,
+        translated_text: str,
+        *,
+        lang_in: str = "",
+        lang_out: str = "",
+        engine_name: str = "",
+    ) -> None:
+        if not self.is_eligible(source_text) or not translated_text:
+            return
+        norm_src = self._normalize_key(source_text)
+        norm_tgt = translated_text.strip()
+        if not norm_tgt or norm_tgt == norm_src:
+            return
+        if _INTERNAL_PLACEHOLDER_RE.search(norm_tgt):
+            return
+        key = (
+            (lang_in or "").lower(),
+            (lang_out or "").lower(),
+            (engine_name or "").lower(),
+            norm_src,
+        )
+        with self._lock:
+            if len(self._entries) >= self._max_entries and key not in self._entries:
+                return
+            self._entries.setdefault(key, translated_text)
+
+    def stats(self) -> dict[str, int]:
+        with self._lock:
+            return {
+                "entries": len(self._entries),
+                "hits": self._hits,
+                "misses": self._misses,
+            }
+
+
+def apply_pre_glossary(
+    text: str,
+    domain: str | None = None,
+    abbreviations: dict[str, str] | None = None,
+) -> str:
     """Lock domain phrases in the English source before translation."""
     if not text or not _enabled():
         return text
+    stripped = text.strip()
+    if abbreviations and stripped in abbreviations:
+        # Preserve document-defined acronyms verbatim unless handled below.
+        if re.fullmatch(r"[A-Z][A-Z0-9]{1,9}", stripped):
+            return stripped
     for pattern, replacement in _PRE_RULES:
         text = pattern.sub(replacement, text)
     for pattern, replacement in _PRE_WHOLE_TEXT:
@@ -181,13 +410,39 @@ def apply_pre_glossary(text: str) -> str:
     return text
 
 
-def apply_post_glossary(text: str, source_text: str | None = None) -> str:
+def apply_post_glossary(
+    text: str,
+    source_text: str | None = None,
+    domain: str | None = None,
+    abbreviations: dict[str, str] | None = None,
+) -> str:
     """Repair known mistranslations in the Arabic output."""
     if not text or not _enabled():
         return text
     for pattern, replacement in _POST_RULES:
         text = pattern.sub(replacement, text)
-    if source_text and _SCIENTIFIC_CONTEXT.search(source_text):
+    if source_text:
+        src_lower = source_text.lower()
+        if "country programme document" in src_lower:
+            text = re.sub(
+                r'\bوثيقة\s+(?:برنامج\s+البلد|البلدان\s+البرنامج|برنامج\s+الدول)\b',
+                'وثيقة البرنامج القطري',
+                text,
+            )
+        if re.search(r'\binterjections?\b', src_lower):
+            text = re.sub(_B + r'(?:التقاطعات|تقاطعات)\b', r'\1صيغ التعجب', text)
+        if re.search(r'\bsyntax\b', src_lower) and "translation" not in src_lower:
+            text = re.sub(_B + r'الترجمة\b', r'\1البنية النحوية', text)
+    sci_active = (
+        domain == "scientific_nlp"
+        or (source_text is not None and bool(_SCIENTIFIC_CONTEXT.search(source_text)))
+        or _abbreviations_indicate_scientific(abbreviations)
+    )
+    if sci_active:
+        pos_def = (abbreviations or {}).get("POS", "").lower()
+        pos_is_retail = any(k in pos_def for k in ("point of sale", "point-of-sale"))
         for pattern, replacement in _SCIENTIFIC_POST_RULES:
+            if pos_is_retail and replacement == r'\1POS':
+                continue
             text = pattern.sub(replacement, text)
     return text

@@ -34,11 +34,22 @@ from babeldoc.format.pdf.document_il.utils.layout_helper import (
 from babeldoc.format.pdf.document_il.utils.layout_helper import (
     is_same_style_except_size,
 )
+from babeldoc.format.pdf.document_il.utils.layout_semantics import (
+    is_standalone_code_text,
+    should_preserve_figure_paragraph,
+)
 from babeldoc.format.pdf.document_il.utils.paragraph_helper import (
     is_placeholder_only_paragraph,
 )
 from babeldoc.format.pdf.document_il.utils.paragraph_helper import (
     is_pure_numeric_paragraph,
+)
+from babeldoc.format.pdf.document_il.midend.domain_glossary import (
+    DocumentTranslationMemory,
+    apply_post_glossary,
+    apply_pre_glossary,
+    classify_document_domain,
+    extract_document_abbreviations,
 )
 from babeldoc.format.pdf.document_il.utils.quality_report import detect_leaked_placeholders
 from babeldoc.format.pdf.document_il.utils.sentence_splitter import split_sentences
@@ -57,6 +68,66 @@ def _set_paragraph_skip_reason(paragraph: PdfParagraph, disposition: str, reason
         "skip_disposition": disposition,
         "skip_reason": reason,
     }
+
+
+def _get_doc_terminology_context(
+    translation_config: Any,
+) -> tuple[str | None, dict[str, str] | None, DocumentTranslationMemory | None]:
+    shared = getattr(translation_config, "shared_context_cross_split_part", None)
+    if shared is None:
+        return None, None, None
+    domain = getattr(shared, "detected_domain", None)
+    abbrevs = getattr(shared, "document_abbreviations", None)
+    tm = getattr(shared, "translation_memory", None)
+    return domain, abbrevs, tm
+
+
+def _init_doc_terminology_context(docs: Document, translation_config: Any) -> None:
+    """Detect document domain, first-occurrence abbreviations, and init TM."""
+    shared = getattr(translation_config, "shared_context_cross_split_part", None)
+    if shared is None:
+        return
+    texts = [
+        para.unicode
+        for page in (getattr(docs, "page", None) or [])
+        for para in (getattr(page, "pdf_paragraph", None) or [])
+        if getattr(para, "unicode", None)
+    ]
+    domain = classify_document_domain(texts)
+    abbrevs = extract_document_abbreviations(texts)
+    shared.detected_domain = domain
+    existing_abbrevs = getattr(shared, "document_abbreviations", None)
+    if isinstance(existing_abbrevs, dict) and existing_abbrevs:
+        merged = dict(existing_abbrevs)
+        for k, v in abbrevs.items():
+            merged.setdefault(k, v)
+        shared.document_abbreviations = merged
+    else:
+        shared.document_abbreviations = abbrevs
+    if getattr(shared, "translation_memory", None) is None:
+        shared.translation_memory = DocumentTranslationMemory()
+    ledger = getattr(shared, "content_ledger", None)
+    if ledger is not None and hasattr(ledger, "record_terminology"):
+        tm = shared.translation_memory
+        ledger.record_terminology(
+            domain,
+            shared.document_abbreviations,
+            tm.stats() if tm is not None else None,
+        )
+
+
+def _sync_terminology_to_ledger(translation_config: Any) -> None:
+    shared = getattr(translation_config, "shared_context_cross_split_part", None)
+    if shared is None:
+        return
+    ledger = getattr(shared, "content_ledger", None)
+    if ledger is not None and hasattr(ledger, "record_terminology"):
+        tm = getattr(shared, "translation_memory", None)
+        ledger.record_terminology(
+            getattr(shared, "detected_domain", "general") or "general",
+            getattr(shared, "document_abbreviations", None) or {},
+            tm.stats() if tm is not None else None,
+        )
 
 
 def _missing_input_placeholders(translate_input, output: str) -> list[str]:
@@ -547,8 +618,8 @@ class ILTranslator:
         cfg = getattr(self, "translation_config", None)
         lang_out = (getattr(cfg, "lang_out", "") or "").lower()
         if any(marker in lang_out for marker in ("ar", "arabic", "ara")):
-            from babeldoc.format.pdf.document_il.midend.domain_glossary import apply_pre_glossary
-            text = apply_pre_glossary(text)
+            domain, abbrevs, _ = _get_doc_terminology_context(cfg)
+            text = apply_pre_glossary(text, domain=domain, abbreviations=abbrevs)
 
         # Financial rates and central banking terms
         text = re.sub(r'\b(?:The\s+)?QMR\s+Lending\s+Rate\b', 'سعر فائدة الإقراض في سوق قطر النقدي', text, flags=re.I)
@@ -586,7 +657,7 @@ class ILTranslator:
         # Contact and communication terminology: Tel, Fax, E-Mail
         text = re.sub(r'\bTel\b(?:\s*[:：])?', 'الهاتف:', text, flags=re.I)
         text = re.sub(r'\bFax\b(?:\s*[:：])?', 'الفاكس:', text, flags=re.I)
-        text = re.sub(r'\bE-?Mail\b(?:\s*[:：])?', 'البريد الإلكتروني:', text, flags=re.I)
+        text = re.sub(r'\bE-?Mail\b(?!\s*@)(?:\s*[:：])?', 'البريد الإلكتروني:', text, flags=re.I)
 
         # Qatar Banking Institutions standardization (prevents fragmentation, stray commas, and phonetic mistranslations)
         text = re.sub(r'\bINTERNATIONAL\s+BANK\s+OF\s+QATAR\b', 'بنك قطر الدولي', text, flags=re.I)
@@ -1032,8 +1103,10 @@ class ILTranslator:
         text = re.sub(r'\bبيليومتر\b', 'برميل', text)
         text = re.sub(r'\bنقاط\s+(?:أوروبية|أرضية|أوراق)\b', 'نقطة أساس', text)
         text = re.sub(r'\bإعادة\s+التأمين\b', 'سعر الريبو', text)
-        from babeldoc.format.pdf.document_il.midend.domain_glossary import apply_post_glossary
-        text = apply_post_glossary(text)
+        domain, abbrevs, _ = _get_doc_terminology_context(
+            getattr(self, "translation_config", None)
+        )
+        text = apply_post_glossary(text, domain=domain, abbreviations=abbrevs)
 
         # Strip leaked English ordinal suffixes ("5th - 29th" -> "5 - 29") when
         # surrounded by Arabic prose so RTL layout does not detach "th"/"rd".
@@ -1066,6 +1139,25 @@ class ILTranslator:
             r'\bAll(?=(?:[\s\u200e\u200f])+' + ar_letters + r')',
             'جميع', text, flags=re.IGNORECASE,
         )
+        # Stash bibliographic/contact spans before formula & script-spacing rules
+        # so numeric slash heuristics never split DOIs (e.g. 10.1145/...) or URLs.
+        _ltr_ref = re.compile(
+            r"(?:"
+            r"(?:https?://|www\.)[^\s<>\"\u201d\u2019\u200e]*[^\s<>\"\u201d\u2019.,;:!?)\]\u200e]"
+            r"|(?<![A-Za-z0-9.])10\.\d{4,9}/[^\s<>\"\u201d\u2019\u200e]*[^\s<>\"\u201d\u2019.,;:!?)\]\u200e]"
+            r"|[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"
+            r"|\[\s*\d{1,3}(?:\s*[,\u2013\u2014-]\s*\d{1,3})*\s*\]"
+            r")"
+        )
+        _ref_stash: list[str] = []
+
+        def _stash_ref(match: re.Match) -> str:
+            idx = len(_ref_stash)
+            _ref_stash.append(match.group(0))
+            return f"\uE000{idx}\uE001"
+
+        text = _ltr_ref.sub(_stash_ref, text)
+
         # Isolate banking formulas, slash dates, and code chains as LTR runs inside Arabic.
         # This protects the visual order of "MOD 97", "14/8/2013", division signs and
         # equals signs without translating or reordering their operands.
@@ -1077,6 +1169,9 @@ class ILTranslator:
         text = ltr_formula.sub(lambda match: f"\u200E{match.group(0)}\u200E", text)
         text = re.sub(rf'({ar_letters})([A-Za-z0-9])', r'\1 \2', text)
         text = re.sub(rf'([A-Za-z0-9])({ar_letters})', r'\1 \2', text)
+        if _ref_stash:
+            text = re.sub(rf'({ar_letters})(\uE000\d+\uE001)', r'\1 \2', text)
+            text = re.sub(rf'(\uE000\d+\uE001)({ar_letters})', r'\1 \2', text)
 
         # 11. Punctuation BiDi Locking: Ensure trailing neutral punctuation (. , : ; ! ؟)
         # following digits, Arabic percent sign (\u066A), or Latin letters/parentheses
@@ -1102,6 +1197,15 @@ class ILTranslator:
             lambda match: "\u200e" + "\u00a0".join(match[0].split()) + "\u200e",
             text,
         )
+        if _ref_stash:
+            def _restore_ref(match: re.Match) -> str:
+                val = _ref_stash[int(match.group(1))]
+                if re.search(r"[\u0600-\u06FF]", text):
+                    return f"\u200e{val}\u200e"
+                return val
+
+            text = re.sub(r"\uE000(\d+)\uE001", _restore_ref, text)
+            text = re.sub(r"\u200e{2,}", "\u200e", text)
         return text
 
     def calc_token_count(self, text: str) -> int:
@@ -1115,6 +1219,7 @@ class ILTranslator:
     def translate(self, docs: Document):
         self.docs = docs
         tracker = DocumentTranslateTracker()
+        _init_doc_terminology_context(docs, self.translation_config)
 
         if not self.translation_config.shared_context_cross_split_part.first_paragraph:
             # Try to find the first title paragraph
@@ -1140,6 +1245,7 @@ class ILTranslator:
                 for page in docs.page:
                     self.process_page(page, executor, pbar, tracker.new_page())
 
+        _sync_terminology_to_ledger(self.translation_config)
         path = self.translation_config.get_working_file_path("translate_tracking.json")
 
         if self.translation_config.debug:
@@ -1686,6 +1792,22 @@ class ILTranslator:
         if not self.support_llm_translate:
             disable_rich_text_translate = True
         layout_label = (paragraph.layout_label or "").lower()
+        if (paragraph.pipeline_trace or {}).get("preserved_code") or is_standalone_code_text(
+            paragraph.unicode, layout_label
+        ):
+            if paragraph.pipeline_trace is None:
+                paragraph.pipeline_trace = {}
+            paragraph.pipeline_trace["preserved_code"] = True
+            _set_paragraph_skip_reason(paragraph, "passthrough", "code_or_algorithm")
+            return None, None
+        if should_preserve_figure_paragraph(paragraph):
+            if paragraph.pipeline_trace is None:
+                paragraph.pipeline_trace = {}
+            paragraph.pipeline_trace["preserved_figure_data"] = True
+            _set_paragraph_skip_reason(
+                paragraph, "passthrough", "figure_data_or_scientific_token"
+            )
+            return None, None
         if "table_cell" in layout_label and re.fullmatch(r"[A-Z]", (paragraph.unicode or "").strip()):
             # Conversion-table letters and marks such as X are literal data.
             _set_paragraph_skip_reason(paragraph, "passthrough", "table_cell_code")
@@ -2035,7 +2157,31 @@ Now, please carefully read the following text to be translated and directly outp
                         "INCOMING": "\u0627\u0644\u0648\u0627\u0631\u062f\u0629",
                         "OUTGOING": "\u0627\u0644\u0635\u0627\u062f\u0631\u0629",
                     }.get(text.strip().upper())
-                if direct_translation is not None:
+                cfg = getattr(self, "translation_config", None)
+                domain, abbrevs, doc_tm = _get_doc_terminology_context(cfg)
+                lang_in_key = getattr(cfg, "lang_in", "") or ""
+                lang_out_key = getattr(cfg, "lang_out", "") or ""
+                engine_tm_key = getattr(
+                    self.translate_engine,
+                    "name",
+                    self.translate_engine.__class__.__name__,
+                )
+                has_placeholders = bool(getattr(translate_input, "placeholders", None))
+                tm_cached = None
+                if (
+                    direct_translation is None
+                    and not has_placeholders
+                    and doc_tm is not None
+                ):
+                    tm_cached = doc_tm.lookup(
+                        text,
+                        lang_in=lang_in_key,
+                        lang_out=lang_out_key,
+                        engine_name=engine_tm_key,
+                    )
+                if tm_cached is not None:
+                    translated_text = tm_cached
+                elif direct_translation is not None:
                     translated_text = direct_translation
                 elif self.support_llm_translate:
                     llm_prompt = self.generate_prompt_for_llm(
@@ -2076,26 +2222,26 @@ Now, please carefully read the following text to be translated and directly outp
                     )
                     if marker:
                         translated_text = f"{marker} {translated_text}"
-                translated_text = self._normalize_arabic_output(translated_text)
-                # Source-aware scientific repairs are a separate boundary so
-                # the long-standing one-argument normalization contract stays
-                # compatible with callers and test doubles.
-                from babeldoc.format.pdf.document_il.midend.domain_glossary import (
-                    apply_post_glossary,
-                )
-
-                translated_text = apply_post_glossary(
-                    translated_text, source_text=source_unicode
-                )
-                translated_text = self.shape_arabic_text(translated_text)
-                # Only collapse repetitive punctuation if not a TOC leader line (\.{4,}\s*\d+)
-                if not re.search(r'\.{4,}\s*\d+', translated_text):
-                    translated_text = re.sub(r"[. 。…，]{20,}", ".", translated_text)
-                if index_reference:
-                    language = (self.translation_config.lang_out or "").lower().rsplit("-", 1)[-1]
-                    if language in {"ar", "ara", "arabic"}:
-                        index_reference = f"\u200e{index_reference}\u200e"
-                    translated_text = f"{translated_text.rstrip()} {index_reference}"
+                if tm_cached is None:
+                    translated_text = self._normalize_arabic_output(translated_text)
+                    # Source-aware scientific repairs are a separate boundary so
+                    # the long-standing one-argument normalization contract stays
+                    # compatible with callers and test doubles.
+                    translated_text = apply_post_glossary(
+                        translated_text,
+                        source_text=source_unicode,
+                        domain=domain,
+                        abbreviations=abbrevs,
+                    )
+                    translated_text = self.shape_arabic_text(translated_text)
+                    # Only collapse repetitive punctuation if not a TOC leader line (\.{4,}\s*\d+)
+                    if not re.search(r'\.{4,}\s*\d+', translated_text):
+                        translated_text = re.sub(r"[. 。…，]{20,}", ".", translated_text)
+                    if index_reference:
+                        language = (self.translation_config.lang_out or "").lower().rsplit("-", 1)[-1]
+                        if language in {"ar", "ara", "arabic"}:
+                            index_reference = f"\u200e{index_reference}\u200e"
+                        translated_text = f"{translated_text.rstrip()} {index_reference}"
 
                 if isinstance(self.translate_engine, BaseTranslator):
                     para_failed, para_incomplete = self.translate_engine._consume_paragraph_status()
@@ -2178,6 +2324,18 @@ Now, please carefully read the following text to be translated and directly outp
                 else:
                     disposition = "translated"
                     reason = None
+                    if (
+                        tm_cached is None
+                        and not has_placeholders
+                        and doc_tm is not None
+                    ):
+                        doc_tm.store(
+                            text,
+                            translated_text,
+                            lang_in=lang_in_key,
+                            lang_out=lang_out_key,
+                            engine_name=engine_tm_key,
+                        )
 
                 _record_paragraph_disposition(
                     self,

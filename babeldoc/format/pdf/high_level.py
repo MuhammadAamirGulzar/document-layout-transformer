@@ -805,6 +805,20 @@ def do_translate(
         )
         if ledger is not None:
             try:
+                from babeldoc.format.pdf.document_il.utils.preflight import audit_output_pdf
+
+                audit_output_pdf(
+                    getattr(result, "mono_pdf_path", None),
+                    expected_page_count=getattr(
+                        getattr(translation_config, "shared_context_cross_split_part", None),
+                        "preflight_total_pages",
+                        None,
+                    ),
+                    ledger=ledger,
+                )
+            except Exception as e:
+                logger.warning(f"Failed to audit output PDF: {e}")
+            try:
                 engine_obj = getattr(translation_config, "translator", None)
                 engine_name = getattr(
                     engine_obj,
@@ -1079,6 +1093,19 @@ def _do_translate_single(
         #     )
             
 
+        shared_ctx = getattr(translation_config, "shared_context_cross_split_part", None)
+        preflight_ledger = getattr(shared_ctx, "content_ledger", None)
+        if shared_ctx is not None:
+            shared_ctx.preflight_total_pages = (
+                getattr(shared_ctx, "preflight_total_pages", 0) or 0
+            ) + len(docs.page)
+        try:
+            from babeldoc.format.pdf.document_il.utils.preflight import inspect_document_preflight
+
+            inspect_document_preflight(docs, doc_pdf2zh, ledger=preflight_ledger)
+        except Exception as e:
+            logger.debug(f"Preflight inspection skipped: {e}")
+
         if check_cid_char(docs):
             raise ExtractTextError("The document contains too many CID chars.")
 
@@ -1349,7 +1376,7 @@ def generate_first_page_with_watermark(
         )
         safe_save(first_page_doc, watermarked_temp_pdf_path)
 
-        Typesetting(watermarked_config).typsetting_document(il_only_first_page_doc)
+        Typesetting(watermarked_config).typesetting_document(il_only_first_page_doc)
         pdf_creater = PDFCreater(
             watermarked_temp_pdf_path.as_posix(),
             il_only_first_page_doc,

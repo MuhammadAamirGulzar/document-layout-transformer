@@ -19,6 +19,15 @@ from babeldoc.format.pdf.document_il import PdfParagraphComposition
 from babeldoc.format.pdf.document_il import PdfRectangle
 from babeldoc.format.pdf.document_il import VisualBbox
 from babeldoc.format.pdf.document_il.utils.fontmap import FontMapper
+from babeldoc.format.pdf.document_il.utils.layout_semantics import (
+    annotate_page_figure_regions,
+    can_merge_paragraphs,
+    classify_pseudocode_region_paragraphs,
+    compute_page_reading_order,
+)
+from babeldoc.format.pdf.document_il.utils.semantic_table import (
+    annotate_page_semantic_tables,
+)
 from babeldoc.format.pdf.document_il.utils.formular_helper import (
     collect_page_formula_font_ids,
 )
@@ -398,12 +407,14 @@ class ParagraphFinder:
             self.merge_alternating_line_number_paragraphs(paragraphs)
 
         # Merge hyphenated words across lines and multi-line continuation fragments
-        self.merge_hyphenated_and_continuation_paragraphs(paragraphs, font_dict=font_dict)
+        self.merge_hyphenated_and_continuation_paragraphs(
+            paragraphs, font_dict=font_dict, page=page
+        )
         # Some legacy PDFs draw a leading word separately from the remainder of
         # the same prose line (for example, ``All`` + ``banks are required``).
         # Repair it before translation so it cannot become an orphan Arabic word.
-        self.merge_detached_leading_word_fragments(paragraphs)
-        self.merge_same_line_sentence_fragments(paragraphs)
+        self.merge_detached_leading_word_fragments(paragraphs, page=page)
+        self.merge_same_line_sentence_fragments(paragraphs, page=page)
 
         # Some PDFs expose each visual line of a definition as an independent
         # paragraph, but the extraction order is not necessarily top-to-bottom.
@@ -418,7 +429,7 @@ class ParagraphFinder:
         # Run once more after structural splitting: the split pass can expose
         # adjacent style runs that were previously hidden inside a larger
         # paragraph object.
-        self.merge_same_line_sentence_fragments(paragraphs)
+        self.merge_same_line_sentence_fragments(paragraphs, page=page)
 
         # Splitting and fallback layout detection can temporarily make two
         # paragraphs reference the same PdfCharacter object. Rendering both is
@@ -487,8 +498,8 @@ class ParagraphFinder:
         # Run the same-line repair once more after role classification and
         # overlap normalization.  Those stages can expose fragments that were
         # previously hidden behind a broad title/body box.
-        self.merge_detached_leading_word_fragments(paragraphs)
-        self.merge_same_line_sentence_fragments(paragraphs)
+        self.merge_detached_leading_word_fragments(paragraphs, page=page)
+        self.merge_same_line_sentence_fragments(paragraphs, page=page)
 
         # ç¬¬å…­æ­¥ï¼šå¯¹æ¯ä¸€è¡Œçš„å­—ç¬¦è¿›è¡ŒæŽ’åº
         # self._sort_characters_in_lines(page)
@@ -500,6 +511,24 @@ class ParagraphFinder:
             and not self.translation_config.ocr_workaround
         ):
             self._attach_drawn_list_bullets(page)
+
+        preserved_fig_records = annotate_page_figure_regions(page, page.pdf_paragraph)
+        ordered_paragraphs, _ro_summary = compute_page_reading_order(
+            page, page.pdf_paragraph
+        )
+        page.pdf_paragraph[:] = ordered_paragraphs
+        shared = getattr(
+            getattr(self, "translation_config", None),
+            "shared_context_cross_split_part",
+            None,
+        )
+        ledger = getattr(shared, "content_ledger", None) if shared is not None else None
+        if ledger is not None:
+            if preserved_fig_records and hasattr(ledger, "record_preserved_regions"):
+                ledger.record_preserved_regions(preserved_fig_records)
+            if hasattr(ledger, "record_reading_order"):
+                ledger.record_reading_order(len(ordered_paragraphs))
+
         self.add_debug_info(page)
 
         # æ–°é˜¶æ®µï¼šè®¾ç½®æ®µè½çš„ renderorder ä¸ºæ‰€æœ‰ç»„æˆéƒ¨åˆ†ä¸­ renderorder æœ€å°çš„
@@ -957,75 +986,116 @@ class ParagraphFinder:
     def _preserve_pseudocode_regions(
         self, page: Page, paragraphs: list[PdfParagraph]
     ) -> None:
-        """Keep numbered pseudocode at source coordinates when its region is identifiable."""
-        control = re.compile(
-            r"^(?:(?:function|procedure|def)\s+\w+\s*\(|"
-            r"(?:for|while)\b.+\bdo\b|(?:for|while)\b.+\b(?:in|to)\b|if\b.+\bthen\b|"
-            r"else\b|repeat\b|until\b|return\b|"
-            r"end\s+(?:if|for|while|function|procedure)\b)",
-            re.IGNORECASE,
-        )
-        assignment = re.compile(r"←|:=|^\w+\s*=(?!=)")
-        # LaTeX algorithmic blocks number lines as "1:", "1.", "1 for ..." or a
-        # bare gutter number extracted as its own line.
-        number_prefix = re.compile(r"^(\d+)(?:\s*[:.]\s*(?!\d)|\s+(?=\S)|\s*$)")
+        """Keep numbered or structural code/pseudocode blocks verbatim while keeping captions translatable."""
         container_classes = {
             "table", "wired_table", "wireless_table", "algorithm", "pseudocode", "code",
             # The layout model has no algorithm class, so an algorithm is
             # usually labelled as ordinary text, a figure or a formula.  The
-            # strict structure checks below decide whether it really is one.
+            # strict structure checks in classify_pseudocode_region_paragraphs decide.
             "plain text", "text", "figure", "isolate_formula", "formula",
         }
-        preserved_ids = set()
+        preserved_ids: set[int] = set()
+        preserved_records: list[dict[str, object]] = []
         page_glyph_ids = {id(char) for char in page.pdf_character}
-        for region in page.page_layout or []:
-            box = region.box
-            if not box or (region.class_name or "").lower() not in container_classes:
-                continue
-            members = []
-            line_numbers = set()
-            control_rows = set()
-            assignment_rows = set()
-            gutter_right = box.x + (box.x2 - box.x) * 0.10
-            for paragraph in paragraphs:
-                bounds = paragraph.box
-                if (
-                    id(paragraph) in preserved_ids
-                    or not bounds
-                    or not (box.x - 2 <= bounds.x <= bounds.x2 <= box.x2 + 2)
-                    or not (box.y - 2 <= bounds.y <= bounds.y2 <= box.y2 + 2)
-                ):
-                    continue
-                members.append(paragraph)
-                for composition in paragraph.pdf_paragraph_composition or []:
-                    line = composition.pdf_line
-                    if not line or not line.box:
-                        continue
-                    text = get_char_unicode_string(line.pdf_character).strip()
-                    marker = number_prefix.match(text) if line.box.x <= gutter_right else None
-                    if marker:
-                        line_numbers.add(int(marker[1]))
-                        text = text[marker.end():]
-                    if control.match(text):
-                        control_rows.add(round(line.box.y))
-                    if assignment.search(text):
-                        assignment_rows.add(round(line.box.y))
-            has_sequence = any(n + 1 in line_numbers and n + 2 in line_numbers for n in line_numbers)
-            if (
-                not has_sequence
-                or len(control_rows) < 2
-                or not (assignment_rows or len(control_rows) >= 3)
-            ):
-                continue
+
+        def _preserve_members(region_id: object, members: list[PdfParagraph]) -> None:
+            char_count = 0
             for paragraph in members:
+                if id(paragraph) in preserved_ids:
+                    continue
                 preserved_ids.add(id(paragraph))
+                if paragraph.pipeline_trace is None:
+                    paragraph.pipeline_trace = {}
+                paragraph.pipeline_trace["preserved_code"] = True
                 for char in self._paragraph_source_characters(paragraph):
                     # Synthetic whitespace has no source glyph to draw.
                     if char.pdf_character_id is not None and id(char) not in page_glyph_ids:
                         page.pdf_character.append(char)
                         page_glyph_ids.add(id(char))
+                        char_count += 1
+            if members:
+                preserved_records.append(
+                    {
+                        "page": page.page_number,
+                        "kind": "code_or_algorithm",
+                        "region_id": region_id,
+                        "paragraph_count": len(members),
+                        "char_count": char_count,
+                    }
+                )
+
+        for ridx, region in enumerate(page.page_layout or []):
+            box = region.box
+            cname = (region.class_name or "").lower()
+            if not box or cname not in container_classes:
+                continue
+            members = [
+                paragraph
+                for paragraph in paragraphs
+                if id(paragraph) not in preserved_ids
+                and paragraph.box is not None
+                and (box.x - 2 <= paragraph.box.x <= paragraph.box.x2 <= box.x2 + 2)
+                and (box.y - 2 <= paragraph.box.y <= paragraph.box.y2 <= box.y2 + 2)
+            ]
+            is_code, body_members, captions = classify_pseudocode_region_paragraphs(
+                cname, box, members, get_char_unicode_string
+            )
+            if not is_code:
+                continue
+            for cap in captions:
+                cap.layout_label = "algorithm_caption"
+                if cap.pipeline_trace is None:
+                    cap.pipeline_trace = {}
+                cap.pipeline_trace["preserve_mode"] = "caption_translatable"
+            _preserve_members(f"layout_{ridx}", body_members)
+
+        # Fallback: cluster unenclosed contiguous multi-line code paragraphs if any remain
+        remaining_paras = [p for p in paragraphs if id(p) not in preserved_ids and p.box is not None]
+        if len(remaining_paras) >= 2:
+            remaining_paras.sort(key=lambda p: (-p.box.y2, p.box.x))
+            clusters: list[list[PdfParagraph]] = []
+            for p in remaining_paras:
+                if (p.layout_label or "").lower() in {"table_cell", "wired_table_cell", "wireless_table_cell", "footnote", "figure_caption", "table_caption"}:
+                    continue
+                if not clusters:
+                    clusters.append([p])
+                    continue
+                last = clusters[-1][-1]
+                v_gap = last.box.y - p.box.y2
+                h_ov = max(0.0, min(last.box.x2, p.box.x2) - max(last.box.x, p.box.x))
+                if -2.0 <= v_gap <= 14.0 and (h_ov > 0 or abs(p.box.x - last.box.x) <= 40.0):
+                    clusters[-1].append(p)
+                else:
+                    clusters.append([p])
+
+            for cidx, cluster in enumerate(clusters):
+                if len(cluster) < 2:
+                    continue
+                cbox = Box(
+                    min(p.box.x for p in cluster),
+                    min(p.box.y for p in cluster),
+                    max(p.box.x2 for p in cluster),
+                    max(p.box.y2 for p in cluster),
+                )
+                is_code, body_members, captions = classify_pseudocode_region_paragraphs(
+                    "plain text", cbox, cluster, get_char_unicode_string
+                )
+                if is_code:
+                    for cap in captions:
+                        cap.layout_label = "algorithm_caption"
+                    _preserve_members(f"cluster_{cidx}", body_members)
+
         if preserved_ids:
             paragraphs[:] = [p for p in paragraphs if id(p) not in preserved_ids]
+
+        shared = getattr(
+            getattr(self, "translation_config", None),
+            "shared_context_cross_split_part",
+            None,
+        )
+        ledger = getattr(shared, "content_ledger", None) if shared is not None else None
+        if ledger is not None and preserved_records and hasattr(ledger, "record_preserved_regions"):
+            ledger.record_preserved_regions(preserved_records)
 
     @staticmethod
     def _cluster_coordinates(values: list[float], tolerance: float = 2.0) -> list[float]:
@@ -1305,6 +1375,33 @@ class ParagraphFinder:
                     paragraph.box = destination_box
                     paragraphs.append(paragraph)
 
+        # Build canonical semantic table models (table_id, cell_id, row/col,
+        # spans, header links, protected numeric tags, and coherence validation)
+        # across all wired, booktabs, and wireless tables on the page.
+        tables = annotate_page_semantic_tables(page, paragraphs)
+        shared = getattr(
+            getattr(self, "translation_config", None),
+            "shared_context_cross_split_part",
+            None,
+        )
+        ledger = getattr(shared, "content_ledger", None) if shared is not None else None
+        if ledger is not None and tables:
+            if hasattr(ledger, "record_tables"):
+                ledger.record_tables([t.to_summary_dict() for t in tables])
+            if hasattr(ledger, "record_layout_issue"):
+                for table in tables:
+                    if not table.is_coherent:
+                        ledger.record_layout_issue(
+                            page=page.page_number,
+                            kind="irregular_table_preserved",
+                            detail=(
+                                f"Table {table.table_id} has irregular geometry "
+                                f"({', '.join(table.validation_issues)}); preserving layout safely"
+                            ),
+                            debug_id=table.table_id,
+                            severity="warning",
+                        )
+
     def _refine_grouped_table_cells(
         self,
         cell_rows: list[list[Box]],
@@ -1466,6 +1563,7 @@ class ParagraphFinder:
         self,
         paragraphs: list[PdfParagraph],
         font_dict: dict | None = None,
+        page: Page | None = None,
     ):
         """
         Merge paragraphs that were severed mid-word (hyphenated line breaks) or
@@ -1518,6 +1616,9 @@ class ParagraphFinder:
             box_a = a.box
             box_b = b.box
             if not box_a or not box_b:
+                i += 1
+                continue
+            if not can_merge_paragraphs(a, b, page=page):
                 i += 1
                 continue
 
@@ -2392,7 +2493,7 @@ class ParagraphFinder:
                 paragraph.layout_label = "heading"
 
     def merge_same_line_sentence_fragments(
-        self, paragraphs: list[PdfParagraph]
+        self, paragraphs: list[PdfParagraph], page: Page | None = None
     ) -> None:
         """Join adjacent source runs that form one visual sentence line.
 
@@ -2457,6 +2558,8 @@ class ParagraphFinder:
                     continue
                 for right in candidates[left_index + 1 :]:
                     if left.xobj_id != right.xobj_id:
+                        continue
+                    if not can_merge_paragraphs(left, right, page=page):
                         continue
                     right_box = leading_line_box(right)
                     right_text = " ".join((right.unicode or "").split())
@@ -2820,7 +2923,9 @@ class ParagraphFinder:
                 previous = candidate
 
     @staticmethod
-    def merge_detached_leading_word_fragments(paragraphs: list[PdfParagraph]) -> None:
+    def merge_detached_leading_word_fragments(
+        paragraphs: list[PdfParagraph], page: Page | None = None
+    ) -> None:
         """Join an extraction-created first word with its same-line prose.
 
         This is geometric and role-aware rather than language-specific, so it
@@ -2842,6 +2947,8 @@ class ParagraphFinder:
             merged = False
             for candidate in paragraphs[index + 1:index + 5]:
                 if not candidate.box or getattr(candidate, "xobj_id", None) != getattr(lead, "xobj_id", None):
+                    continue
+                if not can_merge_paragraphs(lead, candidate, page=page):
                     continue
                 candidate_text = " ".join((candidate.unicode or "").split())
                 lead_height = max(1.0, lead.box.y2 - lead.box.y)
