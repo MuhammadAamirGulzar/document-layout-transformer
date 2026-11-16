@@ -468,6 +468,14 @@ def apply_post_glossary(
             domain == "policy_un"
             or re.search(r'\b(?:children|groups|situations?|families|communities|populations?|people)\b', src_lower)
         ):
+            # Arabic contracts the preposition ``لـ`` with the definite article:
+            # ``لـ + الفئات`` becomes ``للفئات``.  Handle that common form before
+            # the generic optional-prefix rules below.
+            text = re.sub(
+                r'(?<![\u0621-\u064A])للفئات\s+الضعيفة\b',
+                'للفئات الأكثر هشاشة',
+                text,
+            )
             text = re.sub(_B + r'(?:الأوضاع|أوضاع)\s+الضعيفة\b', r'\1الأوضاع الهشّة', text)
             text = re.sub(_B + r'الفئات\s+الضعيفة\b', r'\1الفئات الأكثر هشاشة', text)
             text = re.sub(_B + r'الأطفال\s+الضعفاء\b', r'\1الأطفال الأكثر هشاشة', text)

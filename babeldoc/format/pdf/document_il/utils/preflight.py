@@ -336,9 +336,39 @@ def audit_output_pdf(
                         comps = getattr(para, "pdf_paragraph_composition", None) or []
                         cxs = []
                         for c in comps:
-                            bx = c.pdf_character.box if c.pdf_character and c.pdf_character.box else (c.pdf_formula.box if c.pdf_formula else None)
-                            if bx:
-                                cxs.append((bx.x, bx.x2))
+                            boxes = []
+                            if c.pdf_character and c.pdf_character.box:
+                                boxes.append(c.pdf_character.box)
+                            if c.pdf_line:
+                                boxes.extend(
+                                    ch.box
+                                    for ch in (c.pdf_line.pdf_character or [])
+                                    if ch.box
+                                )
+                            if c.pdf_formula:
+                                formula_chars = [
+                                    ch.box
+                                    for ch in (c.pdf_formula.pdf_character or [])
+                                    if ch.box
+                                ]
+                                boxes.extend(
+                                    formula_chars
+                                    or ([c.pdf_formula.box] if c.pdf_formula.box else [])
+                                )
+                            if c.pdf_same_style_characters:
+                                boxes.extend(
+                                    ch.box
+                                    for ch in (
+                                        c.pdf_same_style_characters.pdf_character or []
+                                    )
+                                    if ch.box
+                                )
+                            if (
+                                c.pdf_same_style_unicode_characters
+                                and c.pdf_same_style_unicode_characters.box
+                            ):
+                                boxes.append(c.pdf_same_style_unicode_characters.box)
+                            cxs.extend((bx.x, bx.x2) for bx in boxes)
                         if cxs:
                             gx0 = min(x[0] for x in cxs)
                             gx2 = max(x[1] for x in cxs)
