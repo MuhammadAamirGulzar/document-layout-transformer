@@ -815,6 +815,8 @@ def do_translate(
                         None,
                     ),
                     ledger=ledger,
+                    source_pdf_path=getattr(translation_config, "input_file", None),
+                    il_document=locals().get("docs"),
                 )
             except Exception as e:
                 logger.warning(f"Failed to audit output PDF: {e}")

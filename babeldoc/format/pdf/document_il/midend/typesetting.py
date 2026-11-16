@@ -1723,7 +1723,8 @@ class Typesetting:
             relief_floor = 0.70
         elif "table" in layout_label:
             min_scale = 0.65
-            relief_floor = 0.58
+            box_w = (box.x2 - box.x) if box is not None else 200.0
+            relief_floor = 0.45 if ("table_cell" in layout_label and box_w < 160.0) else 0.52
         else:
             # Text is expanded/reflowed before reaching this relief floor.
             # A readable body should never become a microscopic last resort.
@@ -2904,6 +2905,17 @@ class Typesetting:
                     min_width = max(1.0, min(first_box.x2 - first_box.x, second_box.x2 - second_box.x))
                     if horizontal_overlap < min_width * 0.25 or vertical_overlap <= 0.25:
                         continue
+                    # Sibling cells in the same table row stay horizontally aligned; never push one below the other.
+                    if self._is_table_cell(first, page) and self._is_table_cell(second, page):
+                        t1 = (first.pipeline_trace or {}).get("table_id")
+                        t2 = (second.pipeline_trace or {}).get("table_id")
+                        l1 = source_lanes.get(id(first))
+                        l2 = source_lanes.get(id(second))
+                        same_src_row = bool(
+                            l1 and l2 and (min(l1[1], l2[1]) - max(l1[0], l2[0])) > 0.30 * max(1.0, min(l1[1] - l1[0], l2[1] - l2[0]))
+                        )
+                        if (t1 == t2 or not (t1 and t2)) and same_src_row:
+                            continue
 
                     first_fixed_bottom = self._is_bottom_fixed_paragraph(first, page)
                     second_fixed_bottom = self._is_bottom_fixed_paragraph(second, page)
@@ -2976,6 +2988,49 @@ class Typesetting:
             if not changed:
                 break
 
+        # Also enforce clearance against fixed/wired tables (which are excluded from mutable pairs).
+        fixed_by_table: dict[str, list[il_version_1.PdfParagraph]] = {}
+        for p in page.pdf_paragraph or []:
+            if p.box is not None and self._is_fixed_table_paragraph(p) and self._rendered_text_box(p) is not None:
+                tid = str((p.pipeline_trace or {}).get("table_id") or f"_fixed_{id(p)}")
+                fixed_by_table.setdefault(tid, []).append(p)
+        if fixed_by_table:
+            for tid, fcells in fixed_by_table.items():
+                frboxes = [b for c in fcells if (b := self._rendered_text_box(c)) is not None]
+                if not frboxes:
+                    continue
+                t_x0 = min(b.x for b in frboxes)
+                t_y0 = min(b.y for b in frboxes)
+                t_x2 = max(b.x2 for b in frboxes)
+                t_y2 = max(b.y2 for b in frboxes)
+                for para in paragraphs:
+                    if self._is_table_cell(para, page) or self._is_bottom_fixed_paragraph(para, page) or self._is_top_band_header(para, page):
+                        continue
+                    pr = self._rendered_text_box(para)
+                    if pr is None:
+                        continue
+                    h_ov = max(0.0, min(pr.x2, t_x2) - max(pr.x, t_x0))
+                    v_ov = max(0.0, min(pr.y2, t_y2) - max(pr.y, t_y0))
+                    min_w = max(1.0, min(pr.x2 - pr.x, t_x2 - t_x0))
+                    if h_ov < min_w * 0.20 or v_ov <= 0.5:
+                        continue
+                    src_y2 = para.box.y2 if para.box and para.box.y2 is not None else pr.y2
+                    if src_y2 <= t_y2 + 2.0:
+                        shift = max(0.0, pr.y2 - (t_y0 - 4.0))
+                        if shift > 0.25:
+                            self._shift_rendered_paragraph_vertically(para, shift)
+                            trace = self._ensure_pipeline_trace(para)
+                            trace["collision_shifted"] = True
+                            moved += 1
+                            after = self._rendered_text_box(para)
+                            if after is not None and after.y < zones["body_floor"] - 1.0:
+                                trace["page_overflow"] = True
+                                trace["body_floor"] = zones["body_floor"]
+                    else:
+                        trace = self._ensure_pipeline_trace(para)
+                        trace["page_overflow"] = True
+                        trace["overflow_reason"] = "body_fixed_table_collision"
+
         self._rendered_collision_resolved_pages.add(page_key)
         if moved:
             logger.warning(
@@ -2998,10 +3053,12 @@ class Typesetting:
             tid = str(trace.get("table_id") or "_default_table")
             by_table.setdefault(tid, []).append(cell)
 
-        table_extents: list[tuple[float, float, float, float]] = []
-        for cells in by_table.values():
+        table_extents: list[tuple[str, float, float, float, float, float]] = []
+        table_groups: list[tuple[str, list[il_version_1.PdfParagraph], float, float, float, float, float]] = []
+        for tid, cells in by_table.items():
             orig_sboxes = [c.box for c in cells if c.box is not None]
             orig_src_bottom = min((b.y for b in orig_sboxes), default=None)
+            orig_src_top = max((b.y2 for b in orig_sboxes), default=None)
             is_fixed_or_irregular = any(
                 "fixed_rtl" in (c.layout_label or "").lower()
                 or (c.pipeline_trace or {}).get("preserve_irregular_table")
@@ -3048,16 +3105,51 @@ class Typesetting:
 
             rboxes = [b for c in cells if (b := self._rendered_text_box(c)) is not None]
             sboxes = [c.box for c in cells if c.box is not None]
-            if rboxes and sboxes and orig_src_bottom is not None:
-                table_extents.append((
-                    min(min(b.x for b in rboxes), min(b.x for b in sboxes)),
-                    min(b.y for b in rboxes),
-                    max(max(b.x2 for b in rboxes), max(b.x2 for b in sboxes)),
-                    orig_src_bottom,
-                ))
+            if rboxes and sboxes and orig_src_bottom is not None and orig_src_top is not None:
+                tx0 = min(min(b.x for b in rboxes), min(b.x for b in sboxes))
+                r_bottom = min(b.y for b in rboxes)
+                tx2 = max(max(b.x2 for b in rboxes), max(b.x2 for b in sboxes))
+                r_top = max(b.y2 for b in rboxes)
+                table_groups.append((tid, cells, tx0, r_bottom, tx2, orig_src_bottom, r_top, orig_src_top))
 
-        if not table_extents:
+        if not table_groups:
             return
+
+        # Separate stacked tables when an upper table expands vertically into a lower table.
+        table_groups.sort(key=lambda item: -item[7])
+        moved_body = False
+        for i in range(len(table_groups) - 1):
+            _, _, x0_a, bot_a, x2_a, _, _, _ = table_groups[i]
+            for j in range(i + 1, len(table_groups)):
+                tid_b, cells_b, x0_b, bot_b, x2_b, src_bot_b, top_b, src_top_b = table_groups[j]
+                h_ov = max(0.0, min(x2_a, x2_b) - max(x0_a, x0_b))
+                min_w = max(1.0, min(x2_a - x0_a, x2_b - x0_b))
+                if h_ov < min_w * 0.20:
+                    continue
+                if top_b > bot_a - 5.0:
+                    dy = top_b - (bot_a - 5.0)
+                    if dy > 0.25:
+                        for c in cells_b:
+                            self._shift_rendered_paragraph_vertically(c, dy)
+                            tr = self._ensure_pipeline_trace(c)
+                            tr["table_row_shifted"] = True
+                            cb = self._rendered_text_box(c)
+                            if cb is not None and cb.y < zones["body_floor"] - 1.0:
+                                tr["page_overflow"] = True
+                                tr["body_floor"] = zones["body_floor"]
+                        # Shift table-local drawn grid shapes with the table cells.
+                        for shape in list(getattr(page, "pdf_curve", None) or []) + list(getattr(page, "pdf_rectangle", None) or []):
+                            sb = getattr(shape, "box", None)
+                            if sb and sb.x >= x0_b - 4.0 and sb.x2 <= x2_b + 4.0 and sb.y >= src_bot_b - 4.0 and sb.y2 <= src_top_b + 4.0:
+                                sb.y -= dy
+                                sb.y2 -= dy
+                        table_groups[j] = (tid_b, cells_b, x0_b, bot_b - dy, x2_b, src_bot_b - dy, top_b - dy, src_top_b - dy)
+                        moved_body = True
+
+        table_extents = [
+            (item[2], item[3], item[4], item[5], item[6], item[7])
+            for item in table_groups
+        ]
 
         body_paras = [
             p for p in page.pdf_paragraph or []
@@ -3065,20 +3157,32 @@ class Typesetting:
             and not self._is_bottom_fixed_paragraph(p, page)
             and not self._is_top_band_header(p, page)
             and p.box is not None
-            and not self._is_inside_table_or_figure_region(p.box, page, figures_only=True)
+            and (
+                "caption" in (p.layout_label or "").lower()
+                or not self._is_inside_table_or_figure_region(p.box, page, figures_only=True)
+            )
         ]
         body_paras.sort(key=lambda p: -(p.box.y2 if p.box and p.box.y2 is not None else 0.0))
-        moved_body = False
-        for tx0, r_bottom, tx2, src_bottom in table_extents:
+        for tx0, r_bottom, tx2, src_bottom, r_top, src_top in table_extents:
             for para in body_paras:
-                if para.box.y2 > src_bottom + 2.0:
-                    continue
                 p_rbox = self._rendered_text_box(para)
                 if p_rbox is None:
                     continue
                 h_ov = max(0.0, min(p_rbox.x2, tx2) - max(p_rbox.x, tx0))
                 min_w = max(1.0, min(p_rbox.x2 - p_rbox.x, tx2 - tx0))
                 if h_ov < min_w * 0.20:
+                    continue
+                if para.box.y >= src_top - 4.0:
+                    # Paragraph starts above table: push down if its wrapped tail crosses table top -> flag overflow if needed.
+                    if p_rbox.y < r_top + 3.0 and p_rbox.y2 > r_bottom:
+                        overlap_up = (r_top + 4.0) - p_rbox.y
+                        if overlap_up > 0.25:
+                            # Shift this body paragraph slightly above? Wait: only shift table down when possible without off-page, else mark overflow.
+                            tr = self._ensure_pipeline_trace(para)
+                            tr["page_overflow"] = True
+                            tr["overflow_reason"] = "body_table_top_collision"
+                    continue
+                if para.box.y2 > src_bottom + 4.0:
                     continue
                 if p_rbox.y2 > r_bottom - 4.0:
                     dy = p_rbox.y2 - (r_bottom - 4.0)
@@ -4617,7 +4721,8 @@ class Typesetting:
             id(p): self._rendered_text_box(p) for p in table_cells
         }
 
-        # 1. Check fixed/wired cells against their own physical slot boundaries
+        # 1. Check fixed/wired cells against their own physical slot boundaries;
+        # compact horizontally overflowing single-cell glyphs safely down to a bounded floor first.
         for cell in table_cells:
             trace = cell.pipeline_trace or {}
             if trace.get("preserve_irregular_table"):
@@ -4626,7 +4731,28 @@ class Typesetting:
             if rbox is None or cell.box is None:
                 continue
             is_fixed_slot = "fixed" in (cell.layout_label or "").lower()
-            if is_fixed_slot and (
+            if is_fixed_slot and (rbox.x < cell.box.x - 1.5 or rbox.x2 > cell.box.x2 + 1.5):
+                avail_w = max(4.0, (cell.box.x2 - cell.box.x) - 2.0)
+                curr_w = max(1.0, rbox.x2 - rbox.x)
+                ratio = avail_w / curr_w
+                if 0.45 <= ratio < 0.99:
+                    anchor_x = cell.box.x2 - 1.0 if self._is_arabic_output() else cell.box.x + 1.0
+                    for comp in cell.pdf_paragraph_composition or []:
+                        if comp.pdf_character:
+                            ch = comp.pdf_character
+                            if ch.box:
+                                ch.box.x = anchor_x + (ch.box.x - rbox.x2 if self._is_arabic_output() else ch.box.x - rbox.x) * ratio
+                                ch.box.x2 = anchor_x + (ch.box.x2 - rbox.x2 if self._is_arabic_output() else ch.box.x2 - rbox.x) * ratio
+                            if ch.visual_bbox and ch.visual_bbox.box:
+                                ch.visual_bbox.box.x = ch.box.x
+                                ch.visual_bbox.box.x2 = ch.box.x2
+                            if ch.pdf_style and ch.pdf_style.font_size:
+                                ch.pdf_style.font_size = round(ch.pdf_style.font_size * max(0.72, ratio), 2)
+                            if getattr(ch, "advance", None):
+                                ch.advance *= ratio
+                    rbox = self._rendered_text_box(cell)
+                    rendered_map[id(cell)] = rbox
+            if is_fixed_slot and rbox is not None and (
                 rbox.x < cell.box.x - 4.0
                 or rbox.x2 > cell.box.x2 + 4.0
                 or rbox.y < cell.box.y - 4.0
@@ -4748,6 +4874,27 @@ class Typesetting:
 
         self._rtl_mirrored_table_pages.add(id(page))
 
+    @staticmethod
+    def _has_vertical_divider_between(
+        left: il_version_1.PdfParagraph,
+        right: il_version_1.PdfParagraph,
+        page: il_version_1.Page,
+    ) -> bool:
+        """Return True if a drawn vertical rule separates adjacent table cells."""
+        if not left.box or not right.box:
+            return False
+        mid_x0 = min(left.box.x2, right.box.x) - 2.0
+        mid_x1 = max(left.box.x2, right.box.x) + 2.0
+        row_y0 = min(left.box.y, right.box.y)
+        row_y1 = max(left.box.y2, right.box.y2)
+        for curve in getattr(page, "pdf_curve", None) or []:
+            cb = getattr(curve, "box", None)
+            if cb and (cb.x2 - cb.x) <= 3.0 and (cb.y2 - cb.y) >= 8.0:
+                if mid_x0 <= (cb.x + cb.x2) * 0.5 <= mid_x1:
+                    if min(cb.y2, row_y1) - max(cb.y, row_y0) >= 0.4 * (row_y1 - row_y0):
+                        return True
+        return False
+
     def _balance_table_row_widths(self, page: il_version_1.Page, fonts: dict):
         """Redistribute unused horizontal space from sibling columns in the same row to overflowing cells."""
         rows = self._cluster_table_cells_into_rows(page)
@@ -4774,6 +4921,8 @@ class Typesetting:
                 ):
                     continue
                 if trace_left.get("col_span", 1) > 1 or trace_right.get("col_span", 1) > 1:
+                    continue
+                if self._has_vertical_divider_between(cell_left, cell_right, page):
                     continue
 
                 units_left = self.create_typesetting_units(cell_left, fonts)
