@@ -135,19 +135,19 @@ def test_failed_retry_retains_scientific_value_and_skips_cache(monkeypatch, fact
     cache.set.assert_not_called()
 
 
-def test_nllb_3_3b_flags_incomplete_and_skips_cache_when_number_dropped(monkeypatch):
+def test_nllb_3_3b_retries_and_restores_number_when_dropped(monkeypatch):
     cache = _patch_cache_and_limiter(monkeypatch)
     engine = tm.NLLBTranslator("en", "ar", model_name="nllb-3.3b")
     monkeypatch.setattr(engine, "do_translate", Mock(return_value="انخفضت النسبة في 2025."))
-    retry = Mock()
+    retry = Mock(return_value="انخفضت النسبة 25 في 2025.")
     monkeypatch.setattr(engine, "_generate_translation", retry)
 
     result = engine.translate("Rate fell 25 in 2025.")
 
-    assert result == "انخفضت النسبة في 2025."
-    retry.assert_not_called()
-    assert engine.incomplete_count == 1
-    cache.set.assert_not_called()
+    assert result == "انخفضت النسبة 25 في 2025."
+    retry.assert_called_once()
+    assert engine.incomplete_count == 0
+    cache.set.assert_called_once()
 
 
 @pytest.mark.parametrize(

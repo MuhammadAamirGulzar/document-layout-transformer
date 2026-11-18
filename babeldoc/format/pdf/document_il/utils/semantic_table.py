@@ -385,6 +385,10 @@ def build_semantic_table(
     para_cell_map: dict[int, SemanticTableCell] = {}
     used_cell_ids: set[str] = set()
 
+    anchored_numeric = any(
+        item.paragraph is None and classify_table_cell_value(item.text)[0] == "numeric"
+        for item in items
+    )
     for item, r0, c0, r_span, c_span in prelim:
         base_id = f"{table_id}:r{r0}c{c0}"
         cell_id = base_id
@@ -462,6 +466,17 @@ def build_semantic_table(
         trace["is_header"] = sem_cell.is_header
         trace["header_cell_ids"] = list(sem_cell.header_cell_ids)
         trace["table_coherent"] = is_coherent
+        if anchored_numeric:
+            trace["anchored_numeric_columns"] = True
+            # Recover usable whitespace to the right of text in a booktabs
+            # column. A midpoint in a genuine gutter cannot consume a value
+            # in the next column. Preserve explicit ruled slots verbatim.
+            right_col = sem_cell.col_index + sem_cell.col_span - 1
+            if is_coherent and layout_kind not in {"wired", "grouped"} and right_col + 1 < len(col_bands):
+                current_edge = col_bands[right_col][1]
+                next_edge = col_bands[right_col + 1][0]
+                if next_edge - current_edge > 3.0:
+                    trace["anchored_column_right"] = (current_edge + next_edge) / 2.0 - 1.0
         if not is_coherent:
             trace["preserve_irregular_table"] = True
 

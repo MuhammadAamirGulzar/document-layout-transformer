@@ -178,10 +178,6 @@ class ILTranslatorLLMOnly:
         # 3. Compound alphanumeric tokens: preserve Q4-2022 as an atomic token
         text = re.sub(r'\bQ\s*([1-4])\s*[-–—]\s*(\d{4})\b', r'Q\1-\2', text)
 
-        # 4. Table header YoY phonetic translation fix (يـو يـو / يـا هـو -> Y-o-Y)
-        text = re.sub(r'(?:ﻳـﻮ|يـو|يو)\s*[-_–—ـ]*\s*(?:ﻳـﻮ|يـو|يو)', 'Y-o-Y', text)
-        text = re.sub(r'(?:ﻳـﺎ|يـا|يا)\s*[-_–—ـ]*\s*(?:ﻫـﻮ|هـو|هو)', 'Y-o-Y', text)
-
         # 5. Petroleum terminology: standardize oil/non-oil sector labels
         text = re.sub(r'\bغير\s+الزيت\b', 'غير النفط', text)
         text = re.sub(r'\bالزيت\s+غير\b', 'غير النفط', text)
@@ -994,10 +990,14 @@ class ILTranslatorLLMOnly:
                         lang_out = (self.translation_config.lang_out or "").lower()
                         logger.info(f"Output language configured as: '{lang_out}'")
 
-                        # Apply Arabic shaping (reshape for glyph joining, no bidi reorder)
-                        translated_text = self.shape_arabic_text(translated_text)
                         # Apply Arabic post-translation normalization (percent signs, Latin spacing)
-                        translated_text = self._normalize_arabic_output(translated_text)
+                        if lang_out.rsplit("-", 1)[-1] in {"ar", "ara", "arabic"}:
+                            translated_text = il_translator.normalize_year_over_year(inputs[id_][0], translated_text)
+                            translated_text = self.il_translator._normalize_arabic_output(translated_text)
+                        else:
+                            translated_text = self._normalize_arabic_output(translated_text)
+                        # Shape glyphs after normalization, leaving visual ordering to typesetting.
+                        translated_text = self.shape_arabic_text(translated_text)
 
                         logger.info(f"Final Translated paragraph: {translated_text}")
 

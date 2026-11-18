@@ -55,6 +55,21 @@ def test_vertical_character_keeps_visual_y_bounds():
     assert finder._get_effective_y_bounds(char) == (2, 14)
 
 
+def test_overlapping_font_boxes_do_not_interleave_distinct_prose_baselines():
+    upper = [glyph(ch, i * 5, 10) for i, ch in enumerate("Reaction occurs")]
+    lower = [glyph(ch, i * 5, 0) for i, ch in enumerate("Calcium ions form")]
+    chars = sorted(upper + lower, key=lambda ch: ch.box.x)
+    paragraph = PdfParagraph(pdf_paragraph_composition=[
+        PdfParagraphComposition(pdf_character=char) for char in chars
+    ])
+    finder = object.__new__(ParagraphFinder)
+    finder._split_paragraph_into_lines(paragraph, set())
+    assert [
+        "".join(ch.char_unicode for ch in comp.pdf_line.pdf_character)
+        for comp in paragraph.pdf_paragraph_composition
+    ] == ["Reaction occurs", "Calcium ions form"]
+
+
 def test_row_split_keeps_subscript_and_superscript_with_their_own_rows():
     def bounded_glyph(text, x, source_y, visual_y):
         return PdfCharacter(

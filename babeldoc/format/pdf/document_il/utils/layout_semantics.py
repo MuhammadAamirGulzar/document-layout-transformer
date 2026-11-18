@@ -25,9 +25,18 @@ _CODE_DEF_OR_BLOCK_RE = re.compile(
     r"#include\s*[<\"])"
 )
 _SQL_CLAUSE_RE = re.compile(
-    r"\b(?:SELECT\s+.+?\s+FROM\s+[A-Za-z_][\w.]*|FROM\s+[A-Za-z_][\w.]*|WHERE\s+[A-Za-z_][\w.]*\s*(?:=|!=|<>|<|>|\bIN\b|\bLIKE\b|\bIS\b)|"
-    r"(?:INNER|LEFT|RIGHT)?\s*JOIN\s+[A-Za-z_][\w.]*\s+ON\b|GROUP\s+BY\s+[A-Za-z_]|ORDER\s+BY\s+[A-Za-z_]|"
-    r"INSERT\s+INTO\s+[A-Za-z_]|CREATE\s+TABLE\s+[A-Za-z_]|ALTER\s+TABLE\s+[A-Za-z_])\b",
+    r"\b(?:"
+    r"SELECT\s+(?:\*|[A-Za-z_][\w.,*\s()]{0,60})\s+FROM\s+(?!(?:the|a|an|all|any|this|that|their|its|our|your|each|more|most|other|some)\b)[A-Za-z_][\w.]*"
+    r"|DELETE\s+FROM\s+[A-Za-z_][\w.]*"
+    r"|WHERE\s+[A-Za-z_][\w.]*\s*(?:=|!=|<>|<|>|\bIN\s*\(|\bLIKE\b|\bIS\s+(?:NOT\s+)?NULL\b)"
+    r"|(?:INNER|LEFT|RIGHT|FULL)\s+JOIN\s+[A-Za-z_][\w.]*\s+ON\b"
+    r"|\bJOIN\s+[A-Za-z_][\w.]*\s+ON\s+[A-Za-z_][\w.]*\s*="
+    r"|GROUP\s+BY\s+[A-Za-z_][\w.]*(?:\s*,|\s+HAVING|\s+ORDER|\s*;|\s*$)"
+    r"|ORDER\s+BY\s+[A-Za-z_][\w.]*(?:\s+(?:ASC|DESC)\b|\s*,|\s*;|\s*$)"
+    r"|INSERT\s+INTO\s+[A-Za-z_][\w.]*"
+    r"|CREATE\s+TABLE\s+[A-Za-z_][\w.]*"
+    r"|ALTER\s+TABLE\s+[A-Za-z_][\w.]*"
+    r")",
     re.IGNORECASE,
 )
 _JSON_KEY_RE = re.compile(r'^\s*"[^"\n]{1,64}"\s*:\s*\S?')
@@ -683,3 +692,287 @@ def compute_page_reading_order(
         "total_paragraphs": len(final_paragraphs),
         "columns_detected": max_cols,
     }
+
+
+_FORM_CONTROL_MARKER_RE = re.compile(
+    r"^(?:[\u2610\u2611\u2612\u25a0\u25a1\u25fb-\u25fe\u25cb\u25cf\u25ef\u2713\u2714]|\[[\sxX\u2713\u2714]?\]|\([\sxXoO\u25cf\u25cb\u2022]?\))$"
+)
+
+
+def _valid_drawn_boxes(page: il_version_1.Page) -> list[il_version_1.Box]:
+    crop = page.cropbox.box if getattr(page, "cropbox", None) and page.cropbox.box else None
+    page_w = max(1.0, crop.x2 - crop.x) if crop else 595.0
+    page_h = max(1.0, crop.y2 - crop.y) if crop else 842.0
+    boxes: list[il_version_1.Box] = []
+    for item in list(getattr(page, "pdf_rectangle", None) or []) + list(getattr(page, "pdf_curve", None) or []):
+        b = getattr(item, "box", None)
+        if b is None:
+            continue
+        bw = b.x2 - b.x
+        bh = b.y2 - b.y
+        if bw < 8.0 or bh < 8.0:
+            continue
+        if bw > page_w * 0.88 or (bw > page_w * 0.85 and bh > page_h * 0.85):
+            continue
+        boxes.append(b)
+    return boxes
+
+
+def assign_page_region_groups(page: il_version_1.Page) -> dict[str, dict[str, Any]]:
+    """Assign shared semantic ``region_group_id``, bounds, pairs, and column lanes on *page*."""
+    paragraphs = [p for p in (getattr(page, "pdf_paragraph", None) or []) if _paragraph_box_valid(p)]
+    if not paragraphs:
+        return {}
+
+    drawn_boxes = _valid_drawn_boxes(page)
+    layouts = list(getattr(page, "page_layout", None) or [])
+    fig_layouts = [
+        (idx, l.box)
+        for idx, l in enumerate(layouts)
+        if getattr(l, "box", None)
+        and (getattr(l, "class_name", "") or "").lower() in {"figure", "chart", "graph", "diagram", "image"}
+    ]
+
+    groups: dict[str, dict[str, Any]] = {}
+    for p in paragraphs:
+        if p.pipeline_trace is None:
+            p.pipeline_trace = {}
+        trace = p.pipeline_trace
+        lbl = (p.layout_label or "").lower()
+
+        # 1. Table region
+        tid = trace.get("table_id")
+        if tid or "table_cell" in lbl or "table_footnote" in lbl or "table_caption" in lbl:
+            gid = f"table:{tid}" if tid else "table:default"
+            trace["region_group_id"] = gid
+            trace["region_type"] = "table"
+            groups.setdefault(gid, {"region_type": "table", "members": []})["members"].append(p)
+            continue
+
+        # 2. Figure / diagram layout region + tight enclosing sub-box
+        matched_fig = next(
+            ((idx, fb) for idx, fb in fig_layouts if _box_center_inside(p.box, fb)),
+            None,
+        )
+        if matched_fig is None and "caption" in lbl:
+            # Attach caption cleanly to nearest figure above/below horizontally overlapping it
+            for idx, fb in fig_layouts:
+                h_ov = _overlap_1d(p.box.x, p.box.x2, fb.x, fb.x2)
+                if h_ov >= 0.30 * min(p.box.x2 - p.box.x, fb.x2 - fb.x):
+                    v_gap = min(abs(fb.y - p.box.y2), abs(p.box.y - fb.y2))
+                    if v_gap <= 32.0:
+                        matched_fig = (idx, fb)
+                        break
+        if matched_fig is not None:
+            fidx, fbox = matched_fig
+            gid = f"figure:{fidx}"
+            enclosing_drawn = [
+                db for db in drawn_boxes
+                if _box_center_inside(p.box, db, tol=1.5)
+                and (db.x2 - db.x) >= (p.box.x2 - p.box.x) * 0.72
+                and (db.y2 - db.y) >= (p.box.y2 - p.box.y) * 0.72
+            ]
+            tight = min(enclosing_drawn, key=lambda b: (b.x2 - b.x) * (b.y2 - b.y), default=fbox)
+            trace["region_group_id"] = gid
+            trace["region_type"] = "figure"
+            if "caption" in lbl and not _box_center_inside(p.box, fbox):
+                trace["region_bounds"] = [
+                    min(fbox.x, p.box.x),
+                    min(fbox.y, p.box.y),
+                    max(fbox.x2, p.box.x2),
+                    max(fbox.y2, p.box.y2),
+                ]
+            else:
+                trace["region_bounds"] = [tight.x, tight.y, tight.x2, tight.y2]
+            groups.setdefault(gid, {"region_type": "figure", "members": [], "bounds": [fbox.x, fbox.y, fbox.x2, fbox.y2]})["members"].append(p)
+            continue
+
+        # 3. Drawn box / card / form container (unify nested cards under largest outer card box)
+        enclosing = [
+            (idx, db) for idx, db in enumerate(drawn_boxes)
+            if _box_center_inside(p.box, db, tol=1.5)
+            and (db.x2 - db.x) >= (p.box.x2 - p.box.x) * 0.72
+            and (db.y2 - db.y) >= (p.box.y2 - p.box.y) * 0.72
+        ]
+        if enclosing:
+            outer_idx, outer_box = max(enclosing, key=lambda item: (item[1].x2 - item[1].x) * (item[1].y2 - item[1].y))
+            _, tight_box = min(enclosing, key=lambda item: (item[1].x2 - item[1].x) * (item[1].y2 - item[1].y))
+            gid = f"card:{outer_idx}"
+            trace["region_group_id"] = gid
+            trace["region_type"] = "card"
+            trace["region_bounds"] = [tight_box.x, tight_box.y, tight_box.x2, tight_box.y2]
+            groups.setdefault(gid, {"region_type": "card", "members": [], "bounds": [outer_box.x, outer_box.y, outer_box.x2, outer_box.y2]})["members"].append(p)
+
+    # 4. Pair horizontally adjacent checkbox/radio/label+value fields
+    pair_seq = 0
+    for i, pa in enumerate(paragraphs):
+        ua = (pa.unicode or "").strip()
+        if not ua:
+            continue
+        is_marker_a = bool(_FORM_CONTROL_MARKER_RE.match(ua))
+        is_colon_lbl_a = ua.endswith(":") and len(ua) <= 40
+        if not (is_marker_a or is_colon_lbl_a):
+            continue
+        ha = max(1.0, pa.box.y2 - pa.box.y)
+        max_h_gap = 65.0 if is_colon_lbl_a else 28.0
+        best_b = None
+        best_gap = float("inf")
+        for j, pb in enumerate(paragraphs):
+            if i == j:
+                continue
+            hb = max(1.0, pb.box.y2 - pb.box.y)
+            v_ov = _overlap_1d(pa.box.y, pa.box.y2, pb.box.y, pb.box.y2)
+            if v_ov < 0.35 * min(ha, hb):
+                continue
+            gap = pb.box.x - pa.box.x2 if pb.box.x >= pa.box.x else pa.box.x - pb.box.x2
+            if -4.0 <= gap <= max_h_gap and gap < best_gap:
+                best_gap = gap
+                best_b = pb
+        if best_b is None and is_colon_lbl_a:
+            # Vertically stacked label-above-value pair in the same column
+            wa = max(1.0, pa.box.x2 - pa.box.x)
+            for j, pb in enumerate(paragraphs):
+                if i == j or pb.pipeline_trace.get("region_type") == "table":
+                    continue
+                wb = max(1.0, pb.box.x2 - pb.box.x)
+                h_ov = _overlap_1d(pa.box.x, pa.box.x2, pb.box.x, pb.box.x2)
+                v_gap = pa.box.y - pb.box.y2
+                if h_ov >= 0.25 * min(wa, wb) and -2.0 <= v_gap <= 16.0 and v_gap < best_gap:
+                    best_gap = v_gap
+                    best_b = pb
+        if best_b is not None:
+            pair_seq += 1
+            pid = f"pair:{pair_seq}"
+            pa.pipeline_trace["region_pair_id"] = pid
+            best_b.pipeline_trace["region_pair_id"] = pid
+            shared_gid = (
+                pa.pipeline_trace.get("region_group_id")
+                or best_b.pipeline_trace.get("region_group_id")
+                or f"form_pair:{pair_seq}"
+            )
+            pa.pipeline_trace["region_group_id"] = shared_gid
+            best_b.pipeline_trace["region_group_id"] = shared_gid
+            pa.pipeline_trace.setdefault("region_type", "form_pair")
+            best_b.pipeline_trace.setdefault("region_type", "form_pair")
+            grp = groups.setdefault(shared_gid, {"region_type": pa.pipeline_trace["region_type"], "members": []})
+            if pa not in grp["members"]:
+                grp["members"].append(pa)
+            if best_b not in grp["members"]:
+                grp["members"].append(best_b)
+
+    # 4b. Unify adjacent form_pair / invoice key-value siblings and their lead heading
+    def _is_form_or_kv_block(p: il_version_1.PdfParagraph) -> bool:
+        tr = p.pipeline_trace or {}
+        if tr.get("region_type") in {"table", "figure", "card"}:
+            return False
+        if tr.get("region_type") == "form_pair":
+            return True
+        lbl = (p.layout_label or "").lower()
+        if lbl in {"form_row", "form_field"}:
+            return True
+        if paragraph_semantic_zone(p, page) in {"table", "figure", "code", "footnote", "header", "footer"}:
+            return False
+        u = (p.unicode or "").strip()
+        if not u or len(u) > 240 or (p.box.y2 - p.box.y) > 95.0:
+            return False
+        return bool(_FORM_CONTROL_MARKER_RE.search(u)) or (":" in u and len(u.splitlines()) <= 5)
+
+    kv_candidates = [p for p in paragraphs if _is_form_or_kv_block(p)]
+    if kv_candidates:
+        # Include short headings immediately above a kv_candidate
+        kv_set = set(id(p) for p in kv_candidates)
+        for p in paragraphs:
+            if id(p) in kv_set or (p.pipeline_trace or {}).get("region_group_id"):
+                continue
+            if (p.layout_label or "").lower() == "heading" and len((p.unicode or "").strip()) <= 65:
+                for kv in list(kv_candidates):
+                    h_ov = _overlap_1d(p.box.x, p.box.x2, kv.box.x, kv.box.x2)
+                    v_gap = p.box.y - kv.box.y2
+                    if h_ov >= 0.25 * min(p.box.x2 - p.box.x, kv.box.x2 - kv.box.x) and -2.0 <= v_gap <= 20.0:
+                        kv_candidates.append(p)
+                        kv_set.add(id(p))
+                        break
+
+        if len(kv_candidates) >= 2:
+            parent = {id(p): id(p) for p in kv_candidates}
+
+            def _find(x: int) -> int:
+                while parent[x] != x:
+                    parent[x] = parent[parent[x]]
+                    x = parent[x]
+                return x
+
+            def _union(a: int, b: int) -> None:
+                ra, rb = _find(a), _find(b)
+                if ra != rb:
+                    parent[rb] = ra
+
+            # Pre-union paragraphs that already share a form_pair region_group_id
+            by_existing_gid: dict[str, list[il_version_1.PdfParagraph]] = {}
+            for p in kv_candidates:
+                egid = (p.pipeline_trace or {}).get("region_group_id")
+                if egid:
+                    by_existing_gid.setdefault(str(egid), []).append(p)
+            for mems in by_existing_gid.values():
+                for m in mems[1:]:
+                    _union(id(mems[0]), id(m))
+
+            for idx_a, pa in enumerate(kv_candidates):
+                ha = max(1.0, pa.box.y2 - pa.box.y)
+                wa = max(1.0, pa.box.x2 - pa.box.x)
+                for pb in kv_candidates[idx_a + 1:]:
+                    hb = max(1.0, pb.box.y2 - pb.box.y)
+                    wb = max(1.0, pb.box.x2 - pb.box.x)
+                    v_ov = _overlap_1d(pa.box.y, pa.box.y2, pb.box.y, pb.box.y2)
+                    h_ov = _overlap_1d(pa.box.x, pa.box.x2, pb.box.x, pb.box.x2)
+                    v_gap = max(0.0, max(pa.box.y - pb.box.y2, pb.box.y - pa.box.y2))
+                    same_band = v_ov >= 0.30 * min(ha, hb) or abs(pa.box.y2 - pb.box.y2) <= 18.0
+                    stacked = h_ov >= 0.20 * min(wa, wb) and v_gap <= 18.0
+                    if same_band or stacked:
+                        _union(id(pa), id(pb))
+
+            clusters: dict[int, list[il_version_1.PdfParagraph]] = {}
+            for p in kv_candidates:
+                clusters.setdefault(_find(id(p)), []).append(p)
+            for root_id, mems in clusters.items():
+                if len(mems) < 2:
+                    continue
+                existing_gids = [
+                    str(m.pipeline_trace["region_group_id"])
+                    for m in mems
+                    if (m.pipeline_trace or {}).get("region_group_id")
+                ]
+                shared_gid = existing_gids[0] if existing_gids else f"form_pair:cluster_{pair_seq + 1}"
+                if not existing_gids:
+                    pair_seq += 1
+                grp = groups.setdefault(shared_gid, {"region_type": "form_pair", "members": []})
+                for m in mems:
+                    m.pipeline_trace["region_group_id"] = shared_gid
+                    m.pipeline_trace.setdefault("region_type", "form_pair")
+                    if m not in grp["members"]:
+                        grp["members"].append(m)
+
+    # 5. Column lanes for unboxed body paragraphs so independent columns stay separated
+    unboxed_body = [
+        p for p in paragraphs
+        if not p.pipeline_trace.get("region_group_id")
+        and paragraph_semantic_zone(p, page) in {"body", "list", "heading"}
+    ]
+    if len(unboxed_body) >= 2:
+        by_x = sorted(unboxed_body, key=lambda p: p.box.x)
+        lanes: list[list[float | list[il_version_1.PdfParagraph]]] = []
+        for p in by_x:
+            if not lanes:
+                lanes.append([p.box.x, p.box.x2, [p]])
+            elif p.box.x - float(lanes[-1][1]) >= 16.0:
+                lanes.append([p.box.x, p.box.x2, [p]])
+            else:
+                lanes[-1][0] = min(float(lanes[-1][0]), p.box.x)
+                lanes[-1][1] = max(float(lanes[-1][1]), p.box.x2)
+                lanes[-1][2].append(p)
+        if len(lanes) >= 2 and sum(1 for _, _, mems in lanes if len(mems) >= 1) >= 2:
+            for lx0, lx1, mems in lanes:
+                for p in mems:
+                    p.pipeline_trace["column_lane"] = [float(lx0), float(lx1)]
+
+    return groups

@@ -191,3 +191,16 @@ def test_un_doc_symbol_passthrough_and_official_un_glossary():
         ["focusing on water, sanitation and hygiene (WASH) services"]
     )
     assert abbrevs.get("WASH") == "water, sanitation and hygiene"
+
+
+def test_prose_with_multiple_from_clauses_not_misclassified_as_sql():
+    from babeldoc.format.pdf.document_il.utils.layout_semantics import is_standalone_code_text
+
+    prose = (
+        "18. The conclusions of the high-level meeting include the following: the need for "
+        "country-led green transitions;\n"
+        "the need to tailor support from the United Nations system and other partners;\n"
+        "and lessons drawn from recent assessments across middle-income countries."
+    )
+    assert is_standalone_code_text(prose, "plain text") is False
+    assert is_standalone_code_text("SELECT id, name FROM accounts\nWHERE balance > 0;", "plain text") is True

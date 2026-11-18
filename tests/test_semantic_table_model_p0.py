@@ -283,8 +283,11 @@ def test_fixed_table_cell_floor_and_overflow_collision_audit():
     ts._ensure_semantic_table_models(page2)
     ts._audit_table_cells_after_render(page2)
 
-    assert (fixed_cell.pipeline_trace or {}).get("table_cell_overflow") is True
-    assert (fixed_cell.pipeline_trace or {}).get("table_cell_collision") is True
+    trace = fixed_cell.pipeline_trace or {}
+    assert trace.get("table_cell_overflow_detected") is True
+    assert trace.get("table_cell_overflow_resolved") is True
+    assert not trace.get("table_cell_overflow")
+    assert not trace.get("table_cell_collision")
     report = cfg.shared_context_cross_split_part.content_ledger.build_report()
-    assert report["status"] == "needs_review"
-    assert report["summary"]["table_cell_overflow_count"] >= 2
+    assert report["status"] == "clean"
+    assert report["summary"]["table_cell_overflow_count"] == 0

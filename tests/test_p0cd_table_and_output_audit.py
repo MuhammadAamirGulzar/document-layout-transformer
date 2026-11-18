@@ -10,6 +10,7 @@ from babeldoc.format.pdf.document_il import (
     Box,
     Cropbox,
     Page,
+    PageLayout,
     PdfCharacter,
     PdfCurve,
     PdfLine,
@@ -66,6 +67,53 @@ def _typesetter(ledger: ContentLedger | None = None) -> Typesetting:
     ts._rendered_collision_resolved_pages = set()
     ts._rtl_mirrored_table_pages = set()
     return ts
+
+
+def test_table_with_source_numeric_glyphs_keeps_labels_in_their_physical_slots():
+    ts = _typesetter()
+    labels = [
+        _rendered_para("First label", Box(45, 215, 160, 231), 45, 218, label="table_cell"),
+        _rendered_para("Second label", Box(45, 185, 165, 201), 45, 188, label="table_cell"),
+    ]
+    values = [
+        _glyph(ch, x + i * 6, y)
+        for x, y, cell in [(215, 218, "124"), (276, 218, "902"), (215, 188, "830"), (276, 188, "315")]
+        for i, ch in enumerate(cell)
+    ]
+    page = Page(
+        page_number=0,
+        cropbox=Cropbox(box=Box(0, 0, 400, 400)),
+        page_layout=[PageLayout(class_name="table", box=Box(40, 180, 315, 238))],
+        pdf_paragraph=labels,
+        pdf_character=values,
+    )
+
+    ts._mirror_table_grids_for_rtl(page)
+    ts._balance_table_row_widths(page, {})
+    ts._synchronize_table_row_heights(page)
+
+    assert [label.box.x for label in labels] == [45, 45]
+    assert all(label.pipeline_trace["anchored_numeric_columns"] for label in labels)
+    assert all(label.box.x2 < min(char.box.x for char in values) for label in labels)
+    assert [label.pipeline_trace["semantic_table"]["col_index"] for label in labels] == [0, 0]
+    assert [char.char_unicode for char in values] == list("124902830315")
+
+
+def test_text_above_fixed_table_uses_available_local_clearance():
+    ts = _typesetter()
+    cell = _rendered_para("12345", Box(50, 195, 105, 220), 55, 205, label="wired_table_cell_fixed_rtl")
+    field = _rendered_para("Reference", Box(48, 219, 125, 245), 52, 212)
+    page = Page(
+        page_number=0,
+        cropbox=Cropbox(box=Box(0, 0, 400, 400)),
+        pdf_paragraph=[cell, field],
+    )
+
+    ts._resolve_rendered_text_collisions(page)
+
+    assert ts._rendered_text_box(field).y >= ts._rendered_text_box(cell).y2 + 4
+    assert field.pipeline_trace["table_clearance_adjusted"]
+    assert not field.pipeline_trace.get("page_overflow")
 
 
 def test_narrow_fixed_cell_compacts_horizontally_instead_of_colliding():

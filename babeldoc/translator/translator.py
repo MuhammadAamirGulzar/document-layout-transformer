@@ -20,7 +20,13 @@ from tenacity import wait_exponential
 from babeldoc.babeldoc_exception.BabelDOCException import ContentFilterError
 from babeldoc.format.pdf.document_il.utils.sentence_splitter import (
     SEGMENTATION_VERSION,
+    split_sentences,
     split_text_for_token_budget,
+)
+from babeldoc.format.pdf.document_il.utils.web_references import (
+    iter_web_references,
+    restore_web_references,
+    stash_web_references,
 )
 from babeldoc.translator.cache import TranslationCache
 from babeldoc.utils.atomic_integer import AtomicInteger
@@ -48,236 +54,30 @@ def remove_control_characters(s):
 #   - Translating SWIFT/BIC codes or financial codes phonetically (ABQQQAQAXXX)
 #   - Inverting modulo algorithms (MOD 97-10) or dropping phone numbers (+974 44456371)
 #
-# Pattern priority (highest-specificity first to avoid partial matches):
-_CITATION_SURNAME = r"[A-ZÀ-ÖØ-Þ][^\W\d_]*(?:[-'’][^\W\d_]+)*"
-_CITATION_AUTHORS = rf"{_CITATION_SURNAME}(?:\s+et\s+al\.|\s+(?:and|&)\s+{_CITATION_SURNAME})?"
-_CITATION_YEAR = r"(?:18|19|20)\d{2}[a-z]?"
-_CITATION_ENTRY = rf"{_CITATION_AUTHORS},\s*{_CITATION_YEAR}"
-AUTHOR_YEAR_CITATION = re.compile(
-    rf"\({_CITATION_ENTRY}(?:;\s*{_CITATION_ENTRY})*\)"
-    rf"|\b{_CITATION_SURNAME}\s+et\s+al\.\s*\({_CITATION_YEAR}\)",
+from babeldoc.format.pdf.document_il.utils.structured_tokens import (
+    ATOMIC_EXPRESSION_RE as _ATOMIC_EXPRESSION,
+    AUTHOR_YEAR_CITATION,
+    CHEM_ION_RE as _CHEM_ION,
+    CHEM_REACTION_RE as _CHEM_REACTION,
+    IBAN_PATTERN as _IBAN_PATTERN,
+    ISO_COUNTRY_CODES as _ISO_COUNTRY_CODES,
+    KNOWN_CODES as _KNOWN_CODES,
+    NUMERIC_VALUE_RE as _SHARED_NUMERIC_VALUE_RE,
+    PASSTHROUGH_ATOM_RE as _PASSTHROUGH_ATOM_RE,
+    PERCENT_VALUE_RE as _SHARED_PERCENT_VALUE_RE,
+    PHONE_PATTERN as _PHONE_PATTERN,
+    STRUCTURED_TOKEN_PATTERN as _NUMERAL_PATTERN,
+    SWIFT_BIC_PATTERN as _SWIFT_BIC_PATTERN,
+    canonicalize_literal_values as _canonicalize_literal_values_shared,
+    caps_phrase_to_sentence_case as _caps_phrase_to_sentence_case,
+    is_code_like as _is_code_like,
+    is_immutable_technical_text,
+    is_plain_caps_word as _is_plain_caps_word,
+    is_valid_bic as _is_valid_bic,
+    protect_structured_tokens as _protect_numerals,
+    protected_value_count as _protected_value_count_shared,
+    restore_structured_tokens as _restore_numerals,
 )
-
-_NUMERAL_PATTERN = re.compile(
-    # 0. Bibliographic and contact atoms that must survive byte-for-byte:
-    # URLs, DOIs, emails, ISO/numeric calendar dates, Unix paths, filenames,
-    # UUIDs/hex hashes, prefixed invoice/PO IDs, multi-hyphen IDs, p-values,
-    # and numeric bracket citations such as [12], [3, 7] or [4-9].
-    r'(https?://[^\s<>"\u201d\u2019]*[^\s<>"\u201d\u2019.,;:!?)\]]|www\.[^\s<>"\u201d\u2019]*[^\s<>"\u201d\u2019.,;:!?)\]])|'
-    r'(\b10\.\d{4,9}/[^\s<>"\u201d\u2019]*[^\s<>"\u201d\u2019.,;:!?)\]])|'
-    r'([A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})|'
-    r'((?<![A-Za-z0-9_])(?:/|\.\.?/)[A-Za-z0-9._\-]+(?:/[A-Za-z0-9._\-]+)+/?)|'
-    r'((?<![A-Za-z0-9_])[A-Za-z0-9][A-Za-z0-9._\-]*\.(?:pdf|xlsx?|csv|tsv|json|ya?ml|xml|html?|sql|py|sh|txt|md|docx?|pptx?|png|jpe?g|svg|zip|tar\.gz|log|ini|cfg|env)\b)|'
-    r'(\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b)|'
-    r'(\b(?:sha256:)?[0-9a-f]{16,64}\b|\b0x[0-9a-fA-F]{4,}\b)|'
-    r'(\b\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:?\d{2})?)?\b)|'
-    r'(\b\d{4}[-/]\d{1,2}[-/]\d{1,2}\b)|'
-    r'(\b\d{1,2}[-/]\d{1,2}[-/]\d{2,4}\b)|'
-    r'(\b(?:INV|PO|REF|TXN|VAT|TIN|EIN|DOC|ID)\s*#\s*\d[A-Z0-9\-/]*\b)|'
-    r'((?<![\w\-\u2010\u2011])[A-Z][A-Z0-9]{1,9}(?:[-\u2010\u2011][A-Z0-9]{1,9})+[-\u2010\u2011][0-9]{2,6}'
-    r'(?:[.-][0-9]{1,6})*(?!\w|[-\u2010\u2011]\w|\.\d))|'
-    r'(\b[pP]\s*(?:<=|>=|[<>≤≥=])\s*0?\.\d+\b)|'
-    r'(\b[A-Z]{1,6}(?:/[A-Z0-9.\-]+){2,}\b)|'
-    r'(\[\s*\d{1,3}(?:\s*[,\u2013\u2014-]\s*\d{1,3})*\s*\])|'
-    rf"({AUTHOR_YEAR_CITATION.pattern})|"
-    # 1. Parenthetical mixed tokens: (2018=100), (NDS3), (281211210/97 =62), (Chart 7-1), (-0.7, -0.1)
-    # Exclude prose parentheticals with lowercase words such as (First 4 character of BIC),
-    # (e.g. QA00 for QATAR), or (29 characters for QATAR) so their text is translated while
-    # inner numbers and codes remain shielded by rules 2-14.
-    r'(\(\s*(?:(?:Chart|Table|Fig(?:ure)?)\s+)?[A-Z0-9\s,.\-+\u2212±×÷=/%$€£¥٪\u2013\u2014:;_]*\d[A-Z0-9\s,.\-+\u2212±×÷=/%$€£¥٪\u2013\u2014:;_]*\))|'
-    # 2. Arithmetic division / equations: 281211210/97 = 62, 502560126/97 = 22, 221000/97= 34
-    r'(\b\d+\s*[/÷]\s*\d+\s*(?:=\s*\d+)?\b)|'
-    # 3. Arithmetic operations with equals: 98-34=64, 2018=100
-    r'(\b\d+\s*[-–—+*×]\s*\d+\s*=\s*\d+\b)|'
-    r'(\b\d+\s*=\s*\d+\b)|'
-    # 4. Modulo and international standard references: MOD 97-10, MOD 97, ISO/IEC 7064, ISO 13616-1
-    r'(\b(?:MOD\s*\d+(?:-\d+)?|ISO(?:/IEC)?\s*\d+(?:-\d+)?)\b)|'
-    # 5. Full IBAN strings (with or without 4-character block spaces) and long account strings (15-35 chars)
-    r'(\b[A-Z]{2}\d{2}(?:\s+[A-Z0-9]{4}){2,7}(?:\s+[A-Z0-9]{1,4})?\b)|'
-    r'(\b[A-Z]{2}\d{2}[A-Z0-9]{11,30}\b)|'
-    r'(\b(?=[A-Z0-9]{15,35}\b)(?=[A-Z0-9]*\d)[A-Z0-9]+\b)|'
-    # Compact identifiers must be protected before shorter prefixes or numbers.
-    r'((?<![\w\-\u2010\u2011])[A-Z][A-Z0-9]{1,9}[-\u2010\u2011][0-9]{2,6}'
-    r'(?:[.-][0-9]{1,6})*(?!\w|[-\u2010\u2011]\w|\.\d))|'
-
-    # 6. SWIFT BIC codes embedded in text (8 or 11 uppercase chars): ABQQQAQAXXX, BBMEQAQXXXX, SCBLQAQXXXX
-    r'(\b[A-Z]{4}[A-Z]{2}[A-Z0-9]{2}(?:[A-Z0-9]{3})?\b)|'
-    # 7. Bank Identifiers (4-letter routing codes): BBME, QNBA, CBQA, DOHB, IBOQ, etc.
-    r'(\b(?:QNBA|CBQA|DOHB|QISB|ABQQ|QIIB|ARAB|MSHQ|IBOQ|BBME|SCBL|UNIL|BNPA|MAFR|KLJI|BRWA|QIDB)\b)|'
-    # 8. All 54 ISO 2-letter Country Codes: AL, AD, AT, BE, BA, BG, HR, QA, etc.
-    r'(\b(?:AL|AD|AT|BE|BA|BG|HR|CY|CZ|DK|EE|FO|FI|FR|GE|DE|GI|GR|GL|HU|IS|IE|IL|IT|JO|KW|LV|LB|LI|LT|LU|MK|MT|MR|MU|MD|MC|ME|NL|NO|PK|PL|PT|QA|RO|SM|SA|RS|SK|SI|ES|SE|CH|TN|TR|AE|GB)\b)|'
-    # 9. Mixed alphanumeric codes containing both letters and numbers (3 to 35 chars): Q1, H2, MOD97, A01
-    r'(\b(?=[A-Z0-9]{3,35}\b)(?=[A-Z0-9]*\d)(?=[A-Z0-9]*[A-Z])[A-Z0-9]+\b)|'
-    # 9b. Scientific notation: 2e-5, 1.5E+10, -3.2e-4, 2e-5%
-    # Must precede dash-range and plain-number rules so exponents stay atomic.
-    r'((?<![A-Za-z0-9_.])[+\-\u2212]?(?:\d+(?:\.\d+)?|\.\d+)[eE][+\-]?\d+(?:\s*[%\u066A])?(?!\w))|'
-    # 10. Compound numeric references: 2-1, Chart 4-4, 7-3, 5.1.1, 2.1.2
-    # Ordinals must precede the generic number alternatives below. Otherwise the
-    # word-boundary checks on the numeric alternatives leave the suffix behind
-    # (``5th`` becomes ``{0}th``), which lets MT and BiDi reorder it.
-    # Multi-dot version/section numbers require >= 2 dots so single decimals like
-    # ``4.2%`` stay atomic with their percent sign in rule 13.
-    r'(\b\d+(?:st|nd|rd|th)\s*[-\u2013\u2014]\s*\d+(?:st|nd|rd|th)\b)|'
-    r'(\b\d+(?:st|nd|rd|th)\b)|'
-    r'(\b\d+[-\u2013\u2014]\d+\b)|'
-    r'(\b\d+(?:\.\d+){2,3}\b)|'
-    # 11. Known financial/statistical acronyms that must never be translated
-    r'(\b(?:QCB(?:RR|LR|DR)?|AOIR|QMR|NDS\d*|CPI|PPI|GDP|GNP|IMF|OPEC|FISIM|BBAN|IBAN|BIC|SWIFT|STP|TERMS|QATCH|Y-o-Y|Q-o-Q|MoM|RHS|LHS|USD|EUR|GBP|SAR|AED|QR|BPS|bps)\b)|'
-    # 12. International phone and fax numbers: +974 44456371, +974 44430382
-    r'(\+\d{1,4}\s*\d{3,4}\s*\d{3,4}(?:\s*\d{3,4})?)|'
-    # 13. Numbers: integers, comma-separated thousands, decimals, percentages
-    #    e.g. 75, 75.3, 4.2%, 75,432, 1,250.5%, -3.2, +4.5
-    r'((?<![A-Za-z0-9_.])[+\-\u2212]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?:\s*[%\u066A])?(?!\w)(?!\.\d))|'
-    # 14. Plain integers not already caught (catches standalone digits)
-    r'((?<!\w)\d+(?:\.\d+)?(?!\w))'
-)
-
-
-def _protect_numerals(text: str) -> tuple[str, dict[str, str]]:
-    """Replace numeric and reference patterns with curly bracket placeholders before translation.
-    
-    Using placeholders like {0}, {1} is recognized by Seq2Seq translation models
-    (MarianMT, NLLB) as untranslated tokens, avoiding XML tag corruption (<1 b>, 0>)
-    and token repetition loops.
-    
-    Returns:
-        tuple of (text with placeholders, mapping of placeholder -> original value)
-    """
-    mapping = {}
-    counter = [0]
-    
-    # Reserve IDs used by numeric placeholders and by PDF formula/style tags.
-    # A decoder may rewrite {1} as <b1>, so the IDs must stay distinct.
-    existing_placeholders = set(re.findall(r'\{\d+\}', text))
-    existing_placeholders.update(
-        f"{{{tag_id}}}"
-        for tag_id in re.findall(r"<\s*/?\s*b\s*([0-9]+)\s*>", text, re.IGNORECASE)
-    )
-
-    def _replacer(match):
-        original = match.group(0)
-        if original in existing_placeholders:
-            return original
-        if _is_plain_caps_word(original):
-            return original
-        placeholder = f"{{{counter[0]}}}"
-        while placeholder in existing_placeholders:
-            counter[0] += 1
-            placeholder = f"{{{counter[0]}}}"
-        mapping[placeholder] = original
-        counter[0] += 1
-        return placeholder
-    
-    protected = _NUMERAL_PATTERN.sub(_replacer, text)
-    return protected, mapping
-
-
-def _restore_numerals(text: str, mapping: dict[str, str]) -> str:
-    """Restore placeholders with original values after translation.
-    
-    Tries multiple fallback patterns because Seq2Seq models sometimes:
-    - Add spaces inside brackets: { 0 } instead of {0}
-    - Drop one bracket: {0 or 0}
-    - Convert to angle brackets: <0> or <b0>
-    - Substitute digit 0 with letter O/o: {O} or {o}
-    - Convert digits to Arabic-Indic: {٠}
-    - Convert to square brackets or parentheses: [0], (0)
-    """
-    # Deduplicate repeated identical parenthesized tokens before and during restoration:
-    # e.g. (BBAN) (BBAN) -> (BBAN)
-    text = re.sub(r'(\([A-Za-z0-9\-_]{2,15}\))(?:\s*\1)+', r'\1', text)
-
-    if not mapping:
-        return text
-
-    # Deduplicate repeated identical placeholder tags before substitution:
-    # e.g. ({0})({0}) -> ({0}), {0}{0} -> {0}
-    text = re.sub(r'(\(\s*\{\s*\d+\s*\}\s*\))(?:\s*\1)+', r'\1', text)
-    text = re.sub(r'(\{\s*\d+\s*\})(?:\s*\1)+', r'\1', text)
-
-    for placeholder, original in mapping.items():
-        tag_num = placeholder.strip("{}")
-        # Primary: standard {0} or with internal whitespace { 0 }
-        text = re.sub(r'\{\s*' + re.escape(tag_num) + r'\s*\}', original, text)
-        
-        # Fallback: model substituted digit 0 with uppercase/lowercase O (e.g. {O} or {o})
-        if tag_num == "0":
-            text = re.sub(r'\{\s*[Oo]\s*\}', original, text)
-            text = re.sub(r'<\s*(?:b\s*)?[Oo]\s*>', original, text)
-            text = re.sub(r'\[\s*[Oo]\s*\]', original, text)
-
-        # Fallback: model converted digits to Arabic-Indic (e.g. {٠}, {١})
-        arabic_indic_num = "".join(chr(0x0660 + int(c)) if c.isdigit() else c for c in tag_num)
-        if arabic_indic_num != tag_num:
-            text = re.sub(r'\{\s*' + re.escape(arabic_indic_num) + r'\s*\}', original, text)
-            text = re.sub(r'<\s*(?:b\s*)?' + re.escape(arabic_indic_num) + r'\s*>', original, text)
-
-        # Fallback: bracket partially dropped — {0 or 0}
-        text = re.sub(r'(?<!\d)\{' + re.escape(tag_num) + r'(?!\d)', original, text)
-        text = re.sub(r'(?<!\d)' + re.escape(tag_num) + r'\}(?!\d)', original, text)
-
-        # Fallback: square brackets [0] or parentheses (0)
-        text = re.sub(r'\[\s*' + re.escape(tag_num) + r'\s*\]', original, text)
-        text = re.sub(r'\(\s*' + re.escape(tag_num) + r'\s*\)', original, text)
-
-        # Fallback: model converted to XML-style — <0>, < 0 >, <b0>, <b 0>
-        text = re.sub(r'<\s*(?:b\s*)?' + re.escape(tag_num) + r'\s*>', original, text)
-
-    # Post-restore spacing cleanup:
-    # Deduplicate repeated identical parenthesized tokens: (BBAN)(BBAN) -> (BBAN)
-    text = re.sub(r'(\([A-Za-z0-9\-_]{2,15}\))(?:\s*\1)+', r'\1', text)
-
-    # NLLB can occasionally repeat a restored critical token immediately
-    # after itself (with or without a space).  This is especially dangerous
-    # in the MOD-97 walkthrough because a duplicated IBAN looks plausible but
-    # is financially wrong.  Only collapse *adjacent* copies of a token that
-    # came from the source mapping; independent source occurrences remain.
-    for original in set(mapping.values()):
-        if not (_SWIFT_BIC_PATTERN.match(original) or _IBAN_PATTERN.match(original)):
-            continue
-        duplicate = re.compile(r'(' + re.escape(original) + r')(?:\s*\1)+')
-        text = duplicate.sub(original, text)
-
-    # Insert space between digits and Arabic-script letters (NOT Latin letters,
-    # and NOT Arabic percent/decimal punctuation \u0660-\u066D, to preserve
-    # codes like Q1, H2, P6, CHAPTER 03 and percentages like 20٪).
-    text = re.sub(r'(\d)([\u0621-\u064A\u066E-\u06D3\u06D5])', r'\1 \2', text)
-    text = re.sub(r'([\u0621-\u064A\u066E-\u06D3\u06D5])(\d)', r'\1 \2', text)
-    # Remove stray spaces before punctuation
-    text = re.sub(r'\s+([,.:;!?،؛])', r'\1', text)
-    # Collapse any double spaces left by restoration
-    text = re.sub(r'[^\S\r\n]{2,}', ' ', text).strip()
-
-    # Byte-identity verification:
-    # For critical SWIFT/BIC codes and IBAN identifiers, assert the restored output exactly equals
-    # the original input byte-for-byte to prevent code corruption.
-    # For natural language numerals/words that Seq2Seq models might idiomatically rephrase or condense,
-    # log a diagnostic warning rather than crashing the pipeline and reverting the paragraph to English.
-    expected_counts = Counter(mapping.values())
-    for original_token, expected_count in expected_counts.items():
-        actual_count = BaseTranslator._protected_value_count(text, original_token)
-        if actual_count < expected_count:
-            is_critical = bool(_is_valid_bic(original_token) or _IBAN_PATTERN.match(original_token))
-            if is_critical:
-                raise AssertionError(
-                    f"Byte-identity check failed! Expected at least {expected_count} occurrence(s) "
-                    f"of critical banking code '{original_token}', but found {actual_count} in restored text:\n  '{text}'"
-                )
-            else:
-                logger.warning(
-                    f"Shielded token '{original_token}' expected {expected_count} occurrence(s), "
-                    f"found {actual_count} in restored text. Preserving translated content."
-                )
-        elif actual_count > expected_count and (
-            _is_valid_bic(original_token) or _IBAN_PATTERN.match(original_token)
-        ):
-            raise AssertionError(
-                f"Byte-identity check failed! Expected exactly {expected_count} occurrence(s) "
-                f"of critical banking code '{original_token}', found {actual_count}:\n  '{text}'"
-            )
-
-    return text
-
 
 # Pattern: text that is entirely made of digits, numeric punctuation, symbols,
 # and/or known short financial codes — no translatable natural-language words.
@@ -286,125 +86,22 @@ _PURE_PASSTHROUGH_PATTERN = re.compile(
     r'^[\s\d,.\-+±×÷=()/%$€£¥٪#\u2013\u2014\u00B1\u2019\u2018:;\'\"]*$'
 )
 
-# Explicit SWIFT BIC regex: 4-letter bank code + 2-letter country + 2-char location + opt 3-char branch
-_SWIFT_BIC_PATTERN = re.compile(r'^[A-Z]{4}[A-Z]{2}[A-Z0-9]{2}(?:[A-Z0-9]{3})?$')
 
-# ISO 3166-1 alpha-2 country codes (plus XK, which SWIFT uses for Kosovo).
-# A real BIC has one of these in characters 5-6. Ordinary ALL-CAPS English words that
-# are 8 or 11 letters long (INCOMING, NATIONAL, DEVELOPMENT) do not.
-_ISO_COUNTRY_CODES = frozenset(
-    "AD AE AF AG AI AL AM AO AQ AR AS AT AU AW AX AZ BA BB BD BE BF BG "
-    "BH BI BJ BL BM BN BO BQ BR BS BT BV BW BY BZ CA CC CD CF CG CH CI "
-    "CK CL CM CN CO CR CU CV CW CX CY CZ DE DJ DK DM DO DZ EC EE EG EH "
-    "ER ES ET FI FJ FK FM FO FR GA GB GD GE GF GG GH GI GL GM GN GP GQ "
-    "GR GS GT GU GW GY HK HM HN HR HT HU ID IE IL IM IN IO IQ IR IS IT "
-    "JE JM JO JP KE KG KH KI KM KN KP KR KW KY KZ LA LB LC LI LK LR LS "
-    "LT LU LV LY MA MC MD ME MF MG MH MK ML MM MN MO MP MQ MR MS MT MU "
-    "MV MW MX MY MZ NA NC NE NF NG NI NL NO NP NR NU NZ OM PA PE PF PG "
-    "PH PK PL PM PN PR PS PT PW PY QA RE RO RS RU RW SA SB SC SD SE SG "
-    "SH SI SJ SK SL SM SN SO SR SS ST SV SX SY SZ TC TD TF TG TH TJ TK "
-    "TL TM TN TO TR TT TV TW TZ UA UG UM US UY UZ VA VC VE VG VI VN VU "
-    "WF WS XK YE YT ZA ZM ZW "
-    .split()
-)
-
-
-def _is_valid_bic(token: str) -> bool:
-    """BIC-shaped token whose characters 5-6 are a real country code."""
-    return bool(_SWIFT_BIC_PATTERN.match(token)) and token[4:6] in _ISO_COUNTRY_CODES
-
-
-def _is_plain_caps_word(token: str) -> bool:
-    """All-letter 8/11 character caps word that only looks like a BIC."""
-    return (
-        token.isalpha()
-        and bool(_SWIFT_BIC_PATTERN.match(token))
-        and token[4:6] not in _ISO_COUNTRY_CODES
-    )
-
-
-def _is_code_like(word: str) -> bool:
-    """Known code, 11-character BIC, or 8-character BIC from a known bank ID."""
-    return word in _KNOWN_CODES or (
-        _is_valid_bic(word) and (len(word) == 11 or word[:4] in _KNOWN_CODES)
-    )
-
-
-def _caps_phrase_to_sentence_case(text: str) -> str:
-    """Turn an ALL-CAPS phrase of ordinary words into sentence case.
-
-    Models read 'STANDARDS DOCUMENT' badly, and a word like DOCUMENT has the shape of a
-    BIC. Phrases holding a known code, a BIC from a known bank, or a short acronym are
-    left alone. An 8-letter BIC from an unknown bank inside such a phrase is treated as a
-    word (known limit).
-    """
-    if not text:
-        return text
-    lines = []
-    for line in text.split("\n"):
-        stripped = line.strip()
-        words = stripped.split()
-        if (
-            len(words) >= 2
-            and all(re.fullmatch(r"[A-Z]{4,}", word) for word in words)
-            and not any(_is_code_like(word) for word in words)
-        ):
-            line = line.replace(stripped, stripped.capitalize(), 1)
-        lines.append(line)
-    return "\n".join(lines)
-
-# Full IBAN account pattern: 2-letter country + 2 check digits + up to 30 alphanumeric chars
-_IBAN_PATTERN = re.compile(r'^[A-Z]{2}\d{2}[A-Z0-9]{11,30}$')
-
-# Phone / Fax numbers with optional country code
-_PHONE_PATTERN = re.compile(r'^\+?\d{1,4}(?:[\s\-]\d{3,4}){2,4}$')
-
-# Known short codes/acronyms that should never be translated
-_KNOWN_CODES = frozenset({
-    "QR", "USD", "EUR", "GBP", "SAR", "AED",
-    "QCBRR", "QCBLR", "QCBDR", "AOIR", "QMR",
-    "CPI", "PPI", "GDP", "GNP", "IMF", "OPEC",
-    "NDS", "NDS3", "FISIM", "RHS", "LHS",
-    "Q1", "Q2", "Q3", "Q4",
-    "H1", "H2",
-    "YoY", "Y-o-Y", "QoQ", "Q-o-Q", "MoM",
-    "bps", "Bps", "BPS",
-    "BBAN", "IBAN", "BIC", "SWIFT", "STP", "TERMS", "QATCH",
-    # Qatar bank identifiers used as standalone table cells.  Keeping this
-    # explicit is safer than treating every 3-4 letter uppercase English word
-    # (for example JULY or TYPE) as an untranslatable code.
-    "QNBA", "CBQA", "DOHB", "QISB", "ABQQ", "QIIB", "ARAB", "MSHQ",
-    "IBOQ", "BBME", "SCBL", "UNIL", "BNPA", "MAFR", "KLJI", "BRWA", "QIDB",
-})
-
-
-_PASSTHROUGH_ATOM_RE = re.compile(
-    r"^(?:"
-    r"https?://\S+|www\.\S+|10\.\d{4,9}/\S+|"
-    r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}|"
-    r"(?:/|\.\.?/)[A-Za-z0-9._\-]+(?:/[A-Za-z0-9._\-]+)+/?|"
-    r"[A-Za-z0-9][A-Za-z0-9._\-]*\.(?:pdf|xlsx?|csv|tsv|json|ya?ml|xml|html?|sql|py|sh|txt|md|docx?|pptx?|png|jpe?g|svg|zip|tar\.gz|log|ini|cfg|env)|"
-    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}|"
-    r"(?:sha256:)?[0-9a-f]{16,64}|0x[0-9a-fA-F]{4,}|"
-    r"[A-Z][A-Z0-9]{1,9}(?:[-\u2010\u2011][A-Z0-9]{1,9})*[-\u2010\u2011][0-9]{2,6}(?:[.-][0-9]{1,6})*|"
-    r"\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:?\d{2})?)?|"
-    r"[pP]\s*(?:<=|>=|[<>≤≥=])\s*0?\.\d+"
-    r")$"
-)
+_ARABIC_LETTER_RANGE = r"\u0621-\u064A\u0671-\u06D3\uFB50-\uFDFF\uFE70-\uFEFC"
 
 
 def _is_degenerate_translation(source_text: str, translated_text: str) -> bool:
     """Detect repetitive hallucinated Arabic output or heavy unrequested vocalization loops."""
     if not translated_text:
         return False
-    arabic_chars = re.findall(r"[\u0600-\u06FF]", translated_text)
+    arabic_chars = re.findall(rf"[\u0600-\u06FF\uFB50-\uFDFF\uFE70-\uFEFC]", translated_text)
     if len(arabic_chars) < 16:
         return False
     diacritics = re.findall(r"[\u064B-\u065F\u0670]", translated_text)
     src_diacritics = re.findall(r"[\u064B-\u065F\u0670]", source_text or "")
     if not src_diacritics and len(diacritics) / max(1, len(arabic_chars)) > 0.22:
         return True
-    words = [w for w in re.findall(r"[\u0621-\u064AA-Za-z0-9]{2,}", translated_text)]
+    words = [w for w in re.findall(rf"[{_ARABIC_LETTER_RANGE}A-Za-z0-9]{{2,}}", translated_text)]
     if len(words) >= 6:
         run_len = 1
         for i in range(1, len(words)):
@@ -419,6 +116,105 @@ def _is_degenerate_translation(source_text: str, translated_text: str) -> bool:
             if trigrams and trigrams.most_common(1)[0][1] >= 3:
                 return True
     return False
+
+
+_HALLUCINATION_STOCK_RE = re.compile(
+    r"(?:لا\s+توجد\s+أسباب\s+إضافية|As\s+an\s+AI\b|Translate\s+the\s+following)",
+    re.IGNORECASE,
+)
+
+
+def _strip_immutable_for_completeness(text: str, extra_values=()) -> str:
+    """Remove protected atoms, web refs, placeholders, and acronyms before prose checks."""
+    cleaned = text or ""
+    cleaned, _ = stash_web_references(cleaned)
+    cleaned = re.sub(r"\uE002\d+\uE003", " ", cleaned)
+    for val in extra_values or ():
+        if val and len(val) >= 2:
+            cleaned = cleaned.replace(val, " ")
+    cleaned = _ATOMIC_EXPRESSION.sub(" ", cleaned)
+    cleaned = _NUMERAL_PATTERN.sub(" ", cleaned)
+    cleaned = re.sub(r"<\s*/?\s*b\s*\d+\s*>", " ", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\{\s*\d+\s*\}", " ", cleaned)
+    cleaned = re.sub(r"\([A-Z0-9\-/]{2,12}\)", " ", cleaned)
+    cleaned = re.sub(r"\b[A-Z0-9]{2,10}\b", " ", cleaned)
+    return cleaned
+
+
+def validate_translation_completeness(
+    source_text: str,
+    translated_text: str,
+    *,
+    target_lang: str = "ar",
+    extra_protected=(),
+) -> tuple[bool, str | None]:
+    """Validate that an Arabic translation of substantial prose is complete and on-language."""
+    tgt_norm = str(target_lang or "").lower().rsplit("-", 1)[-1]
+    if tgt_norm not in {"ar", "ara", "arabic", "arb_arab"}:
+        return True, None
+    src = (source_text or "").strip()
+    out = (translated_text or "").strip()
+    if not src or _is_pure_passthrough(src):
+        return True, None
+    if not out:
+        return False, "empty_translation"
+
+    clean_src = _strip_immutable_for_completeness(src, extra_protected)
+    clean_out = _strip_immutable_for_completeness(out, extra_protected)
+
+    src_prose_words = [
+        w for w in re.findall(r"\b[A-Za-z][A-Za-z'\u2019\-]{1,}\b", clean_src)
+        if not w.isupper()
+    ]
+    if len(src_prose_words) < 4:
+        return True, None
+
+    if _is_degenerate_translation(src, out):
+        return False, "degenerate_output"
+    if _HALLUCINATION_STOCK_RE.search(out):
+        return False, "unrelated_hallucination"
+
+    out_latin_words = [
+        w for w in re.findall(r"\b[A-Za-z][A-Za-z'\u2019\-]{1,}\b", clean_out)
+        if not w.isupper()
+    ]
+    out_lower_latin = [w for w in out_latin_words if w[0].islower()]
+    ar_words = re.findall(rf"[{_ARABIC_LETTER_RANGE}]+", clean_out)
+    ar_chars = re.findall(rf"[{_ARABIC_LETTER_RANGE}]", clean_out)
+    src_prose_chars = sum(len(w) for w in src_prose_words)
+
+    # 1. Excessive untranslated English prose
+    if len(ar_chars) < max(6, len(src_prose_words)) and (
+        len(out_latin_words) >= 3 or clean_out.strip().lower() == clean_src.strip().lower()
+    ):
+        return False, "excessive_untranslated_source"
+    if len(out_lower_latin) >= 4 and len(out_lower_latin) / max(1, len(src_prose_words)) >= 0.38:
+        return False, "excessive_untranslated_source"
+
+    # 2. Suspicious truncation / dropped final sentence / missing prose despite protected tokens
+    if len(src_prose_words) >= 8 and len(ar_chars) < max(10, int(src_prose_chars * 0.25)):
+        return False, "insufficient_translated_prose"
+
+    src_sents = [
+        s for s in split_sentences(src)
+        if len([w for w in re.findall(r"\b[A-Za-z][A-Za-z'\u2019\-]{1,}\b", _strip_immutable_for_completeness(s, extra_protected)) if not w.isupper()]) >= 4
+    ]
+    if len(src_sents) >= 2:
+        out_sents = [s.strip() for s in re.split(r"[.!?؟\n]+", out) if len(re.findall(rf"[{_ARABIC_LETTER_RANGE}]{{2,}}", s)) >= 3]
+        if len(out_sents) < len(src_sents) and (
+            len(ar_chars) < src_prose_chars * 0.55 or len(ar_words) < len(src_prose_words) * 0.72
+        ):
+            return False, "suspicious_truncation"
+
+    if (
+        len(src_prose_words) >= 8
+        and src[-1] in ".!?؟"
+        and out[-1] in "(,،:؛-"
+        and len(ar_chars) < src_prose_chars * 0.55
+    ):
+        return False, "suspicious_truncation"
+
+    return True, None
 
 
 def _is_pure_passthrough(text: str) -> bool:
@@ -455,7 +251,7 @@ def _is_pure_passthrough(text: str) -> bool:
         and not re.search(r"[A-Za-z]", stripped)
     ):
         return True
-    if _is_valid_bic(stripped):
+    if _is_valid_bic(stripped) and not _is_plain_caps_word(stripped):
         return True
     if _IBAN_PATTERN.match(stripped):
         return True
@@ -489,7 +285,7 @@ def _is_pure_passthrough(text: str) -> bool:
         if clean in _KNOWN_CODES or clean.upper() in _KNOWN_CODES:
             continue
         # Is it a SWIFT BIC code or IBAN string?
-        if _is_valid_bic(clean) or _IBAN_PATTERN.match(clean):
+        if (_is_valid_bic(clean) and not _is_plain_caps_word(clean, text)) or _IBAN_PATTERN.match(clean):
             continue
         # A standalone ISO alpha-2 code is structural data.  Longer uppercase
         # words are not assumed to be codes; genuine acronyms and bank IDs are
@@ -654,6 +450,9 @@ class BaseTranslator(ABC):
         state = self._get_call_state()
         state.para_failed = False
         state.para_incomplete = False
+        state.validation_reason = None
+        state.retry_attempted = False
+        state.retry_outcome = None
 
     def _consume_paragraph_status(self) -> tuple[bool, bool]:
         state = self._get_call_state()
@@ -662,6 +461,16 @@ class BaseTranslator(ABC):
         state.para_failed = False
         state.para_incomplete = False
         return failed, incomplete
+
+    def _consume_paragraph_validation(self) -> tuple[str | None, bool, str | None]:
+        state = self._get_call_state()
+        reason = getattr(state, "validation_reason", None)
+        attempted = bool(getattr(state, "retry_attempted", False))
+        outcome = getattr(state, "retry_outcome", None)
+        state.validation_reason = None
+        state.retry_attempted = False
+        state.retry_outcome = None
+        return reason, attempted, outcome
 
     def __del__(self):
         with contextlib.suppress(Exception):
@@ -701,7 +510,7 @@ class BaseTranslator(ABC):
         if not cleaned_text or not str(cleaned_text).strip():
             return text
 
-        if _is_pure_passthrough(cleaned_text):
+        if _is_pure_passthrough(cleaned_text) or is_immutable_technical_text(cleaned_text):
             return cleaned_text
 
         # Shielding placeholder mechanism applied uniformly across all translation engines
@@ -714,12 +523,8 @@ class BaseTranslator(ABC):
             self.cache.set(text, translation)
         return translation
 
-    _PERCENT_VALUE_RE = re.compile(
-        r"^([+\-\u2212]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?:[eE][+\-]?\d+)?)\s*([%\u066A])$"
-    )
-    _NUMERIC_VALUE_RE = re.compile(
-        r"^[+\-\u2212]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)*(?:[eE][+\-]?\d+)?$"
-    )
+    _PERCENT_VALUE_RE = _SHARED_PERCENT_VALUE_RE
+    _NUMERIC_VALUE_RE = _SHARED_NUMERIC_VALUE_RE
     _retry_missing_values = False
 
     def _generate_translation(self, text: str) -> str:
@@ -737,44 +542,12 @@ class BaseTranslator(ABC):
     @classmethod
     def _canonicalize_literal_values(cls, text: str, values) -> str:
         """Canonicalize Arabic/spaced percentage forms back to source tokens."""
-        if not text:
-            return text
-        for value in set(values):
-            pct_match = cls._PERCENT_VALUE_RE.match(value)
-            if not pct_match:
-                continue
-            num = re.escape(pct_match.group(1))
-            left = r"(?<![A-Za-z0-9_.\u066B\u066C+\-\u2212])(?<!\d,)"
-            right = r"(?![A-Za-z_\d])"
-            pct_pattern = re.compile(
-                rf"{left}(?:{num}\s*(?:[%\u066A]|في\s+المائة|بالمائة|بالمئة)|[%\u066A]\s*{num}(?![.,\u066B\u066C]\d)){right}"
-            )
-            text = pct_pattern.sub(value, text)
-        return text
+        return _canonicalize_literal_values_shared(text, values)
 
     @classmethod
     def _protected_value_count(cls, text: str, value: str) -> int:
         """Boundary-aware count of protected literal occurrences in *text*."""
-        if not text or not value:
-            return 0
-        if "{" not in value:
-            text = re.sub(r"\{\s*\d+\s*\}", " ", text)
-        pct_match = cls._PERCENT_VALUE_RE.match(value)
-        if pct_match:
-            num = re.escape(pct_match.group(1))
-            left = r"(?<![A-Za-z0-9_.\u066B\u066C+\-\u2212])(?<!\d,)"
-            right = r"(?![A-Za-z_\d])"
-            pct_pattern = re.compile(
-                rf"{left}(?:{num}\s*(?:[%\u066A]|في\s+المائة|بالمائة|بالمئة)|[%\u066A]\s*{num}(?![.,\u066B\u066C]\d)){right}"
-            )
-            return len(pct_pattern.findall(text))
-        if cls._NUMERIC_VALUE_RE.match(value):
-            left = r"(?<![A-Za-z0-9_.\u066B\u066C+\-\u2212])(?<!\d,)"
-            right = r"(?![A-Za-z0-9_])(?![.,\u066B\u066C]\d)(?!\s*[%\u066A])"
-            return len(re.findall(left + re.escape(value) + right, text))
-        left = r"(?<![A-Za-z_\d])" if value[0].isalnum() else (r"(?<!\d)" if value[0] in "+-\u2212" else "")
-        right = r"(?![A-Za-z_\d])" if value[-1].isalnum() else ""
-        return len(re.findall(left + re.escape(value) + right, text))
+        return _protected_value_count_shared(text, value)
 
     @staticmethod
     def _find_unresolved_placeholders(
@@ -848,6 +621,49 @@ class BaseTranslator(ABC):
             return f"{body} ({literal_text}){punctuation.group(1)}"
         return f"{stripped} ({literal_text})"
 
+    def _protected_integrity_fallback(self, translated, protected_source, mapping, expected):
+        """Produce an incomplete result without losing or duplicating protected data."""
+        source_full = (
+            _restore_numerals(protected_source, mapping, strict=False)
+            if mapping
+            else protected_source
+        )
+        critical = {
+            value
+            for value in expected
+            if _is_valid_bic(value)
+            or _IBAN_PATTERN.fullmatch(re.sub(r"\s+", "", value))
+        }
+        if any(
+            self._protected_value_count(translated, value) != expected[value]
+            for value in critical
+        ):
+            return source_full
+
+        retained = self._retain_missing_protected_values(
+            translated,
+            protected_source,
+            mapping,
+            expected,
+        )
+        exact = all(
+            self._protected_value_count(retained, value) == count
+            for value, count in expected.items()
+        )
+        unresolved = self._find_unresolved_placeholders(
+            protected_source,
+            retained,
+            mapping,
+        )
+        target_lang = str(getattr(self, "tgt_nllb", "") or getattr(self, "lang_out", ""))
+        semantically_valid, _ = validate_translation_completeness(
+            source_full,
+            retained,
+            target_lang=target_lang,
+            extra_protected=tuple(expected.keys()),
+        )
+        return retained if exact and not unresolved and semantically_valid else source_full
+
     def translate_batch(
         self,
         texts: list[str],
@@ -862,7 +678,7 @@ class BaseTranslator(ABC):
 
     def _finalize_protected_translation(self, text, output, mapping, before_untranslated):
         state = self._get_call_state()
-        first = _restore_numerals(output, mapping)
+        first = _restore_numerals(output, mapping, strict=False)
         if mapping:
             first = self._canonicalize_literal_values(first, mapping.values())
         if (
@@ -875,7 +691,11 @@ class BaseTranslator(ABC):
             if getattr(self, "_retry_missing_values", False) and hasattr(self, "_generate_translation"):
                 clean_retry_text = re.sub(r"\s+", " ", text).strip()
                 try:
-                    regenerated = _restore_numerals(self._generate_translation(clean_retry_text), mapping)
+                    regenerated = _restore_numerals(
+                        self._generate_translation(clean_retry_text),
+                        mapping,
+                        strict=False,
+                    )
                     if mapping:
                         regenerated = self._canonicalize_literal_values(regenerated, mapping.values())
                     if (
@@ -890,26 +710,76 @@ class BaseTranslator(ABC):
                 logger.warning(
                     "Detected degenerate hallucinated translation output; falling back safely to source content."
                 )
-                safe_source = _restore_numerals(text, mapping) if mapping else text
+                safe_source = (
+                    _restore_numerals(text, mapping, strict=False) if mapping else text
+                )
                 return safe_source, False
 
         unresolved = self._find_unresolved_placeholders(text, first, mapping)
-        if not mapping:
-            if unresolved:
-                self._inc_incomplete_once()
-                logger.warning(
-                    "Translated output contains unresolved placeholders. Check the translated block."
-                )
-                return first, False
-            return first, not getattr(state, "incomplete", False)
+        if not mapping and unresolved:
+            self._inc_incomplete_once()
+            logger.warning(
+                "Translated output contains unresolved placeholders. Check the translated block."
+            )
+            return first, False
 
-        expected = Counter(mapping.values())
+        expected = Counter(mapping.values()) if mapping else Counter()
+        src_full = (
+            _restore_numerals(text, mapping, strict=False) if mapping else text
+        )
+        structural = {
+            value for value in expected
+            if value.lower().startswith(("http://", "https://", "www.")) or _ATOMIC_EXPRESSION.fullmatch(value)
+        }
         missing = {
             value for value, count in expected.items()
-            if self._protected_value_count(first, value) < count
+            if self._protected_value_count(first, value) != count
         }
+        missing.update(
+            value for value in structural if self._protected_value_count(first, value) != expected[value]
+        )
         if not missing and not unresolved:
-            return first, not getattr(state, "incomplete", False)
+            target_lang = str(getattr(self, "tgt_nllb", "") or getattr(self, "lang_out", ""))
+            valid, val_reason = validate_translation_completeness(
+                src_full,
+                first,
+                target_lang=target_lang,
+                extra_protected=tuple(mapping.values()) if mapping else (),
+            )
+            if valid:
+                return first, not getattr(state, "incomplete", False)
+
+            state.validation_reason = val_reason
+            if not getattr(self, "_retry_missing_values", False):
+                self._inc_incomplete_once()
+                logger.warning(
+                    "Translated output failed completeness validation (%s); skipping cache.",
+                    val_reason,
+                )
+                return first, False
+
+            state.retry_attempted = True
+            retried, retried_ok = self._retry_semantic_segments(src_full, mapping, target_lang)
+            if retried_ok:
+                state.retry_outcome = "succeeded"
+                return retried, not getattr(state, "incomplete", False)
+            state.retry_outcome = "failed"
+            partial = self._recover_by_spans(src_full, target_lang)
+            if partial is not None:
+                state.retry_outcome = "partial"
+                state.validation_reason = "partial_span_recovery"
+                self._inc_incomplete_once()
+                logger.warning(
+                    "Span recovery kept %d translated and %d source segment(s) (%s); not caching.",
+                    partial[1], partial[2], val_reason,
+                )
+                return partial[0], False
+            self._inc_incomplete_once()
+            logger.warning(
+                "Semantic retry failed completeness validation (%s); emitting incomplete block without caching.",
+                val_reason,
+            )
+            return first, False
 
         if not getattr(self, "_retry_missing_values", False):
             self._inc_incomplete_once()
@@ -917,9 +787,12 @@ class BaseTranslator(ABC):
                 "Translated output is missing protected content or kept unresolved placeholders. "
                 "Check the translated block."
             )
-            return first, False
+            return self._protected_integrity_fallback(
+                first, text, mapping, expected
+            ), False
 
         was_incomplete = getattr(state, "incomplete", False)
+        state.validation_reason = "protected_content_mismatch"
         # Do not expose full account numbers (including grouped IBANs) or bank codes.
         literal = {
             tag: value for tag, value in mapping.items()
@@ -927,33 +800,201 @@ class BaseTranslator(ABC):
             and not (_is_valid_bic(value) or _IBAN_PATTERN.fullmatch(re.sub(r"\s+", "", value)))
         }
         if literal:
+            state.retry_attempted = True
             retry_text = re.sub(r"\{\d+\}", lambda match: literal.get(match[0], match[0]), text)
             remaining = {tag: value for tag, value in mapping.items() if tag not in literal}
             state.incomplete = False
             try:
-                candidate = _restore_numerals(self._generate_translation(retry_text), remaining)
+                candidate = _restore_numerals(
+                    self._generate_translation(retry_text),
+                    remaining,
+                    strict=False,
+                )
                 candidate = self._canonicalize_literal_values(candidate, mapping.values())
             except Exception:
                 logger.warning("Protected-content retry failed")
             else:
                 retry_incomplete = getattr(state, "incomplete", False)
+                candidate_valid, _ = validate_translation_completeness(
+                    src_full,
+                    candidate,
+                    target_lang=str(
+                        getattr(self, "tgt_nllb", "")
+                        or getattr(self, "lang_out", "")
+                    ),
+                    extra_protected=tuple(expected.keys()),
+                )
                 if (
                     not retry_incomplete
                     and not self._find_unresolved_placeholders(retry_text, candidate, remaining)
                     and self._retry_target_satisfied(candidate)
+                    and candidate_valid
                     and all(
                         self._protected_value_count(candidate, value) == count
                         for value, count in expected.items()
                     )
                 ):
+                    state.retry_outcome = "succeeded"
                     return candidate, (not was_incomplete)
 
+        # Retry longer blocks in smaller units when a whole-block decode
+        # cannot keep every URL, date or other protected value in context.
+        state.incomplete = was_incomplete
+        if len(src_full) > 160:
+            target_lang = str(getattr(self, "tgt_nllb", "") or getattr(self, "lang_out", ""))
+            state.retry_attempted = True
+            segmented, valid = self._retry_semantic_segments(src_full, mapping, target_lang)
+            if valid and all(
+                self._protected_value_count(segmented, value) == count
+                for value, count in expected.items()
+            ):
+                state.retry_outcome = "succeeded"
+                return segmented, not was_incomplete
+        if getattr(state, "retry_attempted", False):
+            state.retry_outcome = "failed"
+        target_lang = str(getattr(self, "tgt_nllb", "") or getattr(self, "lang_out", ""))
+        partial = self._recover_by_spans(src_full, target_lang)
+        if partial is not None:
+            state.retry_attempted = True
+            state.retry_outcome = "partial"
+            state.validation_reason = "partial_span_recovery"
+            self._inc_incomplete_once()
+            logger.warning(
+                "Span recovery kept %d translated and %d source segment(s) after protected-content mismatch; not caching.",
+                partial[1], partial[2],
+            )
+            return partial[0], False
         self._inc_incomplete_once()
         logger.warning(
             "Translated output is missing protected content or kept unresolved placeholders. "
             "Check the translated block."
         )
-        return self._retain_missing_protected_values(first, text, mapping, expected), False
+        return self._protected_integrity_fallback(
+            first, text, mapping, expected
+        ), False
+
+    def _split_retry_segments(self, source_full: str) -> list[str]:
+        """Split a block into citation/URL-safe sentence (or clause) segments."""
+        web_spans = [(s, e) for s, e, _ in iter_web_references(source_full)]
+        cites = [m.span() for m in AUTHOR_YEAR_CITATION.finditer(source_full)] + web_spans
+        segments = [s.strip() for s in split_sentences(source_full, citation_spans=cites) if s and s.strip()]
+        if len(segments) <= 1 and len(source_full) > 70:
+            clauses = [
+                c.strip()
+                for c in re.split(r"(?<=[;:\u2014])\s+|(?<=,)\s+(?=(?:however|while|whereas|and|but|which|after|before)\b)", source_full, flags=re.IGNORECASE)
+                if c and c.strip()
+            ]
+            if len(clauses) >= 2:
+                segments = clauses
+        return segments or [source_full]
+
+    def _recover_by_spans(self, source_full: str, target_lang: str):
+        """Keep valid Arabic prose while retaining only the spans that cannot be proven safe.
+
+        Each segment is protected, translated, restored and validated on its own,
+        so one failed protected token no longer turns the whole block English.  A
+        segment that fails any check keeps its exact source text.  Returns
+        ``(text, translated_segments, kept_segments)`` or ``None`` when no
+        segment could be recovered (or the block cannot be split).
+        """
+        segments = self._split_retry_segments(source_full)
+        if len(segments) < 2:
+            return None
+        parts: list[str] = []
+        translated_count = 0
+        kept_count = 0
+        for seg in segments:
+            if _is_pure_passthrough(seg) or is_immutable_technical_text(seg):
+                parts.append(seg)
+                continue
+            seg_prot, seg_map = _protect_numerals(seg)
+            accepted: str | None = None
+            try:
+                raw = self._generate_translation(seg_prot)
+                restored = _restore_numerals(raw, seg_map, strict=False) if seg_map else raw
+                if seg_map:
+                    restored = self._canonicalize_literal_values(restored, seg_map.values())
+                exact = all(
+                    self._protected_value_count(restored, value) == count
+                    for value, count in Counter(seg_map.values()).items()
+                )
+                if (
+                    exact
+                    and not self._find_unresolved_placeholders(seg_prot, restored, seg_map)
+                    and self._retry_target_satisfied(restored)
+                ):
+                    valid, _ = validate_translation_completeness(
+                        seg,
+                        restored,
+                        target_lang=target_lang,
+                        extra_protected=tuple(seg_map.values()),
+                    )
+                    if valid:
+                        accepted = restored.strip()
+            except Exception as exc:  # noqa: BLE001 - recovery must never raise
+                logger.warning("Span recovery failed for one segment: %s", exc)
+            if accepted:
+                parts.append(accepted)
+                translated_count += 1
+            else:
+                parts.append(seg)
+                kept_count += 1
+        if translated_count == 0:
+            return None
+        return " ".join(p for p in parts if p), translated_count, kept_count
+
+    def _retry_semantic_segments(
+        self,
+        source_full: str,
+        mapping: dict[str, str] | None,
+        target_lang: str,
+    ) -> tuple[str, bool]:
+        """Split a failed block into sentence/clause segments, translate each, and re-validate."""
+        segments = self._split_retry_segments(source_full)
+
+        state = self._get_call_state()
+        translated_parts: list[str] = []
+        expected = Counter(mapping.values()) if mapping else Counter()
+        for seg in segments:
+            if _is_pure_passthrough(seg):
+                translated_parts.append(seg)
+                continue
+            seg_prot, seg_map = _protect_numerals(seg)
+            try:
+                seg_raw = self._generate_translation(seg_prot)
+            except Exception as exc:
+                logger.warning("Semantic-segment retry failed: %s", exc)
+                return "", False
+            seg_restored = (
+                _restore_numerals(seg_raw, seg_map, strict=False) if seg_map else seg_raw
+            )
+            if seg_map:
+                seg_restored = self._canonicalize_literal_values(seg_restored, seg_map.values())
+            if self._find_unresolved_placeholders(seg_prot, seg_restored, seg_map):
+                return "", False
+            if any(
+                self._protected_value_count(seg_restored, val) < cnt
+                for val, cnt in Counter(seg_map.values()).items()
+            ):
+                return "", False
+            translated_parts.append(seg_restored.strip())
+
+        reassembled = " ".join(part for part in translated_parts if part)
+        if expected and any(self._protected_value_count(reassembled, v) < c for v, c in expected.items()):
+            return reassembled, False
+        was_inc = getattr(state, "incomplete", False)
+        state.incomplete = False
+        ok, _ = validate_translation_completeness(
+            source_full,
+            reassembled,
+            target_lang=target_lang,
+            extra_protected=tuple(expected.keys()),
+        )
+        if not ok:
+            state.incomplete = was_inc
+            return reassembled, False
+        state.incomplete = was_inc
+        return reassembled, True
 
     def _translate_protected(self, text, mapping, rate_limit_params):
         state = self._get_call_state()
@@ -964,9 +1005,11 @@ class BaseTranslator(ABC):
         before_untranslated = getattr(self, "untranslated_count", 0)
         try:
             output = self.do_translate(text, rate_limit_params)
+            return self._finalize_protected_translation(
+                text, output, mapping, before_untranslated
+            )
         finally:
             state.in_protected_call = False
-        return self._finalize_protected_translation(text, output, mapping, before_untranslated)
 
     def llm_translate(self, text, ignore_cache=False, rate_limit_params: dict = None):
         """
@@ -1113,7 +1156,9 @@ class OpenAITranslator(BaseTranslator):
         self.update_token_count(response)
         raw_content = response.choices[0].message.content.strip()
         if numeral_map:
-            raw_content = _restore_numerals(raw_content, numeral_map)
+            raw_content = _restore_numerals(
+                raw_content, numeral_map, strict=False
+            )
         return raw_content
 
     def prompt(self, text):
@@ -1709,7 +1754,9 @@ class MarianMTTranslator(_Seq2SeqTranslator):
             translation = self._generate_translation(protected_text)
             # Restore original numerals if shielded locally
             if numeral_map:
-                translation = _restore_numerals(translation.strip(), numeral_map)
+                translation = _restore_numerals(
+                    translation.strip(), numeral_map, strict=False
+                )
             return translation
         except Exception as e:
             logger.error(f"Error during MarianMT translation: {e}")
@@ -1800,9 +1847,7 @@ class NLLBTranslator(_Seq2SeqTranslator):
         self.add_cache_impact_parameters("model", self.model_name)
         self.add_cache_impact_parameters("load_in_8bit", str(self.load_in_8bit))
         self._retry_missing_values = (
-            self.model_name in ("facebook/nllb-200-distilled-600M", "facebook/nllb-200-1.3B")
-            and self.src_nllb == "eng_Latn"
-            and self.tgt_nllb == "arb_Arab"
+            self.src_nllb == "eng_Latn" and self.tgt_nllb == "arb_Arab"
         )
         self.add_cache_impact_parameters("max_length", self.max_length)
         if self._retry_missing_values:
@@ -1898,7 +1943,9 @@ class NLLBTranslator(_Seq2SeqTranslator):
             translation = self._generate_translation(protected_text)
             # Restore original numerals if shielded locally
             if numeral_map:
-                translation = _restore_numerals(translation.strip(), numeral_map)
+                translation = _restore_numerals(
+                    translation.strip(), numeral_map, strict=False
+                )
             return translation
         except Exception as e:
             logger.error(f"Error during NLLB translation: {e}")

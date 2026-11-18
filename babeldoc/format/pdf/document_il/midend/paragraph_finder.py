@@ -2039,12 +2039,12 @@ class ParagraphFinder:
         if in_gap:
             gaps.append((gap_start_index, len(collision_counts) - 1))
 
-        # If no significant gaps are found, treat it as a single line.
+        # Tight leading and mathematical glyphs can fill the space between two
+        # real baselines. Verify baseline clusters before assuming one line.
         if not gaps:
-            # all_chars.sort(key=lambda c: c.visual_bbox.box.x)
-            single_line_composition = self.create_line(all_chars)
+            rows = self._split_overlapping_source_rows(all_chars)
             paragraph.pdf_paragraph_composition = [
-                single_line_composition
+                self.create_line(row) for row in rows
             ] + other_compositions
             self.update_paragraph_data(paragraph)
             return
@@ -2073,18 +2073,59 @@ class ParagraphFinder:
         # 6. Rebuild the paragraph's composition list from the new lines.
         new_line_compositions = []
         for line_chars in lines:
-            if line_chars:
+            for source_row in self._split_overlapping_source_rows(line_chars) if line_chars else []:
                 # Sort characters within each line by x-coordinate (left-to-right).
-                line_chars.sort(
+                source_row.sort(
                     key=lambda c: c.visual_bbox.box.x
                     if c.visual_bbox and c.visual_bbox.box
                     else c.box.x
                 )
-                new_line_compositions.append(self.create_line(line_chars))
+                new_line_compositions.append(self.create_line(source_row))
 
         # The lines are already sorted vertically due to the scanning process.
         paragraph.pdf_paragraph_composition = new_line_compositions + other_compositions
         self.update_paragraph_data(paragraph)
+
+    @staticmethod
+    def _split_overlapping_source_rows(chars: list[PdfCharacter]) -> list[list[PdfCharacter]]:
+        """Recover closely set prose rows using stable source boxes and letter baselines."""
+        anchors = [
+            ch for ch in chars
+            if ch.box and not ch.vertical and not ch.formula_layout_id
+            and (ch.char_unicode or "").isalpha()
+        ]
+        if len(anchors) < 8:
+            return [chars]
+        typical = statistics.median(ch.box.y2 - ch.box.y for ch in anchors)
+        if typical <= 0:
+            return [chars]
+
+        groups: list[list[PdfCharacter]] = []
+        for ch in sorted(anchors, key=lambda ch: -ch.box.y):
+            if not 0.72 * typical <= ch.box.y2 - ch.box.y <= 1.35 * typical:
+                continue
+            if not groups or groups[-1][0].box.y - ch.box.y > 0.25 * typical:
+                groups.append([])
+            groups[-1].append(ch)
+
+        rows = [group for group in groups if len(group) >= 4]
+        if len(rows) < 2:
+            return [chars]
+        bands = [
+            (statistics.median(ch.box.y for ch in row), min(ch.box.x for ch in row), max(ch.box.x2 for ch in row))
+            for row in rows
+        ]
+        for upper, lower in zip(bands, bands[1:]):
+            overlap = min(upper[2], lower[2]) - max(upper[1], lower[1])
+            if upper[0] - lower[0] < 0.65 * typical or overlap < 0.35 * min(upper[2] - upper[1], lower[2] - lower[1]):
+                return [chars]
+
+        result = [[] for _ in bands]
+        for char in chars:
+            y = char.box.y if char.box else char.visual_bbox.box.y
+            index = min(range(len(bands)), key=lambda j: abs(y - bands[j][0]))
+            result[index].append(char)
+        return [sorted(row, key=lambda ch: ch.box.x if ch.box else ch.visual_bbox.box.x) for row in result]
 
     def process_paragraph_spacing(self, paragraph: PdfParagraph):
         if not paragraph.pdf_paragraph_composition:
@@ -2805,6 +2846,11 @@ class ParagraphFinder:
             texts = [text for _, text in visual_lines]
             procedure_mode = any(procedure_pattern.match(text) for text in texts)
             contact_mode = any(contact_pattern.search(text) for text in texts)
+            form_mode = (
+                len(visual_lines) >= 3
+                and sum(text.count(":") for text in texts) >= 2
+                and sum(ch in "☐☑☒□✓" for text in texts for ch in text) >= 2
+            )
             if any(k in para_label for k in ("table", "footnote", "abandon")) and not (procedure_mode or contact_mode):
                 continue
             section_indices = [
@@ -2815,7 +2861,7 @@ class ParagraphFinder:
                 and section_pattern.match(text)
                 and not quantity_line_pattern.match(text)
             ]
-            if not (procedure_mode or contact_mode or section_indices):
+            if not (procedure_mode or contact_mode or form_mode or section_indices):
                 continue
 
             replacement: list[PdfParagraph] = []
@@ -2831,7 +2877,7 @@ class ParagraphFinder:
                         else "procedure_step_body"
                     )
                     replacement.append(clone_with(paragraph, [composition], label))
-            elif contact_mode:
+            elif contact_mode or form_mode:
                 # Phone numbers are often tagged as formula runs immediately
                 # after the ``Tel:`` line composition. Keep non-line fragments
                 # with their preceding row so exact values survive.
@@ -2842,7 +2888,7 @@ class ParagraphFinder:
                     else:
                         contact_rows[-1].append(composition)
                 replacement.extend(
-                    clone_with(paragraph, row, "contact_card")
+                    clone_with(paragraph, row, "form_row" if form_mode else "contact_card")
                     for row in contact_rows
                 )
             else:

@@ -38,7 +38,9 @@ from babeldoc.format.pdf.document_il.utils.layout_helper import is_same_style
 from babeldoc.format.pdf.document_il.utils.spatial_analyzer import (
     is_element_contained_in_formula,
 )
+from babeldoc.format.pdf.document_il.utils.web_references import iter_web_references
 from babeldoc.format.pdf.translation_config import TranslationConfig
+from babeldoc.translator.translator import _ATOMIC_EXPRESSION
 
 
 class StylesAndFormulas:
@@ -410,6 +412,8 @@ class StylesAndFormulas:
         formula_font_ids: set[int],
         first_is_bullet_so_far: bool,
         line_index: int,
+        web_reference_chars: set[int] | None = None,
+        chemical_expression_chars: set[int] | None = None,
     ) -> tuple[list[tuple[PdfCharacter, bool]], bool]:
         """
         Phase 1: Classify every character in a composition as either formula or text.
@@ -429,6 +433,16 @@ class StylesAndFormulas:
 
         # Determine the `is_formula` tag for each character
         for i, char in enumerate(line.pdf_character):
+            if web_reference_chars and id(char) in web_reference_chars:
+                is_formula_tags.append(False)
+                corner_mark_info.append(False)
+                in_formula_state = in_corner_mark_state = False
+                continue
+            if chemical_expression_chars and id(char) in chemical_expression_chars:
+                is_formula_tags.append(True)
+                corner_mark_info.append(False)
+                in_formula_state, in_corner_mark_state = True, False
+                continue
             # The original logic for `first_is_bullet`: it is set if any segment starts with a bullet.
             # A "segment" started when `current_chars` was empty.
             # We determine the start of a segment by looking at the previous char's tag.
@@ -636,6 +650,32 @@ class StylesAndFormulas:
             if not paragraph.pdf_paragraph_composition:
                 continue
 
+            # URL punctuation (particularly '=' and '_') is literal text. Scan
+            # across source lines before classifying those glyphs as operators.
+            source_parts = []
+            char_ids: list[int | None] = []
+            for composition in paragraph.pdf_paragraph_composition:
+                if composition.pdf_line:
+                    for char in composition.pdf_line.pdf_character:
+                        value = char.char_unicode or " "
+                        source_parts.append(value)
+                        char_ids.extend([id(char)] * len(value))
+                source_parts.append("\n" if composition.pdf_line else "<>")
+                char_ids.extend([None] * len(source_parts[-1]))
+            source_text = "".join(source_parts)
+            web_reference_chars = {
+                char_id
+                for start, end, _ in iter_web_references(source_text)
+                for char_id in char_ids[start:end]
+                if char_id is not None
+            }
+            chemical_expression_chars = {
+                char_id
+                for match in _ATOMIC_EXPRESSION.finditer(source_text)
+                for char_id in char_ids[match.start():match.end()]
+                if char_id is not None
+            }
+
             current_formula_font_ids: set[int]
             if (
                 paragraph.xobj_id
@@ -662,6 +702,8 @@ class StylesAndFormulas:
                     current_formula_font_ids,
                     first_is_bullet,
                     line_index,
+                    web_reference_chars,
+                    chemical_expression_chars,
                 )
 
                 if not tagged_chars:

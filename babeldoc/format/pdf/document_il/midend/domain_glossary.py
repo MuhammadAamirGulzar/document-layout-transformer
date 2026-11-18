@@ -10,12 +10,59 @@ Set the environment variable ``TRANSDOC_DOMAIN_GLOSSARY=0`` to disable them.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import threading
-from typing import Iterable
+from pathlib import Path
+from typing import Any, Iterable
 
 _I = re.IGNORECASE
+_GLOSSARY_JSON_PATH = Path(__file__).with_name("terminology_glossary.json")
+
+
+def _load_structured_glossary() -> dict[str, Any]:
+    if not _GLOSSARY_JSON_PATH.exists():
+        return {}
+    try:
+        data = json.loads(_GLOSSARY_JSON_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+_GLOSSARY_DATA = _load_structured_glossary()
+_GLOSSARY_PRE_RULES: list[tuple[str, re.Pattern, str]] = [
+    (
+        str(item.get("domain", "any") or "any"),
+        re.compile(
+            str(item["pattern"]),
+            _I if item.get("ignore_case", True) else 0,
+        ),
+        str(item["replacement"]),
+    )
+    for item in (_GLOSSARY_DATA.get("pre_rules") or [])
+    if item.get("pattern") and "replacement" in item
+]
+_GLOSSARY_POST_RULES: list[tuple[re.Pattern, re.Pattern, str]] = [
+    (
+        re.compile(str(item["source_pattern"]), _I),
+        re.compile(str(item["pattern"])),
+        str(item["replacement"]),
+    )
+    for item in (_GLOSSARY_DATA.get("post_rules") or [])
+    if item.get("source_pattern") and item.get("pattern") and "replacement" in item
+]
+_TRACKED_GLOSSARY_TERMS: list[dict[str, Any]] = [
+    {
+        "source_term": str(item["source_term"]),
+        "source_re": re.compile(str(item["source_pattern"]), _I),
+        "canonical": str(item.get("canonical") or item["source_term"]),
+        "variant_res": [re.compile(str(vp)) for vp in (item.get("variant_patterns") or []) if vp],
+    }
+    for item in (_GLOSSARY_DATA.get("tracked_terms") or [])
+    if item.get("source_term") and item.get("source_pattern")
+]
 
 
 def _enabled() -> bool:
@@ -338,10 +385,68 @@ class DocumentTranslationMemory:
         self._max_entries = max_entries
         self._hits = 0
         self._misses = 0
+        self._term_variants: dict[str, dict[str, int]] = {}
+        self._term_canonical: dict[str, str] = {}
+        self._source_conflicts: dict[str, set[str]] = {}
 
     @staticmethod
     def _normalize_key(text: str) -> str:
         return re.sub(r"\s+", " ", (text or "").strip())
+
+    def record_term_observations(
+        self,
+        source_text: str,
+        translated_text: str,
+        *,
+        domain: str | None = None,
+        abbreviations: dict[str, str] | None = None,
+    ) -> None:
+        """Track surface forms of recurring high-impact terms to detect inconsistencies."""
+        if not source_text or not translated_text:
+            return
+        with self._lock:
+            for spec in _TRACKED_GLOSSARY_TERMS:
+                if not spec["source_re"].search(source_text):
+                    continue
+                term = spec["source_term"]
+                self._term_canonical.setdefault(term, spec["canonical"])
+                for pat in spec["variant_res"]:
+                    if pat.search(translated_text):
+                        counts = self._term_variants.setdefault(term, {})
+                        counts[pat.pattern] = counts.get(pat.pattern, 0) + 1
+                        break
+            for acro, exp in (abbreviations or {}).items():
+                if not acro or not re.search(rf"\b{re.escape(acro)}\b", source_text):
+                    continue
+                if re.search(rf"\b{re.escape(acro)}\b", translated_text):
+                    counts = self._term_variants.setdefault(acro, {})
+                    counts[acro] = counts.get(acro, 0) + 1
+                    self._term_canonical.setdefault(acro, exp or acro)
+
+    def conflicts(self) -> list[dict[str, Any]]:
+        """Return terms or repeated source segments observed with conflicting translations."""
+        with self._lock:
+            out: list[dict[str, Any]] = []
+            for term, counts in sorted(self._term_variants.items()):
+                if len(counts) >= 2:
+                    out.append(
+                        {
+                            "source_term": term,
+                            "canonical": self._term_canonical.get(term, term),
+                            "variants": sorted(counts.keys()),
+                            "variant_counts": dict(counts),
+                        }
+                    )
+            for norm_src, variants in sorted(self._source_conflicts.items()):
+                if len(variants) >= 2:
+                    out.append(
+                        {
+                            "source_term": norm_src[:100],
+                            "canonical": sorted(variants)[0],
+                            "variants": sorted(variants),
+                        }
+                    )
+            return out
 
     @classmethod
     def is_eligible(cls, text: str) -> bool:
@@ -400,16 +505,22 @@ class DocumentTranslationMemory:
             norm_src,
         )
         with self._lock:
+            existing = self._entries.get(key)
+            if existing is not None and existing.strip() != norm_tgt:
+                self._source_conflicts.setdefault(norm_src, {existing.strip()}).add(norm_tgt)
             if len(self._entries) >= self._max_entries and key not in self._entries:
                 return
             self._entries.setdefault(key, translated_text)
 
-    def stats(self) -> dict[str, int]:
+    def stats(self) -> dict[str, Any]:
+        conflicts = self.conflicts()
         with self._lock:
             return {
                 "entries": len(self._entries),
                 "hits": self._hits,
                 "misses": self._misses,
+                "terminology_conflict_count": len(conflicts),
+                "terminology_conflicts": conflicts,
             }
 
 
@@ -428,6 +539,9 @@ def apply_pre_glossary(
             return stripped
     for pattern, replacement in _PRE_RULES:
         text = pattern.sub(replacement, text)
+    for rule_domain, pattern, replacement in _GLOSSARY_PRE_RULES:
+        if rule_domain == "any" or rule_domain == domain:
+            text = pattern.sub(replacement, text)
     for pattern, replacement in _PRE_WHOLE_TEXT:
         if pattern.fullmatch(text):
             return replacement
@@ -446,6 +560,18 @@ def apply_post_glossary(
     for pattern, replacement in _POST_RULES:
         text = pattern.sub(replacement, text)
     if source_text:
+        for src_pat, dst_pat, replacement in _GLOSSARY_POST_RULES:
+            if src_pat.search(source_text):
+                text = dst_pat.sub(replacement, text)
+        if abbreviations:
+            for acro in abbreviations:
+                if len(acro) >= 3 and re.search(rf"\b{re.escape(acro)}\b", source_text):
+                    # Normalize accidental title/lowercase Latin variant of document acronym
+                    text = re.sub(
+                        rf"\b{re.escape(acro.capitalize())}\b",
+                        acro,
+                        text,
+                    )
         src_lower = source_text.lower()
         if "country programme document" in src_lower:
             text = re.sub(
@@ -459,6 +585,8 @@ def apply_post_glossary(
                 r'\1البرنامج القطري',
                 text,
             )
+        if re.search(r"\bexecutive\s+summary\b", src_lower):
+            text = re.sub(_B + r"(?:الملخص|ملخص)\s+التنفيذي\b", r"\1الموجز التنفيذي", text)
         if re.search(r'\bprogramme\s+priorities\s+and\s+partnerships\b', src_lower):
             text = re.sub(_B + r'أولويات\s+البرنامج\s+والشركات\b', r'\1أولويات البرنامج والشراكات', text)
         if re.search(r'\bunicef\s+outcomes?\b', src_lower):
@@ -531,7 +659,7 @@ def apply_post_glossary(
             and (domain == "financial_banking" or re.search(r'\b(?:clearing\s+house|ach|qatch|settlement|iban|payment|bank|cheque|check)\b', src_lower))
             and not re.search(r'\b(?:cache|forest|brush|land|throat)\b', src_lower)
         ):
-            text = re.sub(_B + r'(?:التنظيف|تنظيف)\b', r'\1المقاصة', text)
+            text = re.sub(_B + r'(?:التنظيف|تنظيف|التصفية|تصفية)\b', r'\1المقاصة', text)
         if re.search(r'\bcheck\s+digit\b', src_lower):
             text = re.sub(_B + r'(?:تولد\s+المال\s+التحقق|تحديدات\s+الاختبار)\b', r'\1رقم التحقق', text)
         if re.search(r'\bqty\b', src_lower):

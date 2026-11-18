@@ -23,6 +23,7 @@ from babeldoc.format.pdf.document_il.utils.arabic_shaper import shape_arabic_run
 from babeldoc.format.pdf.document_il.utils.formular_helper import update_formula_data
 from babeldoc.format.pdf.document_il.utils.layout_helper import box_to_tuple
 from babeldoc.format.pdf.document_il.utils.layout_semantics import (
+    assign_page_region_groups,
     is_standalone_code_text,
     paragraph_semantic_zone,
 )
@@ -1141,6 +1142,7 @@ class Typesetting:
         page_width = page_box.x2 - page_box.x
         content_left = page_box.x + page_width * 0.055
         content_right = page_box.x2 - page_width * 0.055
+        self._anchor_text_next_to_illustrations(page)
         for paragraph in page.pdf_paragraph or []:
             if not paragraph.box:
                 continue
@@ -1153,6 +1155,8 @@ class Typesetting:
                 and paragraph.box.x2 - paragraph.box.x < page_width * 0.60
             )
             if not (is_structured or is_narrow_heading):
+                continue
+            if (paragraph.pipeline_trace or {}).get("anchored_to_illustration"):
                 continue
             if "fallback_line" in label or self._is_inside_table_or_figure_region(paragraph.box, page):
                 continue
@@ -1170,9 +1174,13 @@ class Typesetting:
                     paragraph.box.y2,
                 )
                 continue
-            # Do not expand laterally across images/barcodes or side-by-side cards/paragraphs.
+            # Do not expand laterally across column lanes, images/barcodes, or side-by-side cards.
             cand_left = min(paragraph.box.x, content_left)
             cand_right = max(paragraph.box.x2, content_right)
+            col_lane = (paragraph.pipeline_trace or {}).get("column_lane")
+            if isinstance(col_lane, (list, tuple)) and len(col_lane) == 2:
+                cand_left = max(cand_left, float(col_lane[0]))
+                cand_right = min(cand_right, float(col_lane[1]))
             for form in getattr(page, "pdf_form", None) or []:
                 fbox = getattr(form, "box", None)
                 if fbox and min(fbox.y2, paragraph.box.y2) - max(fbox.y, paragraph.box.y) > 2.0:
@@ -1868,13 +1876,16 @@ class Typesetting:
         # The paragraph must always be formatted.
         if best_typeset_units is not None and len(best_typeset_units) > 0:
             min_unit_y = min((u.box.y for u in best_typeset_units if u.box and u.box.y is not None), default=box.y)
-            safe_bottom = self.get_max_bottom_space(box, page) + safety_margin
+            safe_bottom = self.get_max_bottom_space(box, page, paragraph=paragraph) + safety_margin
             if min_unit_y < safe_bottom:
-                delta = safe_bottom - min_unit_y
+                # Never lift an unfittable block over its own row or the
+                # preceding footnote in the best-effort fallback.
+                max_unit_y2 = max((u.box.y2 for u in best_typeset_units if u.box), default=box.y2)
+                delta = min(safe_bottom - min_unit_y, max(0.0, box.y2 - max_unit_y2))
                 best_typeset_units = self._shift_laid_out_units_vertically(
                     best_typeset_units, delta
                 )
-                min_unit_y = safe_bottom
+                min_unit_y += delta
             if min_unit_y < paragraph.box.y:
                 paragraph.box = Box(
                     x=paragraph.box.x,
@@ -2009,6 +2020,7 @@ class Typesetting:
             self._paginate_overflowing_pages(document)
             for final_page in document.page:
                 self._report_clipped_content(final_page, record_to_ledger=True)
+            self._record_pagination_metrics(document)
         finally:
             self._in_typesetting_document = False
         
@@ -2107,6 +2119,7 @@ class Typesetting:
             )
         # A direct render_page() call (used by tests and API retries) may not
         # have passed through preprocessing, so finalize table geometry here too.
+        assign_page_region_groups(page)
         self._ensure_semantic_table_models(page)
         self._synchronize_table_row_heights(page)
         # Balance table row widths before rendering
@@ -2121,13 +2134,26 @@ class Typesetting:
         header_rules = self._find_header_underlines(page)
 
         # Start typesetting layout rendering
+        source_boxes = {
+            id(paragraph): copy.copy(paragraph.box)
+            for paragraph in page.pdf_paragraph
+            if paragraph.box is not None
+        }
         for paragraph in page.pdf_paragraph:
             self.render_paragraph(paragraph, page, fonts)
         self._audit_arabic_font_ownership(page)
+        # Enforce known cell/card/column lanes before the generic collision
+        # resolver. Otherwise longer RTL text from neighboring columns can be
+        # mistaken for a vertical collision and pushed onto a blank
+        # continuation page.
+        self._contain_rendered_region_bounds(page)
+        self._contain_bottom_fixed_lanes(page)
         self._resolve_rendered_text_collisions(page)
         self._resolve_table_row_and_body_clearance(page)
         self._audit_table_cells_after_render(page)
         self._anchor_inline_highlight_curves(page)
+        self._validate_rendered_regions(page)
+        self._avoid_decorative_shape_collisions(page, source_boxes)
         self._report_clipped_content(
             page,
             record_to_ledger=not self._in_typesetting_document,
@@ -2145,9 +2171,13 @@ class Typesetting:
         severity: str = "warning",
     ) -> None:
         key = (page_number, kind, debug_id, detail)
-        if key in self._reported_layout_issue_keys:
+        reported_keys = getattr(self, "_reported_layout_issue_keys", None)
+        if reported_keys is None:
+            reported_keys = set()
+            self._reported_layout_issue_keys = reported_keys
+        if key in reported_keys:
             return
-        self._reported_layout_issue_keys.add(key)
+        reported_keys.add(key)
         issue = {
             "page": page_number,
             "kind": kind,
@@ -2155,7 +2185,11 @@ class Typesetting:
             "debug_id": debug_id,
             "severity": severity,
         }
-        self._layout_issues.append(issue)
+        layout_issues = getattr(self, "_layout_issues", None)
+        if layout_issues is None:
+            layout_issues = []
+            self._layout_issues = layout_issues
+        layout_issues.append(issue)
         shared = getattr(self.translation_config, "shared_context_cross_split_part", None)
         if shared is not None:
             shared_issues = getattr(shared, "layout_issues", None)
@@ -2275,8 +2309,10 @@ class Typesetting:
 
     @staticmethod
     def _is_footnote_paragraph(paragraph: il_version_1.PdfParagraph) -> bool:
-        """Whether a paragraph is a page footnote or table footnote."""
-        return "footnote" in (paragraph.layout_label or "").lower()
+        """Whether a paragraph belongs to the page's bottom footnote zone."""
+        label = (paragraph.layout_label or "").lower()
+        trace = paragraph.pipeline_trace or {}
+        return "footnote" in label and "table_footnote" not in label and not trace.get("cell_id")
 
     def _is_top_band_header(
         self,
@@ -2301,13 +2337,25 @@ class Typesetting:
         page: il_version_1.Page,
     ) -> bool:
         label = (paragraph.layout_label or "").lower()
+        trace = getattr(paragraph, "pipeline_trace", None) or {}
         crop = page.cropbox.box if page.cropbox and page.cropbox.box else None
         if any(marker in label for marker in ("footer", "page_footer", "page_number")):
             if crop is None or not paragraph.box:
                 return True
             mid_y = (crop.y + crop.y2) * 0.5
             return paragraph.box.y2 <= mid_y
+        if crop is not None and paragraph.box and label == "abandon":
+            text = re.sub(r"[\u200e\u200f\u202a-\u202e\u2066-\u2069]", "", paragraph.unicode or "").strip()
+            if (
+                paragraph.box.y2 <= crop.y + (crop.y2 - crop.y) * 0.06
+                and re.fullmatch(r"\d+[-/]\d+", text)
+            ):
+                return True
+        if trace.get("page_overflow") or trace.get("region_type") in {"card", "form_pair", "figure", "table"}:
+            return False
         if crop is not None and paragraph.box and self._is_header_or_footer(paragraph, page):
+            if paragraph.box.y < crop.y - 1.0:
+                return False
             height = max(1.0, crop.y2 - crop.y)
             return paragraph.box.y2 <= crop.y + height * 0.12
         return False
@@ -2800,8 +2848,11 @@ class Typesetting:
         dy: float = 0.0,
     ) -> None:
         """Translate a rendered paragraph and all child glyphs/curves cleanly."""
+        shifted_box_ids: set[int] = set()
+
         def shift_box(box: Box | None) -> None:
-            if box:
+            if box and id(box) not in shifted_box_ids:
+                shifted_box_ids.add(id(box))
                 box.x += dx
                 box.x2 += dx
                 box.y += dy
@@ -3027,6 +3078,29 @@ class Typesetting:
                                 trace["page_overflow"] = True
                                 trace["body_floor"] = zones["body_floor"]
                     else:
+                        # Text originally above this table (including form
+                        # labels and payment terms) should clear it upward if
+                        # the original page still has room for the block.
+                        ceiling = zones["body_ceiling"]
+                        enclosing = self._find_enclosing_region_box(para, page)
+                        if enclosing is not None:
+                            ceiling = min(ceiling, enclosing.y2 - 1.5)
+                        for neighbor in page.pdf_paragraph:
+                            if neighbor is para:
+                                continue
+                            nr = self._rendered_text_box(neighbor)
+                            if nr and nr.y >= pr.y2 - 0.5 and self._boxes_overlap_horizontally(pr, nr):
+                                ceiling = min(ceiling, nr.y - 3.0)
+                        shift_up = t_y2 + 4.0 - pr.y
+                        if 0.25 < shift_up <= ceiling - pr.y2:
+                            self._translate_rendered_paragraph(para, dy=shift_up)
+                            trace = self._ensure_pipeline_trace(para)
+                            if trace.get("overflow_reason") == "body_fixed_table_collision":
+                                trace.pop("page_overflow", None)
+                                trace.pop("overflow_reason", None)
+                            trace["table_clearance_adjusted"] = True
+                            moved += 1
+                            continue
                         trace = self._ensure_pipeline_trace(para)
                         trace["page_overflow"] = True
                         trace["overflow_reason"] = "body_fixed_table_collision"
@@ -3062,6 +3136,7 @@ class Typesetting:
             is_fixed_or_irregular = any(
                 "fixed_rtl" in (c.layout_label or "").lower()
                 or (c.pipeline_trace or {}).get("preserve_irregular_table")
+                or (c.pipeline_trace or {}).get("anchored_numeric_columns")
                 for c in cells
             )
             if not is_fixed_or_irregular:
@@ -3125,6 +3200,8 @@ class Typesetting:
                 h_ov = max(0.0, min(x2_a, x2_b) - max(x0_a, x0_b))
                 min_w = max(1.0, min(x2_a - x0_a, x2_b - x0_b))
                 if h_ov < min_w * 0.20:
+                    continue
+                if any((c.pipeline_trace or {}).get("anchored_numeric_columns") for c in cells_b):
                     continue
                 if top_b > bot_a - 5.0:
                     dy = top_b - (bot_a - 5.0)
@@ -3241,7 +3318,7 @@ class Typesetting:
         line_tol = max(2.5, heights[len(heights) // 2] * 0.45)
 
         lines: list[dict] = []
-        for comp, box in compositions:
+        for comp in compositions:
             cbox = self._composition_item_box(comp)
             if cbox is None:
                 if lines:
@@ -3368,6 +3445,133 @@ class Typesetting:
                 for ch in comp.pdf_same_style_characters.pdf_character or []:
                     ch.xobj_id = None
 
+    def _record_pagination_metrics(self, document: il_version_1.Document) -> dict[str, int]:
+        """Compute and record pagination quality metrics onto ContentLedger."""
+        sparse_continuation_pages = 0
+        clipped_fragment_count = 0
+        group_pages: dict[str, set[int]] = {}
+
+        for page in document.page or []:
+            crop = page.cropbox.box if page.cropbox and page.cropbox.box else None
+            crop_h = max(1.0, crop.y2 - crop.y) if crop is not None else 842.0
+            paras = list(page.pdf_paragraph or [])
+
+            if getattr(page, "continuation_of_page", None) is not None:
+                total_h = 0.0
+                total_chars = 0
+                painted_area = 0.0
+                for para in paras:
+                    box = self._rendered_text_box(para) or para.box
+                    if box is not None:
+                        total_h += max(0.0, box.y2 - box.y)
+                        painted_area += max(0.0, box.x2 - box.x) * max(0.0, box.y2 - box.y)
+                    total_chars += sum(
+                        len((char.char_unicode or "").strip())
+                        for char in self._iter_paragraph_glyphs(para)
+                    )
+                # A stray line, small icon or copied decoration does not make
+                # a continuation page with one short fragment substantial.
+                crop_area = crop_h * (crop.x2 - crop.x if crop is not None else 595.0)
+                artwork_area = sum(
+                    max(0.0, box.x2 - box.x) * max(0.0, box.y2 - box.y)
+                    for item in [*page.pdf_rectangle, *page.pdf_curve, *page.pdf_form]
+                    if (box := item.box) is not None
+                )
+                has_artwork = artwork_area >= crop_area * 0.02
+                occupied_ratio = min(1.0, (painted_area + artwork_area) / max(1.0, crop_area))
+                min_occ = 0.12 if len(paras) <= 1 else 0.04
+                if len(paras) == 0 or (
+                    not has_artwork
+                    and (
+                        (
+                            total_h < max(36.0, crop_h * 0.06)
+                            and total_chars < 60
+                        )
+                        or occupied_ratio < min_occ
+                    )
+                ):
+                    sparse_continuation_pages += 1
+
+            for para in paras:
+                trace = para.pipeline_trace or {}
+                rendered = self._rendered_text_box(para)
+                text = (para.unicode or "").strip()
+                is_clipped = bool(trace.get("clipped"))
+                if not is_clipped:
+                    if rendered is None and text and not para.vertical:
+                        is_clipped = True
+                    elif rendered is not None and crop is not None and (
+                        rendered.x < crop.x - 1.0
+                        or rendered.x2 > crop.x2 + 1.0
+                        or rendered.y < crop.y - 1.0
+                        or rendered.y2 > crop.y2 + 1.0
+                    ):
+                        is_clipped = True
+                if is_clipped:
+                    clipped_fragment_count += 1
+
+                gid = trace.get("region_group_id")
+                rtype = trace.get("region_type")
+                if gid and rtype in {"card", "form_pair", "figure"}:
+                    group_pages.setdefault(str(gid), set()).add(page.page_number)
+
+        detached_group_count = sum(1 for pages in group_pages.values() if len(pages) > 1)
+        metrics = {
+            "sparse_continuation_pages": sparse_continuation_pages,
+            "clipped_fragment_count": clipped_fragment_count,
+            "detached_group_count": detached_group_count,
+        }
+        shared = getattr(self.translation_config, "shared_context_cross_split_part", None)
+        ledger = getattr(shared, "content_ledger", None) if shared is not None else None
+        if ledger is not None and hasattr(ledger, "record_pagination_metrics"):
+            ledger.record_pagination_metrics(**metrics)
+        return metrics
+
+    @staticmethod
+    def _box_x_overlap_significant(first: Box, second: Box) -> bool:
+        overlap = min(first.x2, second.x2) - max(first.x, second.x)
+        if overlap <= 0.0:
+            return False
+        min_w = max(1.0, min(first.x2 - first.x, second.x2 - second.x))
+        return overlap >= min(8.0, 0.2 * min_w)
+
+    def _collect_region_shapes(
+        self,
+        page: il_version_1.Page,
+        region_box: Box,
+        crop: Box,
+    ) -> tuple[list[il_version_1.PdfRectangle], list[il_version_1.PdfCurve]]:
+        """Collect non-page-wide border/fill shapes belonging to an overflowing region."""
+        page_w = max(1.0, crop.x2 - crop.x)
+        page_h = max(1.0, crop.y2 - crop.y)
+        rects: list[il_version_1.PdfRectangle] = []
+        curves: list[il_version_1.PdfCurve] = []
+        tol = 4.0
+
+        def _matches(box: Box | None) -> bool:
+            if box is None:
+                return False
+            bw = max(0.0, box.x2 - box.x)
+            bh = max(0.0, box.y2 - box.y)
+            if bw > page_w * 0.85 or (bw > page_w * 0.80 and bh > page_h * 0.80):
+                return False
+            return (
+                box.x >= region_box.x - tol
+                and box.x2 <= region_box.x2 + tol
+                and box.y >= region_box.y - tol
+                and box.y2 <= region_box.y2 + tol
+            )
+
+        for rect in list(page.pdf_rectangle or []):
+            if _matches(getattr(rect, "box", None)):
+                rects.append(rect)
+                page.pdf_rectangle.remove(rect)
+        for curve in list(page.pdf_curve or []):
+            if _matches(getattr(curve, "box", None)):
+                curves.append(curve)
+                page.pdf_curve.remove(curve)
+        return rects, curves
+
     def _paginate_overflowing_pages(self, document: il_version_1.Document) -> int:
         """Reflow overflowing body prose cleanly onto inserted continuation pages.
 
@@ -3385,6 +3589,9 @@ class Typesetting:
             crop = src_page.cropbox.box if src_page.cropbox and src_page.cropbox.box else None
             if crop is None:
                 continue
+
+            if not any((p.pipeline_trace or {}).get("region_group_id") for p in (src_page.pdf_paragraph or [])):
+                assign_page_region_groups(src_page)
 
             zones = self._get_page_vertical_zones(src_page)
             body_floor = zones["body_floor"]
@@ -3413,12 +3620,33 @@ class Typesetting:
 
             movable.sort(key=lambda item: (-item[1].y2, item[1].x))
 
-            overflow_queue: list[tuple[il_version_1.PdfParagraph, Box, list[il_version_1.PdfRectangle]]] = []
-            overflow_cutoff_y2: float | None = None
-            keep_paragraphs = set(id(p) for p in src_page.pdf_paragraph or [])
-
+            group_members_map: dict[str, list[tuple[il_version_1.PdfParagraph, Box]]] = {}
             for para, rbox in movable:
                 trace = para.pipeline_trace or {}
+                gid = trace.get("region_group_id")
+                if gid and trace.get("region_type") in {"card", "form_pair"}:
+                    group_members_map.setdefault(str(gid), []).append((para, rbox))
+
+            # Queue item: (paragraphs, group_box, attached_rects, attached_curves, is_rigid_group)
+            overflow_queue: list[
+                tuple[
+                    list[il_version_1.PdfParagraph],
+                    Box,
+                    list[il_version_1.PdfRectangle],
+                    list[il_version_1.PdfCurve],
+                    bool,
+                ]
+            ] = []
+            overflow_lanes: list[tuple[float, Box]] = []
+            keep_paragraphs = set(id(p) for p in src_page.pdf_paragraph or [])
+            handled_group_ids: set[str] = set()
+
+            for para, rbox in movable:
+                if id(para) not in keep_paragraphs:
+                    continue
+                trace = para.pipeline_trace or {}
+                gid = trace.get("region_group_id")
+                rtype = trace.get("region_type")
                 violates_offpage = rbox.y < crop.y + 4.0
                 violates_footnote = has_footnotes and rbox.y < body_floor - 1.0
                 violates_content = rbox.y < content_floor - 2.0 and (
@@ -3426,7 +3654,12 @@ class Typesetting:
                     or bool(trace.get("page_overflow"))
                     or rbox.y < crop.y + 8.0
                 )
-                follows_moved_stream = overflow_cutoff_y2 is not None and rbox.y2 <= overflow_cutoff_y2 + 0.5
+                follows_moved_stream = any(
+                    rbox.y2 <= cutoff + 0.5
+                    and min(rbox.x2, lane.x2) - max(rbox.x, lane.x)
+                    >= 0.30 * max(1.0, min(rbox.x2 - rbox.x, lane.x2 - lane.x))
+                    for cutoff, lane in overflow_lanes
+                )
                 is_overflowing = (
                     bool(trace.get("page_overflow"))
                     or violates_offpage
@@ -3437,23 +3670,152 @@ class Typesetting:
                 if not is_overflowing:
                     continue
 
+                # Cohesive card/form_pair groups: check live drawn enclosures on src_page.
+                # Keep enclosed groups anchored when inside page bounds, or relocate
+                # the entire group + artwork rigidly together when overflowing.
+                if gid and rtype in {"card", "form_pair"} and gid in group_members_map:
+                    if gid in handled_group_ids:
+                        continue
+                    members = group_members_map[str(gid)]
+                    live_enclosing = next(
+                        (
+                            enc
+                            for m_para, _ in members
+                            if (enc := self._find_enclosing_region_box(m_para, src_page)) is not None
+                        ),
+                        None,
+                    )
+                    if live_enclosing is not None:
+                        handled_group_ids.add(str(gid))
+                        group_offpage = any(m_rb.y < crop.y + 4.0 for _, m_rb in members) or (
+                            live_enclosing.y < crop.y + 4.0
+                        )
+                        group_in_footnote = has_footnotes and all(m_rb.y < body_floor - 1.0 for _, m_rb in members)
+                        if not group_offpage and not group_in_footnote:
+                            if violates_footnote or violates_content or trace.get("page_overflow"):
+                                self._record_layout_issue(
+                                    page_number=src_page.page_number,
+                                    kind="contained_region_overflow",
+                                    detail="Text in a drawn region needs more room on the source page.",
+                                    debug_id=para.debug_id,
+                                    severity="warning",
+                                )
+                            continue
+
+                        min_x = min(min(m_rb.x for _, m_rb in members), live_enclosing.x)
+                        min_y = min(min(m_rb.y for _, m_rb in members), live_enclosing.y)
+                        max_x2 = max(max(m_rb.x2 for _, m_rb in members), live_enclosing.x2)
+                        max_y2 = max(max(m_rb.y2 for _, m_rb in members), live_enclosing.y2)
+                        group_box = Box(min_x, min_y, max_x2, max_y2)
+                        group_rects, group_curves = self._collect_region_shapes(src_page, group_box, crop)
+                        for m_para, _ in members:
+                            keep_paragraphs.discard(id(m_para))
+                        overflow_lanes.append((group_box.y2, group_box))
+                        overflow_queue.append(
+                            ([m_para for m_para, _ in members], group_box, group_rects, group_curves, True)
+                        )
+                        continue
+
+                    # Unframed cohesive form_pair / invoice sibling group: keep siblings
+                    # together rather than detaching a single label or field.
+                    handled_group_ids.add(str(gid))
+                    min_x = min(m_rb.x for _, m_rb in members)
+                    min_y = min(m_rb.y for _, m_rb in members)
+                    max_x2 = max(m_rb.x2 for _, m_rb in members)
+                    max_y2 = max(m_rb.y2 for _, m_rb in members)
+                    group_box = Box(min_x, min_y, max_x2, max_y2)
+                    lead_headings = [
+                        (cand_p, cand_rb)
+                        for cand_p, cand_rb in movable
+                        if id(cand_p) in keep_paragraphs
+                        and all(cand_p is not mp for mp, _ in members)
+                        and self._is_heading_paragraph(cand_p)
+                        and not (cand_p.pipeline_trace or {}).get("region_group_id")
+                        and cand_rb.y >= group_box.y2 - 2.0
+                        and (cand_rb.y - group_box.y2) <= 28.0
+                        and self._box_x_overlap_significant(cand_rb, group_box)
+                    ]
+                    if lead_headings:
+                        lead_headings.sort(key=lambda item: (-item[1].y2, item[1].x))
+                        members = [*lead_headings, *members]
+                        group_box = Box(
+                            min(m_rb.x for _, m_rb in members),
+                            min(m_rb.y for _, m_rb in members),
+                            max(m_rb.x2 for _, m_rb in members),
+                            max(m_rb.y2 for _, m_rb in members),
+                        )
+                    for m_para, _ in members:
+                        keep_paragraphs.discard(id(m_para))
+                    overflow_lanes.append((group_box.y2, group_box))
+                    overflow_queue.append(
+                        ([m_para for m_para, _ in members], group_box, [], [], True)
+                    )
+                    continue
+
+                # A local card/diagram region owns its text and artwork. A
+                # generic body overflow flag cannot detach that text alone.
+                enclosing_box = self._find_enclosing_region_box(para, src_page)
+                if enclosing_box is not None and not violates_offpage:
+                    if violates_footnote or violates_content or trace.get("page_overflow"):
+                        self._record_layout_issue(
+                            page_number=src_page.page_number,
+                            kind="contained_region_overflow",
+                            detail="Text in a drawn region needs more room on the source page.",
+                            debug_id=para.debug_id,
+                            severity="warning",
+                        )
+                    continue
+
                 para_height = max(0.0, rbox.y2 - rbox.y)
                 can_split = (
                     rbox.y2 > body_floor + 16.0
                     and para_height > body_span * 0.25
-                    and overflow_cutoff_y2 is None
+                    and not follows_moved_stream
                 )
                 if can_split:
                     cont_part = self._split_rendered_paragraph_at_y(para, body_floor)
                     if cont_part is not None:
                         cont_rbox = self._rendered_text_box(cont_part) or cont_part.box
                         if cont_rbox is not None:
-                            overflow_queue.append((cont_part, cont_rbox, []))
-                            overflow_cutoff_y2 = body_floor
+                            overflow_queue.append(([cont_part], cont_rbox, [], [], False))
+                            overflow_lanes.append((body_floor, rbox))
                             continue
 
-                if overflow_cutoff_y2 is None:
-                    overflow_cutoff_y2 = rbox.y2
+                # Keep-with-next: do not leave an immediately preceding column-aligned
+                # heading or short colon-label stranded at the bottom of the source page.
+                pulled_headings: list[tuple[il_version_1.PdfParagraph, Box]] = []
+                anchor_y2 = rbox.y2
+                anchor_box = rbox
+                for _ in range(2):
+                    candidates = [
+                        (cand_p, cand_rb)
+                        for cand_p, cand_rb in movable
+                        if cand_p is not para
+                        and id(cand_p) in keep_paragraphs
+                        and cand_rb.y >= anchor_y2 - 2.0
+                        and (cand_rb.y - anchor_y2) <= 28.0
+                        and self._box_x_overlap_significant(cand_rb, anchor_box)
+                    ]
+                    if not candidates:
+                        break
+                    closest_p, closest_rb = min(candidates, key=lambda item: item[1].y)
+                    closest_trace = closest_p.pipeline_trace or {}
+                    closest_u = (closest_p.unicode or "").strip()
+                    is_lead_label = self._is_heading_paragraph(closest_p) or (
+                        closest_u.endswith(":") and len(closest_u) <= 60
+                    )
+                    if not is_lead_label or closest_trace.get("region_group_id"):
+                        break
+                    keep_paragraphs.discard(id(closest_p))
+                    pulled_headings.insert(0, (closest_p, closest_rb))
+                    anchor_y2 = closest_rb.y2
+                    anchor_box = closest_rb
+
+                for h_para, h_rbox in pulled_headings:
+                    overflow_queue.append(([h_para], h_rbox, [], [], False))
+
+                if not follows_moved_stream:
+                    overflow_lanes.append((anchor_y2, rbox))
 
                 # Collect matching translated_code_band rectangles anchored to this paragraph
                 attached_rects: list[il_version_1.PdfRectangle] = []
@@ -3469,16 +3831,41 @@ class Typesetting:
                         attached_rects.append(rect)
                         src_page.pdf_rectangle.remove(rect)
 
+                attached_curves: list[il_version_1.PdfCurve] = []
+                if enclosing_box is not None and violates_offpage:
+                    enc_rects, enc_curves = self._collect_region_shapes(src_page, enclosing_box, crop)
+                    attached_rects.extend(enc_rects)
+                    attached_curves.extend(enc_curves)
+
                 keep_paragraphs.discard(id(para))
-                overflow_queue.append((para, rbox, attached_rects))
+                overflow_queue.append(([para], rbox, attached_rects, attached_curves, False))
+
+                # Never move a short label or heading alone while leaving its immediately
+                # following value or body behind in the same column.
+                para_u = (para.unicode or "").strip()
+                if self._is_heading_paragraph(para) or (para_u.endswith(":") and len(para_u) <= 60):
+                    following_deps = [
+                        (dep_p, dep_rb)
+                        for dep_p, dep_rb in movable
+                        if dep_p is not para
+                        and id(dep_p) in keep_paragraphs
+                        and dep_rb.y2 <= rbox.y + 4.0
+                        and (rbox.y - dep_rb.y2) <= 20.0
+                        and self._box_x_overlap_significant(dep_rb, rbox)
+                    ]
+                    if following_deps:
+                        dep_p, dep_rb = max(following_deps, key=lambda item: item[1].y2)
+                        keep_paragraphs.discard(id(dep_p))
+                        overflow_queue.append(([dep_p], dep_rb, [], [], False))
 
             if not overflow_queue:
                 continue
 
-            # Eliminate accidental near-empty continuation pages for tiny buffer encroachment:
-            # only suppress when NO item carries an explicit collision/overflow flag and
-            # every queued item stays clear above both footnote boxes and rendered ink.
-            has_explicit_overflow = any((qp.pipeline_trace or {}).get("page_overflow") for qp, _, _ in overflow_queue)
+            has_explicit_overflow = any(
+                (qp.pipeline_trace or {}).get("page_overflow")
+                for group_paras, _, _, _, _ in overflow_queue
+                for qp in group_paras
+            )
             footnote_barrier_top = None
             if has_footnotes:
                 fn_tops = [
@@ -3495,26 +3882,150 @@ class Typesetting:
                 content_floor + 1.5,
                 (footnote_barrier_top + 2.5) if footnote_barrier_top is not None else content_floor,
             )
-            total_q_h = sum(max(0.0, rb.y2 - rb.y) for _, rb, _ in overflow_queue)
+            total_q_h = sum(max(0.0, gb.y2 - gb.y) for _, gb, _, _, _ in overflow_queue)
+
+            # A translated block near the physical footer can be taller than its
+            # English source while its original column still has ample unused
+            # room above it.  Keep the complete heading/body/form stream on the
+            # source page when an upward translation (including any immediately
+            # preceding movable blocks in the same column lane) clears the floor
+            # without crossing fixed obstacles or footnotes.
+            compactable_boxes = [
+                gb for _, gb, rects, curves, _rigid in overflow_queue
+                if not rects and not curves
+            ]
+            if (
+                compactable_boxes
+                and len(compactable_boxes) == len(overflow_queue)
+                and not has_footnotes
+                and (
+                    len(compactable_boxes) == 1
+                    or all(
+                        self._box_x_overlap_significant(compactable_boxes[0], box)
+                        for box in compactable_boxes[1:]
+                    )
+                )
+            ):
+                stream_box = Box(
+                    min(box.x for box in compactable_boxes),
+                    min(box.y for box in compactable_boxes),
+                    max(box.x2 for box in compactable_boxes),
+                    max(box.y2 for box in compactable_boxes),
+                )
+                target_floor = max(
+                    body_floor if has_footnotes else content_floor,
+                    min_clear_floor,
+                    crop.y + 8.0,
+                )
+                deficit = target_floor - stream_box.y
+                movable_ids = {id(mp) for mp, _ in movable}
+                chain_paras: list[il_version_1.PdfParagraph] = []
+                chain_ids: set[int] = set()
+                current_top = stream_box.y2
+                if stream_box.y >= crop.y and 0.0 < deficit <= crop_h * 0.22:
+                    # Walk upward through movable kept blocks in the same column lane
+                    # that would otherwise block shifting into free space higher up.
+                    kept_in_lane = sorted(
+                        [
+                            (kp, krb)
+                            for kp in (src_page.pdf_paragraph or [])
+                            if id(kp) in keep_paragraphs
+                            and id(kp) in movable_ids
+                            and not (kp.pipeline_trace or {}).get("region_group_id")
+                            and (krb := self._rendered_text_box(kp)) is not None
+                            and krb.y >= stream_box.y2 - 0.5
+                            and self._box_x_overlap_significant(krb, stream_box)
+                        ],
+                        key=lambda item: item[1].y,
+                    )
+                    for kp, krb in kept_in_lane:
+                        if krb.y - current_top - 3.0 >= deficit:
+                            break
+                        chain_paras.append(kp)
+                        chain_ids.add(id(kp))
+                        current_top = max(current_top, krb.y2)
+                        stream_box = Box(
+                            min(stream_box.x, krb.x),
+                            stream_box.y,
+                            max(stream_box.x2, krb.x2),
+                            current_top,
+                        )
+
+                retained_above = [
+                    rb.y
+                    for kept in (src_page.pdf_paragraph or [])
+                    if id(kept) in keep_paragraphs
+                    and id(kept) not in chain_ids
+                    and (rb := self._rendered_text_box(kept)) is not None
+                    and rb.y >= current_top - 0.5
+                    and self._box_x_overlap_significant(rb, stream_box)
+                ]
+                available_ceiling = min(retained_above) if retained_above else zones["body_ceiling"]
+                headroom = available_ceiling - current_top - 3.0
+                if (
+                    stream_box.y >= crop.y
+                    and 0.0 < deficit <= min(headroom, crop_h * 0.22)
+                ):
+                    for cp in chain_paras:
+                        self._translate_rendered_paragraph(cp, dy=deficit)
+                        moved_c = self._rendered_text_box(cp)
+                        if moved_c is not None:
+                            cp.box = moved_c
+                        self._ensure_pipeline_trace(cp)["compacted_on_source_page"] = True
+                    for group_paras, _, _, _, _ in overflow_queue:
+                        for qp in group_paras:
+                            self._translate_rendered_paragraph(qp, dy=deficit)
+                            moved = self._rendered_text_box(qp)
+                            if moved is not None:
+                                qp.box = moved
+                            trace = self._ensure_pipeline_trace(qp)
+                            trace["compacted_on_source_page"] = True
+                            trace.pop("page_overflow", None)
+                    continue
+
+            # First try bounded compaction within same horizontal lane before creating a sparse page.
             if (
                 not has_explicit_overflow
+                and len(overflow_queue) == 1
+                and len(overflow_queue[0][0]) == 1
+                and not overflow_queue[0][4]
                 and total_q_h <= 28.0
-                and all(rb.y >= min_clear_floor and rb.y >= crop.y + 8.0 for _, rb, _ in overflow_queue)
             ):
-                continue
-            if not has_explicit_overflow and len(overflow_queue) == 1 and total_q_h <= 28.0:
-                qp, qrb, _ = overflow_queue[0]
-                deficit = body_floor - qrb.y
-                if 0.0 < deficit <= 14.0:
+                qp = overflow_queue[0][0][0]
+                qrb = overflow_queue[0][1]
+                target_floor = max(body_floor if has_footnotes else content_floor, min_clear_floor)
+                deficit = target_floor - qrb.y
+                if 0.0 < deficit <= 18.0:
                     above_bottoms = [
                         rb.y
                         for ap in (src_page.pdf_paragraph or [])
-                        if ap is not qp and (rb := self._rendered_text_box(ap)) is not None and rb.y >= qrb.y2 - 0.5
+                        if ap is not qp
+                        and (rb := self._rendered_text_box(ap)) is not None
+                        and rb.y >= qrb.y2 - 0.5
+                        and self._box_x_overlap_significant(rb, qrb)
                     ]
-                    headroom = (min(above_bottoms) - qrb.y2 - 3.0) if above_bottoms else (zones["body_ceiling"] - qrb.y2)
-                    if headroom >= deficit and (qrb.y + deficit) >= min_clear_floor:
+                    headroom = (
+                        (min(above_bottoms) - qrb.y2 - 3.0)
+                        if above_bottoms
+                        else (zones["body_ceiling"] - qrb.y2)
+                    )
+                    if (
+                        headroom >= deficit
+                        and (qrb.y + deficit) >= min_clear_floor
+                        and (qrb.y + deficit) >= crop.y + 8.0
+                    ):
                         self._translate_rendered_paragraph(qp, dy=deficit)
+                        moved = self._rendered_text_box(qp)
+                        if moved is not None:
+                            qp.box = moved
                         continue
+
+            if (
+                not has_explicit_overflow
+                and total_q_h <= 28.0
+                and all(gb.y >= min_clear_floor and gb.y >= crop.y + 8.0 for _, gb, _, _, _ in overflow_queue)
+            ):
+                continue
 
             src_page.pdf_paragraph = [
                 p for p in (src_page.pdf_paragraph or []) if id(p) in keep_paragraphs
@@ -3532,7 +4043,7 @@ class Typesetting:
 
             idx = 0
             while idx < len(overflow_queue):
-                para, rbox, attached_rects = overflow_queue[idx]
+                group_paras, rbox, attached_rects, attached_curves, is_rigid = overflow_queue[idx]
                 item_h = max(0.0, rbox.y2 - rbox.y)
 
                 if cursor_y2 - item_h < cont_floor - 1.0 and cont_page.pdf_paragraph:
@@ -3545,14 +4056,17 @@ class Typesetting:
                     cursor_y2 = cont_ceiling
 
                 dy = cursor_y2 - rbox.y2
-                self._translate_rendered_paragraph(para, dx=dx, dy=dy)
-                self._clear_paragraph_xobj_id(para)
-                moved_rbox = self._rendered_text_box(para)
-                if moved_rbox is not None:
-                    para.box = moved_rbox
-                trace = self._ensure_pipeline_trace(para)
-                trace["paginated_from_page"] = src_page.page_number
-                trace.pop("page_overflow", None)
+                placed_top = cursor_y2
+                placed_bottom = cursor_y2 - item_h
+                for para in group_paras:
+                    self._translate_rendered_paragraph(para, dx=dx, dy=dy)
+                    self._clear_paragraph_xobj_id(para)
+                    moved_rbox = self._rendered_text_box(para)
+                    if moved_rbox is not None:
+                        para.box = moved_rbox
+                    trace = self._ensure_pipeline_trace(para)
+                    trace["paginated_from_page"] = src_page.page_number
+                    trace.pop("page_overflow", None)
 
                 for rect in attached_rects:
                     if rect.box is not None:
@@ -3565,29 +4079,52 @@ class Typesetting:
                     rect.xobj_id = None
                     cont_page.pdf_rectangle.append(rect)
 
-                # If even alone on a fresh continuation page the block still dips below
-                # cont_floor, split its lines iteratively onto the next continuation page.
+                for curve in attached_curves:
+                    self._translate_rendered_curve(curve, dx=dx, dy=dy)
+                    curve.xobj_id = None
+                    cont_page.pdf_curve.append(curve)
+
+                # If even alone on a fresh continuation page a single non-rigid block still dips
+                # below cont_floor, split its lines iteratively onto the next continuation page.
                 if (
-                    moved_rbox is not None
-                    and moved_rbox.y < cont_floor - 1.0
+                    not is_rigid
+                    and len(group_paras) == 1
+                    and (moved_single := self._rendered_text_box(group_paras[0])) is not None
+                    and moved_single.y < cont_floor - 1.0
                     and cont_count_for_src < max_continuations_per_page
                 ):
-                    extra_tail = self._split_rendered_paragraph_at_y(para, cont_floor)
+                    extra_tail = self._split_rendered_paragraph_at_y(group_paras[0], cont_floor)
                     if extra_tail is not None:
                         tail_box = self._rendered_text_box(extra_tail) or extra_tail.box
                         if tail_box is not None:
-                            overflow_queue.insert(idx + 1, (extra_tail, tail_box, []))
-                            moved_rbox = self._rendered_text_box(para) or moved_rbox
+                            overflow_queue.insert(idx + 1, ([extra_tail], tail_box, [], [], False))
+                            moved_single = self._rendered_text_box(group_paras[0]) or moved_single
+                            placed_bottom = moved_single.y
+                            placed_top = moved_single.y2
 
-                cont_page.pdf_paragraph.append(para)
-                placed_h = (moved_rbox.y2 - moved_rbox.y) if moved_rbox is not None else item_h
-                cursor_y2 -= max(0.0, placed_h) + 8.0
+                cont_page.pdf_paragraph.extend(group_paras)
+                cursor_y2 -= max(0.0, placed_top - placed_bottom) + 8.0
                 idx += 1
 
         if created_continuations:
+            shift = 0
+            cont_count = 0
+            src_orig_to_final: dict[int, int] = {}
+            for page in new_pages:
+                orig_src = getattr(page, "continuation_of_page", None)
+                if orig_src is not None:
+                    cont_count += 1
+                    final_src = src_orig_to_final.get(orig_src, orig_src + shift)
+                    page.continuation_of_page = final_src
+                    page.page_number = final_src + cont_count
+                    shift += 1
+                else:
+                    orig_num = page.page_number
+                    final_num = orig_num + shift
+                    src_orig_to_final[orig_num] = final_num
+                    page.page_number = final_num
+                    cont_count = 0
             document.page[:] = new_pages
-            for page_idx, page in enumerate(document.page):
-                page.page_number = page_idx
             document.total_pages = len(document.page)
             shared = getattr(self.translation_config, "shared_context_cross_split_part", None)
             if shared is not None and hasattr(shared, "continuation_pages"):
@@ -3601,6 +4138,7 @@ class Typesetting:
                 created_continuations,
                 len(document.page),
             )
+        self._record_pagination_metrics(document)
         return created_continuations
 
     def _anchor_inline_highlight_curves(self, page: il_version_1.Page) -> None:
@@ -4165,6 +4703,9 @@ class Typesetting:
             new_x = page_box.x + orig_right_margin
             return self._keep_clear_of_later_images(paragraph, page, new_x - box.x)
 
+        if (paragraph.pipeline_trace or {}).get("column_lane"):
+            return 0.0
+
         # Detect content area boundaries (accounting for sidebars/decorations)
         content_left, content_right = self._get_content_area_bounds(page)
         
@@ -4411,15 +4952,29 @@ class Typesetting:
         """Detect if paragraph is a running header, footer, or page number."""
         if self._is_table_cell(paragraph, page):
             return False
+        trace = getattr(paragraph, "pipeline_trace", None) or {}
         if paragraph.layout_label:
             lbl = paragraph.layout_label.lower()
             if "table_" in lbl or "footnote" in lbl:
                 return False
             if any(h in lbl for h in ['header', 'footer', 'page_number', 'page_header', 'page_footer']):
                 return True
+            if any(h in lbl for h in ['heading', 'title', 'caption', 'formula', 'code', 'algorithm', 'list']):
+                return False
+        if trace.get("page_overflow") or trace.get("collision_shifted"):
+            return False
+        if trace.get("region_type") in {"card", "form_pair", "figure", "table"}:
+            return False
         if paragraph.box and page.cropbox and page.cropbox.box:
             p_box = page.cropbox.box
             p_height = p_box.y2 - p_box.y
+            # Overflowing content extending outside the cropbox is never a pinned banner.
+            if paragraph.box.y < p_box.y - 1.0 or paragraph.box.y2 > p_box.y2 + 1.0:
+                return False
+            if max(0.0, paragraph.box.y2 - paragraph.box.y) > 28.0:
+                return False
+            if len((paragraph.unicode or "").strip()) > 140:
+                return False
             # Top 6% or bottom 6% of page
             if paragraph.box.y > p_box.y2 - p_height * 0.06 or paragraph.box.y2 < p_box.y + p_height * 0.06:
                 return True
@@ -4430,7 +4985,11 @@ class Typesetting:
         if self._is_header_or_footer(paragraph, page):
             return False  # Always mirror running headers, footers, and page numbers!
         trace = getattr(paragraph, "pipeline_trace", None) or {}
-        if trace.get("preserved_code") or trace.get("in_figure_region"):
+        if paragraph.layout_label in {"form_row", "figure_caption"}:
+            return True
+        if trace.get("preserved_code") or trace.get("in_figure_region") or trace.get("anchored_to_illustration"):
+            return True
+        if trace.get("region_type") in {"card", "form_pair", "figure", "table"}:
             return True
         if paragraph_semantic_zone(paragraph, page) in {"code", "figure"}:
             return True
@@ -4554,7 +5113,7 @@ class Typesetting:
         label = (paragraph.layout_label or "").lower()
         is_table_text = any(marker in label for marker in ("table_cell", "table_text"))
         is_caption = any(marker in label for marker in ("table_caption", "table_title", "table_footnote"))
-        if is_table_text and not is_caption:
+        if not is_caption and (is_table_text or (paragraph.pipeline_trace or {}).get("cell_id")):
             return True
         # Check if inside a table layout region
         if paragraph.box and hasattr(page, 'page_layout') and page.page_layout:
@@ -4749,6 +5308,410 @@ class Typesetting:
                 )
         return tables
 
+    @staticmethod
+    def _iter_paragraph_glyphs(paragraph: il_version_1.PdfParagraph):
+        for comp in paragraph.pdf_paragraph_composition or []:
+            if comp.pdf_character:
+                yield comp.pdf_character
+            elif comp.pdf_line:
+                yield from comp.pdf_line.pdf_character or []
+            elif comp.pdf_same_style_characters:
+                yield from comp.pdf_same_style_characters.pdf_character or []
+            elif comp.pdf_formula:
+                yield from comp.pdf_formula.pdf_character or []
+
+    def _compact_paragraph_to_box(
+        self,
+        paragraph: il_version_1.PdfParagraph,
+        perm_box: Box,
+        *,
+        min_ratio: float = 0.48,
+        min_font_size: float = 4.5,
+    ) -> bool:
+        """Fit rendered glyphs without making the result effectively unreadable."""
+        rbox = self._rendered_text_box(paragraph)
+        if rbox is None:
+            return True
+        fits_x = rbox.x >= perm_box.x - 1.5 and rbox.x2 <= perm_box.x2 + 1.5
+        fits_y = rbox.y >= perm_box.y - 1.5 and rbox.y2 <= perm_box.y2 + 1.5
+        if fits_x and fits_y:
+            return True
+        avail_w = perm_box.x2 - perm_box.x - 2.0
+        avail_h = perm_box.y2 - perm_box.y - 2.0
+        curr_w = max(1.0, rbox.x2 - rbox.x)
+        curr_h = max(1.0, rbox.y2 - rbox.y)
+        x_ratio = min(1.0, avail_w / curr_w) if not fits_x else 1.0
+        y_ratio = min(1.0, avail_h / curr_h) if not fits_y else 1.0
+        ratio = min(x_ratio, y_ratio)
+        font_sizes = [
+            float(ch.pdf_style.font_size)
+            for ch in self._iter_paragraph_glyphs(paragraph)
+            if ch.pdf_style and ch.pdf_style.font_size and ch.pdf_style.font_size > 0
+        ]
+        readable_ratio = min_ratio
+        if font_sizes and min_font_size > 0:
+            # Do not claim that an impossible region was repaired by reducing
+            # visible text to a microscopic scale. Existing source text below
+            # the floor is preserved at its original size rather than shrunk.
+            readable_ratio = max(
+                readable_ratio,
+                min(1.0, max(min_font_size / size for size in font_sizes)),
+            )
+        if ratio < readable_ratio:
+            return False
+
+        # Vector paths and form transforms need the renderer's native scaling.
+        # A glyph-only fit would separate them from their formulas.
+        if any(
+            comp.pdf_formula and (comp.pdf_formula.pdf_curve or comp.pdf_formula.pdf_form)
+            for comp in paragraph.pdf_paragraph_composition or []
+        ):
+            return False
+
+        rtl_anchor = self._is_arabic_output() and rbox.x < perm_box.x2
+        if rtl_anchor:
+            desired_x2 = min(perm_box.x2 - 1.0, max(perm_box.x + 1.0, rbox.x2))
+            if rbox.x < perm_box.x - 1.5 or rbox.x2 > perm_box.x2 + 1.5:
+                desired_x2 = perm_box.x2 - 1.0
+            anchor_x = desired_x2
+            source_anchor_x = rbox.x2
+        else:
+            desired_x = max(perm_box.x + 1.0, min(rbox.x, perm_box.x2 - 1.0))
+            if rbox.x < perm_box.x - 1.5 or rbox.x2 > perm_box.x2 + 1.5:
+                desired_x = perm_box.x + 1.0
+            anchor_x = desired_x
+            source_anchor_x = rbox.x
+
+        anchor_y2 = min(perm_box.y2 - 1.0, max(perm_box.y + 1.0, rbox.y2))
+        if rbox.y < perm_box.y - 1.5 or rbox.y2 > perm_box.y2 + 1.5:
+            anchor_y2 = perm_box.y2 - 1.0
+        transformed_boxes: set[int] = {id(paragraph.box)}
+
+        def transform(box: Box | None) -> None:
+            if box is None or id(box) in transformed_boxes:
+                return
+            transformed_boxes.add(id(box))
+            box.x = anchor_x + (box.x - source_anchor_x) * ratio
+            box.x2 = anchor_x + (box.x2 - source_anchor_x) * ratio
+            box.y = anchor_y2 + (box.y - rbox.y2) * ratio
+            box.y2 = anchor_y2 + (box.y2 - rbox.y2) * ratio
+
+        for composition in paragraph.pdf_paragraph_composition or []:
+            group = composition.pdf_line or composition.pdf_same_style_characters or composition.pdf_formula
+            if group:
+                transform(group.box)
+        for ch in self._iter_paragraph_glyphs(paragraph):
+            transform(ch.box)
+            if ch.visual_bbox:
+                transform(ch.visual_bbox.box)
+            if ratio < 1.0 and ch.pdf_style and ch.pdf_style.font_size:
+                ch.pdf_style = copy.copy(ch.pdf_style)
+                ch.pdf_style.font_size = round(ch.pdf_style.font_size * ratio, 2)
+            if ch.advance:
+                ch.advance *= ratio
+        fitted = self._rendered_text_box(paragraph)
+        return bool(
+            fitted is None
+            or (
+                fitted.x >= perm_box.x - 1.5
+                and fitted.x2 <= perm_box.x2 + 1.5
+                and fitted.y >= perm_box.y - 1.5
+                and fitted.y2 <= perm_box.y2 + 1.5
+            )
+        )
+
+    def _contain_rendered_region_bounds(self, page: il_version_1.Page) -> None:
+        """Apply known region/column bounds before collision-driven reflow.
+
+        This prevents two independent columns from being mistaken for a
+        vertical collision merely because longer Arabic glyphs crossed the
+        source gutter.
+        """
+        for paragraph in page.pdf_paragraph or []:
+            if paragraph.box is None or self._is_bottom_fixed_paragraph(paragraph, page):
+                continue
+            rendered = self._rendered_text_box(paragraph)
+            if rendered is None:
+                continue
+            trace = paragraph.pipeline_trace or {}
+            label = (paragraph.layout_label or "").lower()
+            permitted: Box | None = None
+            bounds = trace.get("region_bounds")
+            if label == "form_row" or trace.get("anchored_to_illustration") or self._is_table_cell(paragraph, page):
+                permitted = paragraph.box
+            elif isinstance(bounds, (list, tuple)) and len(bounds) == 4:
+                permitted = Box(*(float(value) for value in bounds))
+            elif (enclosing := self._find_enclosing_region_box(paragraph, page)) is not None:
+                permitted = enclosing
+            else:
+                lane = trace.get("column_lane")
+                if isinstance(lane, (list, tuple)) and len(lane) == 2:
+                    permitted = Box(
+                        float(lane[0]),
+                        rendered.y - 2.0,
+                        float(lane[1]),
+                        rendered.y2 + 2.0,
+                    )
+            if permitted is not None:
+                self._compact_paragraph_to_box(
+                    paragraph,
+                    permitted,
+                    min_ratio=0.45 if "table" in label else 0.52,
+                )
+
+    def _contain_bottom_fixed_lanes(self, page: il_version_1.Page) -> None:
+        """Keep page numbers, document codes, and footnotes in source lanes."""
+        fixed = [
+            paragraph
+            for paragraph in page.pdf_paragraph or []
+            if paragraph.box is not None and self._is_bottom_fixed_paragraph(paragraph, page)
+        ]
+        for paragraph in fixed:
+            self._compact_paragraph_to_box(paragraph, paragraph.box, min_ratio=0.52)
+
+        # Fixed footer objects are frequently painted in separate XObjects.
+        # Resolve any residual collision independently of XObject ownership.
+        for fixed_index, first in enumerate(fixed):
+            first_box = self._rendered_text_box(first)
+            if first_box is None:
+                continue
+            for second in fixed[fixed_index + 1:]:
+                second_box = self._rendered_text_box(second)
+                if second_box is None:
+                    continue
+                h_overlap = max(0.0, min(first_box.x2, second_box.x2) - max(first_box.x, second_box.x))
+                v_overlap = max(0.0, min(first_box.y2, second_box.y2) - max(first_box.y, second_box.y))
+                if h_overlap <= 1.0 or v_overlap <= 1.0:
+                    continue
+                upper = first if first.box.y2 >= second.box.y2 else second
+                lower_box = second_box if upper is first else first_box
+                upper_box = first_box if upper is first else second_box
+                dy = max(0.0, lower_box.y2 + 2.0 - upper_box.y)
+                crop_top = page.cropbox.box.y2 if page.cropbox and page.cropbox.box else 842.0
+                if dy > 0 and upper_box.y2 + dy <= crop_top - 2.0:
+                    self._translate_rendered_paragraph(upper, dy=dy)
+
+    @staticmethod
+    def _decorative_shape_boxes(page: il_version_1.Page) -> list[Box]:
+        crop = page.cropbox.box if page.cropbox and page.cropbox.box else Box(0, 0, 595, 842)
+        page_w = max(1.0, crop.x2 - crop.x)
+        page_h = max(1.0, crop.y2 - crop.y)
+        shapes: list[Box] = []
+        for item in (
+            list(getattr(page, "pdf_curve", None) or [])
+            + list(getattr(page, "pdf_rectangle", None) or [])
+            + list(getattr(page, "pdf_form", None) or [])
+        ):
+            box = getattr(item, "box", None)
+            if box is None:
+                continue
+            width = box.x2 - box.x
+            height = box.y2 - box.y
+            if 6.0 <= width <= page_w * 0.22 and 6.0 <= height <= page_h * 0.16:
+                shapes.append(box)
+        return shapes
+
+    def _anchor_text_next_to_illustrations(self, page: il_version_1.Page) -> None:
+        """Keep prose in its source lane when a nearby icon identifies its subject."""
+        if not self._is_arabic_output():
+            return
+        shapes = self._decorative_shape_boxes(page)
+        anchored_boxes: list[Box] = []
+        crop = page.cropbox.box if page.cropbox and page.cropbox.box else Box(0, 0, 595, 842)
+        width = crop.x2 - crop.x
+        for paragraph in page.pdf_paragraph or []:
+            box = paragraph.box
+            if box is None or self._is_table_cell(paragraph, page):
+                continue
+            for shape in shapes:
+                gap = max(box.x - shape.x2, shape.x - box.x2)
+                overlap = min(box.y2, shape.y2) - max(box.y, shape.y)
+                if 0.0 <= gap <= min(32.0, width * 0.06) and overlap >= 3.0:
+                    self._ensure_pipeline_trace(paragraph)["anchored_to_illustration"] = True
+                    anchored_boxes.append(box)
+                    break
+
+        # Icon descriptions can extend well below the icon itself. If the
+        # layout has illustrated columns, keep the aligned continuation text
+        # in those same columns so only parts of an article never change sides.
+        if not anchored_boxes:
+            return
+        midpoint = (crop.x + crop.x2) * 0.5
+        lane_paragraphs = [
+            paragraph for paragraph in page.pdf_paragraph or []
+            if paragraph.box is not None
+            and not self._is_table_cell(paragraph, page)
+            and (paragraph.box.x2 <= midpoint + 4.0 or paragraph.box.x >= midpoint - 4.0)
+        ]
+        has_parallel_lane = any(
+            max(box.x - anchor.x2, anchor.x - box.x2) >= 12.0
+            and min(box.y2, anchor.y2) - max(box.y, anchor.y) >= 3.0
+            and abs(box.x - anchor.x) >= width * 0.22
+            for paragraph in lane_paragraphs
+            for box in (paragraph.box,)
+            for anchor in anchored_boxes
+        )
+        if has_parallel_lane:
+            for paragraph in lane_paragraphs:
+                self._ensure_pipeline_trace(paragraph)["anchored_to_illustration"] = True
+
+    def _avoid_decorative_shape_collisions(
+        self, page: il_version_1.Page, source_boxes: dict[int, Box] | None = None
+    ) -> None:
+        """Keep translated labels from drifting across adjacent vector icons."""
+        crop = page.cropbox.box if page.cropbox and page.cropbox.box else Box(0, 0, 595, 842)
+        shapes = self._decorative_shape_boxes(page)
+
+        for paragraph in page.pdf_paragraph or []:
+            if paragraph.box is None or self._is_table_cell(paragraph, page):
+                continue
+            rendered = self._rendered_text_box(paragraph)
+            if rendered is None:
+                continue
+            source = (source_boxes or {}).get(id(paragraph), paragraph.box)
+            trace = self._ensure_pipeline_trace(paragraph)
+            if trace.get("can_passthrough") or trace.get("preserved_code"):
+                continue
+            if not self._boxes_overlap_horizontally(source, rendered):
+                continue
+            lane = trace.get("column_lane")
+            bounds = trace.get("region_bounds")
+            if trace.get("anchored_to_illustration"):
+                permitted = source
+            elif isinstance(bounds, (list, tuple)) and len(bounds) == 4:
+                permitted = Box(*(float(value) for value in bounds))
+            elif isinstance(lane, (list, tuple)) and len(lane) == 2:
+                permitted = Box(float(lane[0]), crop.y, float(lane[1]), crop.y2)
+            elif (enclosing := self._find_enclosing_region_box(paragraph, page)) is not None:
+                permitted = enclosing
+            else:
+                permitted = crop
+
+            for shape in shapes:
+                src_h = max(0.0, min(source.x2, shape.x2) - max(source.x, shape.x))
+                src_v = max(0.0, min(source.y2, shape.y2) - max(source.y, shape.y))
+                if src_h > 1.0 and src_v > 1.0:
+                    continue  # intentional source overlay/background
+                h_overlap = max(0.0, min(rendered.x2, shape.x2) - max(rendered.x, shape.x))
+                v_overlap = max(0.0, min(rendered.y2, shape.y2) - max(rendered.y, shape.y))
+                if h_overlap <= 1.0 or v_overlap <= 1.0:
+                    continue
+
+                gap = 3.0
+                if (shape.x + shape.x2) * 0.5 <= (source.x + source.x2) * 0.5:
+                    dx = shape.x2 + gap - rendered.x
+                    lane_box = Box(max(permitted.x, shape.x2 + gap), rendered.y - 2, permitted.x2, rendered.y2 + 2)
+                else:
+                    dx = shape.x - gap - rendered.x2
+                    lane_box = Box(permitted.x, rendered.y - 2, min(permitted.x2, shape.x - gap), rendered.y2 + 2)
+                if lane_box.x <= rendered.x + dx and rendered.x2 + dx <= lane_box.x2:
+                    self._translate_rendered_paragraph(paragraph, dx=dx)
+                else:
+                    self._compact_paragraph_to_box(paragraph, lane_box, min_ratio=0.52)
+                rendered = self._rendered_text_box(paragraph) or rendered
+                remaining_h = max(0.0, min(rendered.x2, shape.x2) - max(rendered.x, shape.x))
+                remaining_v = max(0.0, min(rendered.y2, shape.y2) - max(rendered.y, shape.y))
+                if remaining_h <= 1.0 or remaining_v <= 1.0:
+                    trace["shape_collision_resolved"] = True
+
+    def _validate_rendered_regions(self, page: il_version_1.Page) -> list[dict]:
+        """Validate every rendered region against permitted bounds and cross-region collisions."""
+        issues: list[dict] = []
+        paragraphs = [p for p in (getattr(page, "pdf_paragraph", None) or []) if p.box is not None]
+        for para in paragraphs:
+            rbox = self._rendered_text_box(para)
+            if rbox is None:
+                continue
+            trace = para.pipeline_trace or {}
+            lbl = (para.layout_label or "").lower()
+            perm_box: Box | None = None
+            strict_y = True
+
+            rb = trace.get("region_bounds")
+            if lbl == "form_row":
+                perm_box = para.box
+            elif isinstance(rb, (list, tuple)) and len(rb) == 4:
+                perm_box = Box(float(rb[0]), float(rb[1]), float(rb[2]), float(rb[3]))
+            elif (enc := self._find_enclosing_region_box(para, page)) is not None:
+                perm_box = enc
+            elif "fixed" in lbl or trace.get("anchored_numeric_columns"):
+                perm_box = para.box
+            else:
+                cl = trace.get("column_lane")
+                if isinstance(cl, (list, tuple)) and len(cl) == 2 and not trace.get("page_overflow"):
+                    perm_box = Box(float(cl[0]), -1e6, float(cl[1]), 1e6)
+                    strict_y = False
+
+            if perm_box is not None:
+                min_r = 0.45 if "table_cell" in lbl else 0.48
+                if (
+                    rbox.x < perm_box.x - 2.0
+                    or rbox.x2 > perm_box.x2 + 2.0
+                    or (strict_y and (rbox.y < perm_box.y - 2.0 or rbox.y2 > perm_box.y2 + 2.0))
+                ):
+                    self._compact_paragraph_to_box(para, perm_box, min_ratio=min_r)
+                    rbox = self._rendered_text_box(para) or rbox
+                escaped_x = rbox.x < perm_box.x - 2.5 or rbox.x2 > perm_box.x2 + 2.5
+                escaped_y = strict_y and (rbox.y < perm_box.y - 2.5 or rbox.y2 > perm_box.y2 + 2.5)
+                is_table_or_form = (
+                    self._is_table_cell(para, page)
+                    or lbl in {"form_row", "form_field"}
+                    or trace.get("region_type") in {"table", "form_pair"}
+                )
+                if (escaped_x or escaped_y) and is_table_or_form:
+                    # Earlier layout passes already attempted bounded fitting.
+                    # Keep the readable result and expose the unresolved region
+                    # instead of hiding it with a microscopic emergency scale.
+                    self._ensure_pipeline_trace(para)["region_fallback"] = (
+                        "unresolved_readable_overflow"
+                    )
+                if escaped_x or escaped_y:
+                    self._ensure_pipeline_trace(para)["region_escape"] = True
+                    msg = (
+                        f"Region escape in {trace.get('region_group_id') or lbl} "
+                        f"para={getattr(para, 'debug_id', '?')}"
+                    )
+                    self._record_layout_issue(
+                        page_number=page.page_number,
+                        kind="region_escape",
+                        detail=msg,
+                        debug_id=getattr(para, "debug_id", None),
+                        severity="warning",
+                    )
+                    issues.append({"kind": "region_escape", "debug_id": getattr(para, "debug_id", None)})
+
+        # Check cross-region collisions between distinct non-table region groups or column lanes
+        rendered_boxes = [(p, self._rendered_text_box(p)) for p in paragraphs]
+        for idx, (p1, b1) in enumerate(rendered_boxes):
+            if b1 is None:
+                continue
+            t1 = p1.pipeline_trace or {}
+            g1 = t1.get("region_group_id") or (tuple(t1["column_lane"]) if "column_lane" in t1 else None)
+            if not g1 or self._is_table_cell(p1, page):
+                continue
+            for p2, b2 in rendered_boxes[idx + 1:]:
+                if b2 is None or self._is_table_cell(p2, page):
+                    continue
+                t2 = p2.pipeline_trace or {}
+                g2 = t2.get("region_group_id") or (tuple(t2["column_lane"]) if "column_lane" in t2 else None)
+                if not g2 or g1 == g2:
+                    continue
+                if not self._shares_reflow_layer(p1, p2):
+                    continue
+                h_ov = max(0.0, min(b1.x2, b2.x2) - max(b1.x, b2.x))
+                v_ov = max(0.0, min(b1.y2, b2.y2) - max(b1.y, b2.y))
+                if h_ov > 3.0 and v_ov > 3.0:
+                    msg = f"Cross-region collision between {g1} and {g2}"
+                    self._record_layout_issue(
+                        page_number=page.page_number,
+                        kind="region_collision",
+                        detail=msg,
+                        debug_id=getattr(p1, "debug_id", None),
+                        severity="warning",
+                    )
+                    issues.append({"kind": "region_collision", "debug_id": getattr(p1, "debug_id", None)})
+        return issues
+
     def _audit_table_cells_after_render(self, page: il_version_1.Page) -> None:
         """Audit rendered table cells for cross-cell collisions or fixed-cell boundary escape."""
         table_cells = [
@@ -4771,35 +5734,34 @@ class Typesetting:
             rbox = rendered_map.get(id(cell))
             if rbox is None or cell.box is None:
                 continue
-            is_fixed_slot = "fixed" in (cell.layout_label or "").lower()
-            if is_fixed_slot and (rbox.x < cell.box.x - 1.5 or rbox.x2 > cell.box.x2 + 1.5):
-                avail_w = max(4.0, (cell.box.x2 - cell.box.x) - 2.0)
-                curr_w = max(1.0, rbox.x2 - rbox.x)
-                ratio = avail_w / curr_w
-                if 0.45 <= ratio < 0.99:
-                    anchor_x = cell.box.x2 - 1.0 if self._is_arabic_output() else cell.box.x + 1.0
-                    for comp in cell.pdf_paragraph_composition or []:
-                        if comp.pdf_character:
-                            ch = comp.pdf_character
-                            if ch.box:
-                                ch.box.x = anchor_x + (ch.box.x - rbox.x2 if self._is_arabic_output() else ch.box.x - rbox.x) * ratio
-                                ch.box.x2 = anchor_x + (ch.box.x2 - rbox.x2 if self._is_arabic_output() else ch.box.x2 - rbox.x) * ratio
-                            if ch.visual_bbox and ch.visual_bbox.box:
-                                ch.visual_bbox.box.x = ch.box.x
-                                ch.visual_bbox.box.x2 = ch.box.x2
-                            if ch.pdf_style and ch.pdf_style.font_size:
-                                ch.pdf_style.font_size = round(ch.pdf_style.font_size * max(0.72, ratio), 2)
-                            if getattr(ch, "advance", None):
-                                ch.advance *= ratio
-                    rbox = self._rendered_text_box(cell)
-                    rendered_map[id(cell)] = rbox
-            if is_fixed_slot and rbox is not None and (
-                rbox.x < cell.box.x - 4.0
-                or rbox.x2 > cell.box.x2 + 4.0
-                or rbox.y < cell.box.y - 4.0
-                or rbox.y2 > cell.box.y2 + 4.0
-            ):
+            is_fixed_slot = (
+                "fixed" in (cell.layout_label or "").lower()
+                or trace.get("anchored_numeric_columns")
+            )
+            overflow_detected = is_fixed_slot and (
+                rbox.x < cell.box.x - 1.5
+                or rbox.x2 > cell.box.x2 + 1.5
+                or rbox.y < cell.box.y - 1.5
+                or rbox.y2 > cell.box.y2 + 1.5
+            )
+            if overflow_detected:
                 p_trace = self._ensure_pipeline_trace(cell)
+                p_trace["table_cell_overflow_detected"] = True
+                repaired = False
+                if self._compact_paragraph_to_box(cell, cell.box, min_ratio=0.45):
+                    repaired_box = self._rendered_text_box(cell)
+                    if repaired_box is not None and (
+                        repaired_box.x >= cell.box.x - 1.5
+                        and repaired_box.x2 <= cell.box.x2 + 1.5
+                        and repaired_box.y >= cell.box.y - 1.5
+                        and repaired_box.y2 <= cell.box.y2 + 1.5
+                    ):
+                        repaired = True
+                        p_trace["table_cell_overflow_resolved"] = True
+                        rendered_map[id(cell)] = repaired_box
+                if repaired:
+                    continue
+                p_trace["region_fallback"] = "unresolved_readable_overflow"
                 p_trace["table_cell_overflow"] = True
                 self._record_layout_issue(
                     page_number=page.page_number,
@@ -4882,11 +5844,16 @@ class Typesetting:
             # Irregular / low-confidence tables keep original geometry safely.
             if cells and any(
                 (cell.pipeline_trace or {}).get("preserve_irregular_table")
+                or (cell.pipeline_trace or {}).get("anchored_numeric_columns")
                 for cell in cells
             ):
                 continue
             for cell in cells:
-                self._mirror_box_within_table(cell.box, table_box)
+                # Move source glyphs with their owning slot. Some cells
+                # (notably fixed values) bypass typesetting and retain their
+                # existing glyph coordinates at export.
+                dx = table_box.x + table_box.x2 - cell.box.x2 - cell.box.x
+                self._translate_rendered_paragraph(cell, dx=dx)
 
             # Tables may be represented by colored cell rectangles or by vector
             # rules. Mirror only elements wholly contained in this table, leaving
@@ -4938,11 +5905,17 @@ class Typesetting:
 
     def _balance_table_row_widths(self, page: il_version_1.Page, fonts: dict):
         """Redistribute unused horizontal space from sibling columns in the same row to overflowing cells."""
+        for cell in page.pdf_paragraph or []:
+            trace = cell.pipeline_trace or {}
+            right_edge = trace.get("anchored_column_right")
+            if cell.box is not None and right_edge is not None:
+                cell.box.x2 = max(cell.box.x2, right_edge)
         rows = self._cluster_table_cells_into_rows(page)
         for row in rows:
             if any(
                 "fixed_rtl" in (cell.layout_label or "").lower()
                 or (cell.pipeline_trace or {}).get("preserve_irregular_table")
+                or (cell.pipeline_trace or {}).get("anchored_numeric_columns")
                 for cell in row
             ):
                 continue
@@ -5014,6 +5987,7 @@ class Typesetting:
             if any(
                 "fixed_rtl" in (cell.layout_label or "").lower()
                 or (cell.pipeline_trace or {}).get("preserve_irregular_table")
+                or (cell.pipeline_trace or {}).get("anchored_numeric_columns")
                 for cell in row
             ):
                 continue
@@ -5414,6 +6388,14 @@ class Typesetting:
             current_line_w = 0.0
 
             for token_idx, token in enumerate(tokens):
+                line_idx_current = len(lines_tokens)
+                if is_bullet_para and line_idx_current > 0:
+                    avail = effective_line_width - bullet_indent
+                elif line_idx_current == 0 and paragraph.first_line_indent:
+                    avail = effective_line_width - first_indent
+                else:
+                    avail = effective_line_width
+
                 # Explicit line boundaries originate from structured source
                 # records (Step N, calculation/result, contact fields).  They
                 # are semantic boundaries, so width-based wrapping must never
@@ -5441,13 +6423,6 @@ class Typesetting:
                             token[:] = [copy.copy(dot_unit) for _ in range(needed)]
 
                 token_w = sum(u.width * scale for u in token)
-                line_idx_current = len(lines_tokens)
-                if is_bullet_para and line_idx_current > 0:
-                    avail = effective_line_width - bullet_indent
-                elif line_idx_current == 0 and paragraph.first_line_indent:
-                    avail = effective_line_width - first_indent
-                else:
-                    avail = effective_line_width
 
                 # Skip leading space on a line
                 if not current_line_tokens and token[0].is_space:
@@ -6399,8 +7374,10 @@ class Typesetting:
         if paragraph is not None and self._is_fixed_table_paragraph(paragraph):
             lbl = (paragraph.layout_label or "").lower()
             trace = paragraph.pipeline_trace or {}
-            if "fixed" in lbl or trace.get("preserve_irregular_table"):
+            if "fixed" in lbl or trace.get("preserve_irregular_table") or trace.get("anchored_numeric_columns"):
                 min_y = max(min_y, current_box.y)
+        if paragraph is not None and paragraph.layout_label == "form_row":
+            min_y = max(min_y, current_box.y)
 
         if paragraph is not None:
             enclosing = self._find_enclosing_region_box(paragraph, page)

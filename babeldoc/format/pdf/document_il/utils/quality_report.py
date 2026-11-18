@@ -65,6 +65,26 @@ class ContentLedger:
         self._preflight: dict[str, Any] | None = None
         self._terminology: dict[str, Any] | None = None
         self._output_qa: dict[str, Any] | None = None
+        self._pagination_metrics: dict[str, int] = {
+            "sparse_continuation_pages": 0,
+            "clipped_fragment_count": 0,
+            "detached_group_count": 0,
+        }
+
+    def record_pagination_metrics(
+        self,
+        *,
+        sparse_continuation_pages: int = 0,
+        clipped_fragment_count: int = 0,
+        detached_group_count: int = 0,
+    ) -> None:
+        """Record document-level pagination cohesion and continuation metrics."""
+        with self._lock:
+            self._pagination_metrics = {
+                "sparse_continuation_pages": max(0, int(sparse_continuation_pages)),
+                "clipped_fragment_count": max(0, int(clipped_fragment_count)),
+                "detached_group_count": max(0, int(detached_group_count)),
+            }
 
     def record_preserved_regions(self, regions: list[dict[str, Any]] | None) -> None:
         """Record protected code/algorithm and figure-data regions preserved verbatim."""
@@ -143,6 +163,9 @@ class ContentLedger:
         leaked_placeholders: list[str] | None = None,
         missing_placeholders: list[str] | None = None,
         engine: str = "",
+        validation_reason: str | None = None,
+        retry_attempted: bool = False,
+        retry_outcome: str | None = None,
     ) -> None:
         if disposition not in DISPOSITIONS:
             raise ValueError(f"Unknown disposition: {disposition!r}")
@@ -158,6 +181,9 @@ class ContentLedger:
             "leaked_placeholders": list(leaked_placeholders or []),
             "missing_placeholders": list(missing_placeholders or []),
             "engine": engine,
+            "validation_reason": validation_reason,
+            "retry_attempted": bool(retry_attempted),
+            "retry_outcome": retry_outcome,
         }
         with self._lock:
             if block_key is None:
@@ -179,12 +205,17 @@ class ContentLedger:
         tm_stats: dict[str, Any] | None = None,
     ) -> None:
         """Store document-level domain, abbreviation disambiguation, and TM stats."""
+        stats = dict(tm_stats or {})
+        conflicts = list(stats.get("terminology_conflicts") or [])
+        conflict_count = int(stats.get("terminology_conflict_count", len(conflicts)) or 0)
         with self._lock:
             self._terminology = {
                 "domain": domain,
                 "abbreviations": dict(abbreviations or {}),
                 "abbreviation_count": len(abbreviations or {}),
-                "translation_memory": dict(tm_stats or {}),
+                "translation_memory": stats,
+                "terminology_conflict_count": conflict_count,
+                "terminology_conflicts": conflicts,
             }
 
     def record_output_qa(self, qa_report: dict[str, Any]) -> None:
@@ -236,6 +267,7 @@ class ContentLedger:
             preflight = dict(self._preflight) if self._preflight is not None else None
             terminology = dict(self._terminology) if self._terminology is not None else None
             output_qa = dict(self._output_qa) if self._output_qa is not None else None
+            pagination_metrics = dict(self._pagination_metrics)
         summary = self.snapshot()
         code_algorithm_preserved_count = sum(
             1 for r in preserved_regions if r.get("kind") == "code_or_algorithm"
@@ -251,7 +283,13 @@ class ContentLedger:
                 "off_page",
                 "page_overflow_unpaginated",
                 "footnote_overflow",
+                "contained_region_overflow",
             }
+        )
+        region_containment_issue_count = sum(
+            1
+            for issue in layout_issues
+            if issue.get("kind") in {"region_escape", "region_collision", "contained_region_overflow"}
         )
         table_cell_overflow_count = sum(
             1
@@ -289,6 +327,7 @@ class ContentLedger:
             or (engine_incomplete_count or 0) > 0
             or unsupported_glyph_count > 0
             or clipped_content_count > 0
+            or region_containment_issue_count > 0
             or irregular_table_count > 0
             or table_cell_overflow_count > 0
             or broken_tounicode_pages > 0
@@ -312,6 +351,26 @@ class ContentLedger:
                     "count": count,
                 }
             )
+        clipped_fragment_count = max(
+            int(pagination_metrics.get("clipped_fragment_count", 0) or 0),
+            sum(
+                1
+                for issue in layout_issues
+                if issue.get("kind") in {
+                    "clipped_or_missing",
+                    "off_page",
+                    "page_overflow_unpaginated",
+                    "footnote_overflow",
+                }
+            ),
+        )
+        detached_group_count = max(
+            int(pagination_metrics.get("detached_group_count", 0) or 0),
+            sum(1 for issue in layout_issues if issue.get("kind") == "detached_group"),
+        )
+        sparse_continuation_pages = int(
+            pagination_metrics.get("sparse_continuation_pages", 0) or 0
+        )
         return {
             "schema_version": "1.0",
             "status": "needs_review" if needs_review else "clean",
@@ -329,6 +388,10 @@ class ContentLedger:
                 "unsupported_glyph_count": unsupported_glyph_count,
                 "layout_issue_count": len(layout_issues),
                 "clipped_content_count": clipped_content_count,
+                "clipped_fragment_count": clipped_fragment_count,
+                "sparse_continuation_pages": sparse_continuation_pages,
+                "detached_group_count": detached_group_count,
+                "region_containment_issue_count": region_containment_issue_count,
                 "table_count": len(tables),
                 "irregular_table_count": irregular_table_count,
                 "table_cell_overflow_count": table_cell_overflow_count,
@@ -340,6 +403,13 @@ class ContentLedger:
                 "translation_memory_hits": (
                     ((terminology or {}).get("translation_memory") or {}).get("hits", 0)
                 ),
+                "terminology_conflict_count": int(
+                    (terminology or {}).get("terminology_conflict_count", 0) or 0
+                ),
+                "validation_retry_count": sum(1 for e in entries if e.get("retry_attempted")),
+                "validation_retry_succeeded_count": sum(1 for e in entries if e.get("retry_outcome") == "succeeded"),
+                "validation_retry_failed_count": sum(1 for e in entries if e.get("retry_outcome") == "failed"),
+                "validation_retry_partial_count": sum(1 for e in entries if e.get("retry_outcome") == "partial"),
             },
             "preflight": preflight,
             "terminology": terminology,

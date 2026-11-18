@@ -20,6 +20,7 @@ from babeldoc.format.pdf.document_il import (
 from babeldoc.format.pdf.document_il.midend.il_translator import (
     FormulaPlaceholder,
     ILTranslator,
+    normalize_year_over_year,
 )
 from babeldoc.format.pdf.document_il.midend.paragraph_finder import ParagraphFinder
 from babeldoc.format.pdf.document_il.midend.styles_and_formulas import StylesAndFormulas
@@ -243,4 +244,66 @@ def test_degenerate_arabic_hallucination_rejected_and_marked_incomplete(monkeypa
     assert engine.incomplete_count == 1
     assert "4.2%" in out
     assert out == "Sample rate is 4.2%."
+    cache.set.assert_not_called()
+
+
+def test_url_is_reassembled_and_kept_out_of_formula_and_arabic_rewrites():
+    url = "https://example.org/data/?option=com_content&view=article&id=1470&name=A%20B"
+    broken = url.replace("com_content", "com_\ncontent")
+    il = object.__new__(ILTranslator)
+    il.translation_config = SimpleNamespace(lang_out="ar")
+    assert il._pre_translate_terminology(f"See {broken}, then continue.") == f"See {url}, then continue."
+    assert il._pre_translate_terminology("See https://example.org/ for details.") == "See https://example.org/ for details."
+    path = "https://example.org/Fax/Allbanks"
+    assert il._pre_translate_terminology(f"Read {path}") == f"Read {path}"
+    output = il._normalize_arabic_output(f"راجع {url} ثم قارن 15%")
+    assert f"\u200e{url}\u200e" in output
+    assert "15٪" in output
+
+    compositions = [
+        PdfParagraphComposition(pdf_line=PdfLine(pdf_character=[
+            _make_char(ch, i * 6, y=200 - 15 * row) for i, ch in enumerate(line)
+        ]))
+        for row, line in enumerate(broken.splitlines())
+    ]
+    paragraph = PdfParagraph(pdf_paragraph_composition=compositions)
+    styles = object.__new__(StylesAndFormulas)
+    styles.font_mapper = SimpleNamespace(has_char=lambda _: True)
+    styles.translation_config = SimpleNamespace(formular_char_pattern=None, formular_font_pattern=None)
+    styles.process_page_formulas(Page(pdf_paragraph=[paragraph]))
+    assert all(comp.pdf_line for comp in paragraph.pdf_paragraph_composition)
+
+
+def test_yoy_repair_preserves_names_even_in_financial_paragraphs():
+    il = object.__new__(ILTranslator)
+    il.translation_config = SimpleNamespace(lang_out="ar")
+    assert il._normalize_arabic_output("التقرير في نيويورك") == "التقرير في نيويورك"
+    assert normalize_year_over_year("New York", "نيو يورك") == "نيو يورك"
+    assert normalize_year_over_year("YoY in New York", "يو يو في نيويورك") == "Y-o-Y في نيويورك"
+
+
+def test_heading_words_are_not_bics_but_acronyms_and_explicit_bank_codes_survive():
+    heading = "CLIMATE, ENERGY AND ENVIRONMENT (CEE) CONTRIBUTE TO THE INCREASED FREQUENCY."
+    encoded, mapping = tm._protect_numerals(heading)
+    assert "ENVIRONMENT" in encoded
+    assert not tm._is_pure_passthrough("ENVIRONMENT")
+    assert "(CEE)" in mapping.values()
+    assert tm._restore_numerals(encoded, mapping) == heading
+    assert "DEUTDEFFABC" in tm._protect_numerals("SWIFT BIC: DEUTDEFFABC")[1].values()
+    assert tm._protect_numerals("(NOTE)") == ("(NOTE)", {})
+
+
+def test_chemical_reaction_survives_or_uses_reviewable_source_fallback(monkeypatch):
+    formula = "6 CO₂ + 6 H₂O → C₆H₁₂O₆ + 6 O₂"
+    text = f"The reaction is {formula}. Calcium forms Ca²⁺ ions."
+    protected, values = tm._protect_numerals(text)
+    assert {formula, "Ca²⁺"} <= set(values.values())
+    assert tm._restore_numerals(protected, values) == text
+    assert tm._protect_numerals("OPEN → CLOSE") == ("OPEN → CLOSE", {})
+    assert "Mg2+" in tm._protect_numerals("Magnesium forms Mg2+ ions.")[1].values()
+
+    wrong = "لا توجد أسباب إضافية للاستمرار في إدارة المواد الغذائية (6، 6، 6، 6، 2)."
+    engine, cache = _dummy_nllb(monkeypatch, wrong, retry=wrong)
+    assert engine.translate(text) == text
+    assert engine.incomplete_count == 1
     cache.set.assert_not_called()

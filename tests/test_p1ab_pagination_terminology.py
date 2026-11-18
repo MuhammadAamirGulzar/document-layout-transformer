@@ -15,6 +15,7 @@ from babeldoc.format.pdf.document_il import (
     PdfLine,
     PdfParagraph,
     PdfParagraphComposition,
+    PdfRectangle,
     PdfStyle,
     VisualBbox,
 )
@@ -58,6 +59,8 @@ def _typesetter() -> Typesetting:
     )
     ts._rendered_collision_resolved_pages = set()
     ts._rtl_mirrored_table_pages = set()
+    ts._reported_layout_issue_keys = set()
+    ts._layout_issues = []
     return ts
 
 
@@ -114,6 +117,62 @@ def test_real_multiline_overflow_still_creates_continuation_page_and_keeps_table
     assert fn in doc.page[0].pdf_paragraph
     assert fixed_cell in doc.page[0].pdf_paragraph
     assert heavy_body in doc.page[1].pdf_paragraph
+
+
+def test_pagination_splits_tall_rendered_paragraph_without_losing_glyphs():
+    ts = _typesetter()
+    footnote = _para("1 Source note", 50, 35, 55, label="footnote")
+    lines = [f"Line {i:02d}" for i in range(20)]
+    compositions = [
+        PdfParagraphComposition(pdf_character=_glyph(char, 50 + col * 6, 258 - row * 12))
+        for row, line in enumerate(lines)
+        for col, char in enumerate(line)
+    ]
+    body = PdfParagraph(
+        box=Box(50, 30, 92, 268),
+        unicode="\n".join(lines),
+        layout_label="body",
+        debug_id="long-body",
+        pdf_paragraph_composition=compositions,
+    )
+    page = Page(
+        cropbox=Cropbox(box=Box(0, 0, 595, 842)),
+        page_number=0,
+        pdf_paragraph=[body, footnote],
+    )
+    doc = Document(page=[page], total_pages=1)
+
+    assert ts._paginate_overflowing_pages(doc) == 1
+
+    assert doc.total_pages == 2
+    assert doc.page[0].pdf_paragraph == [body, footnote]
+    assert [p.debug_id for p in doc.page[1].pdf_paragraph] == ["long-body_cont"]
+    continuation = doc.page[1].pdf_paragraph[0]
+    # The last three lines fall below the 65 pt footnote clearance boundary.
+    kept_glyphs = sum(len(line) for line in lines[:-3])
+    assert body.pdf_paragraph_composition == compositions[:kept_glyphs]
+    assert continuation.pdf_paragraph_composition == compositions[kept_glyphs:]
+    assert continuation.box.y > footnote.box.y2
+
+
+def test_overflow_stays_in_its_column_and_does_not_detach_a_framed_field():
+    ts = _typesetter()
+    overflow = _para("Left overflow", 45, 175, 190, trace={"page_overflow": True})
+    left_next = _para("Left continuation", 45, 150, 163)
+    right_field = _para("Reference: 12345", 330, 145, 157, trace={"page_overflow": True})
+    right_text = _para("Independent column", 330, 100, 113)
+    page = Page(
+        cropbox=Cropbox(box=Box(0, 0, 595, 842)),
+        page_number=0,
+        pdf_rectangle=[PdfRectangle(box=Box(310, 136, 500, 170))],
+        pdf_paragraph=[overflow, left_next, right_field, right_text],
+    )
+    doc = Document(page=[page], total_pages=1)
+
+    assert ts._paginate_overflowing_pages(doc) == 1
+    assert page.pdf_paragraph == [right_field, right_text]
+    assert doc.page[1].pdf_paragraph == [overflow, left_next]
+    assert [issue["kind"] for issue in ts._layout_issues] == ["contained_region_overflow"]
 
 
 def test_migrate_toc_preserves_bookmarks_across_continuation_pages(tmp_path: Path):

@@ -7,6 +7,7 @@ import re
 import threading
 import unicodedata
 from pathlib import Path
+from typing import Any
 
 import tiktoken
 from tqdm import tqdm
@@ -54,13 +55,39 @@ from babeldoc.format.pdf.document_il.midend.domain_glossary import (
 from babeldoc.format.pdf.document_il.utils.quality_report import detect_leaked_placeholders
 from babeldoc.format.pdf.document_il.utils.sentence_splitter import split_sentences
 from babeldoc.format.pdf.document_il.utils.style_helper import GRAY80
+from babeldoc.format.pdf.document_il.utils.web_references import iter_web_references
+from babeldoc.format.pdf.document_il.utils.web_references import restore_web_references
+from babeldoc.format.pdf.document_il.utils.web_references import stash_web_references
+from babeldoc.format.pdf.document_il.utils.structured_tokens import (
+    is_immutable_technical_text,
+    isolate_ltr_structured_spans,
+)
 from babeldoc.format.pdf.translation_config import TranslationConfig
-from babeldoc.translator.translator import AUTHOR_YEAR_CITATION
-from babeldoc.translator.translator import BaseTranslator, _is_pure_passthrough
+from babeldoc.translator.translator import (
+    AUTHOR_YEAR_CITATION,
+    BaseTranslator,
+    _ATOMIC_EXPRESSION,
+    _is_pure_passthrough,
+    validate_translation_completeness,
+)
 from babeldoc.utils.priority_thread_pool_executor import PriorityThreadPoolExecutor
 from arabic_reshaper import reshape
 
 logger = logging.getLogger(__name__)
+
+
+def normalize_year_over_year(source: str, translated: str) -> str:
+    """Repair a phonetic YoY only when the corresponding source contains it."""
+    if not re.search(r"\b(?:y[-–‑]?o[-–‑]?y|year[\s-]+over[\s-]+year)\b", source, re.I):
+        return translated
+    letter = r"[\u0600-\u06ff\ufb50-\ufdff\ufe70-\ufeff]"
+    return re.sub(
+        rf"(?<!{letter})(?:ﻳـﻮ|يـو|يو)\s*[-_–—ـ]*\s*(?:ﻳـﻮ|يـو|يو)(?!{letter})"
+        rf"|(?<!{letter})(?:ﻳـﺎ|يـا|يا)\s*[-_–—ـ]*\s*(?:ﻫـﻮ|هـو|هو)(?!{letter})",
+        "Y-o-Y",
+        translated,
+    )
+
 
 def _set_paragraph_skip_reason(paragraph: PdfParagraph, disposition: str, reason: str) -> None:
     paragraph.pipeline_trace = {
@@ -229,6 +256,9 @@ def _record_paragraph_disposition(
     translated_text: str = "",
     leaked_placeholders: list[str] | None = None,
     missing_placeholders: list[str] | None = None,
+    validation_reason: str | None = None,
+    retry_attempted: bool = False,
+    retry_outcome: str | None = None,
 ) -> None:
     engine_obj = getattr(translator, "translate_engine", None)
     engine_name = getattr(
@@ -270,6 +300,9 @@ def _record_paragraph_disposition(
             leaked_placeholders=leaked,
             missing_placeholders=missing,
             engine=engine_name,
+            validation_reason=validation_reason,
+            retry_attempted=retry_attempted,
+            retry_outcome=retry_outcome,
         )
 
 
@@ -622,6 +655,7 @@ class ILTranslator:
         """Lock and standardize technical financial terms before sending to translation model."""
         if not text:
             return text
+        text, urls = stash_web_references(text)
 
         # Collapse artificial letter-spaced words (>= 4 single ASCII letters separated
         # by single spaces, e.g. "L E T T E R - S P A C E D") while keeping initials
@@ -663,15 +697,6 @@ class ILTranslator:
         )
         text = re.sub(r'\b(\d+)isa\b', r'\1 is a', text, flags=re.I)
         text = re.sub(r'\bw\.?r\.?t\.?(?=\s|$|[.,;:)\]])', 'with respect to', text, flags=re.I)
-
-        # Rejoin URLs that wrapped across PDF lines and acquired a space at a
-        # slash, hyphen, query, or parameter boundary.
-        for _ in range(3):
-            text = re.sub(
-                r'(https?://[^\s<>"]+?[/\?&=\-_])\s+((?:\?[A-Za-z0-9_]+=|[A-Za-z0-9_]+\-[A-Za-z0-9_\-\(\)%./?&=:]+|[A-Za-z0-9_]+=[A-Za-z0-9_\-\(\)%./?&=:]+|[A-Za-z0-9_\-\(\)%]+/[A-Za-z0-9_\-\(\)%./?&=:]*))',
-                r'\1\2',
-                text,
-            )
 
         # Strip English ordinal suffixes on calendar dates before month names
         # ("as of 23rd June 2013" -> "as of 23 June 2013") so numeric shielding
@@ -781,7 +806,7 @@ class ILTranslator:
             flags=re.I,
         )
 
-        return text
+        return restore_web_references(text, urls)
 
     @staticmethod
     def _leading_bullet_tag(text: str, translate_input, layout_label: str) -> str:
@@ -1063,6 +1088,7 @@ class ILTranslator:
             # from truncating sentences at the tail of long paragraphs.
             # Periods in an author–year reference do not end a sentence.
             citations = [match.span() for match in AUTHOR_YEAR_CITATION.finditer(normalized_text)]
+            citations.extend((start, end) for start, end, _ in iter_web_references(normalized_text))
             raw_sentences = split_sentences(normalized_text, citation_spans=citations)
             sentences: list[str] = []
             for raw_sent in raw_sentences:
@@ -1167,7 +1193,6 @@ class ILTranslator:
         - Inconsistent percent signs (% vs ٪)
         - Stray periods around percent signs (e.g. '5.7 .٪' -> '5.7 ٪.')
         - Compound tokens like Q4-2022
-        - Phonetic table header translations (يـو يـو -> Y-o-Y)
         - Petroleum economic terminology (الزيت -> النفط for sector labels)
         - Currency unit standardization (QR / كرو -> ريال قطري)
         - Financial mistranslations cleanup (bps, bbl, repo rate)
@@ -1202,6 +1227,10 @@ class ILTranslator:
             if char in {"\n", "\t"} or unicodedata.category(char) != "Cc"
         )
 
+        # Stash web references before punctuation, glossary and BiDi rewrites.
+        # A percent escape in a literal URI is unrelated to a numeric percent.
+        text, urls = stash_web_references(text)
+
         # 1. Normalize percent signs: replace Western % with Arabic ٪
         text = text.replace('%', '\u066A')  # U+066A = Arabic percent sign ٪
 
@@ -1213,10 +1242,6 @@ class ILTranslator:
 
         # 3. Compound alphanumeric tokens: preserve Q4-2022 as an atomic token
         text = re.sub(r'\bQ\s*([1-4])\s*[-–—]\s*(\d{4})\b', r'Q\1-\2', text)
-
-        # 4. Table header YoY phonetic translation fix (يـو يـو / يـا هـو -> Y-o-Y)
-        text = re.sub(r'(?:ﻳـﻮ|يـو|يو)\s*[-_–—ـ]*\s*(?:ﻳـﻮ|يـو|يو)', 'Y-o-Y', text)
-        text = re.sub(r'(?:ﻳـﺎ|يـا|يا)\s*[-_–—ـ]*\s*(?:ﻫـﻮ|هـو|هو)', 'Y-o-Y', text)
 
         # 5. Petroleum terminology: standardize oil/non-oil sector labels
         text = re.sub(r'\bغير\s+الزيت\b', 'غير النفط', text)
@@ -1343,7 +1368,8 @@ class ILTranslator:
 
             text = re.sub(r"\uE000(\d+)\uE001", _restore_ref, text)
             text = re.sub(r"\u200e{2,}", "\u200e", text)
-        return text
+        text = restore_web_references(text, urls, mark_ltr=bool(re.search(r"[\u0600-\u06FF]", text)))
+        return isolate_ltr_structured_spans(text)
 
     def calc_token_count(self, text: str) -> int:
         if text is None:  # ADD THIS LINE
@@ -2506,6 +2532,8 @@ Now, please carefully read the following text to be translated and directly outp
                     if marker:
                         translated_text = f"{marker} {translated_text}"
                 if tm_cached is None:
+                    if lang_out_key.lower().rsplit("-", 1)[-1] in {"ar", "ara", "arabic"}:
+                        translated_text = normalize_year_over_year(source_unicode, translated_text)
                     translated_text = self._normalize_arabic_output(translated_text)
                     # Source-aware scientific repairs are a separate boundary so
                     # the long-standing one-argument normalization contract stays
@@ -2528,7 +2556,9 @@ Now, please carefully read the following text to be translated and directly outp
 
                 if isinstance(self.translate_engine, BaseTranslator):
                     para_failed, para_incomplete = self.translate_engine._consume_paragraph_status()
+                    val_reason, retry_attempted, retry_outcome = self.translate_engine._consume_paragraph_validation()
                 else:
+                    val_reason, retry_attempted, retry_outcome = None, False, None
                     after_untranslated = getattr(self.translate_engine, "untranslated_count", None)
                     after_incomplete = getattr(self.translate_engine, "incomplete_count", None)
                     para_failed = (
@@ -2568,10 +2598,24 @@ Now, please carefully read the following text to be translated and directly outp
                 translated_text = self._recover_and_clean_formula_placeholders(
                     translate_input, translated_text
                 )
+                missing_placeholders = _missing_input_placeholders(translate_input, translated_text)
+                for placeholder in getattr(translate_input, "placeholders", None) or []:
+                    if not isinstance(placeholder, FormulaPlaceholder) or placeholder.placeholder not in missing_placeholders:
+                        continue
+                    literal = get_char_unicode_string(placeholder.formula.pdf_character).strip()
+                    if _ATOMIC_EXPRESSION.search(literal):
+                        if not para_incomplete and isinstance(self.translate_engine, BaseTranslator):
+                            self.translate_engine._inc_incomplete_once()
+                        _record_paragraph_disposition(
+                            self, paragraph, page, "incomplete",
+                            reason="missing_chemical_expression",
+                            source_text=text,
+                            missing_placeholders=missing_placeholders,
+                        )
+                        return
                 post_ok = self.post_translate_paragraph(
                     paragraph, tracker, translate_input, translated_text
                 )
-                missing_placeholders = _missing_input_placeholders(translate_input, translated_text)
                 rendered_texts = _rendered_unicode_texts(paragraph)
                 if not getattr(translate_input, "placeholders", None):
                     rendered_texts.append(translated_text)
@@ -2587,6 +2631,25 @@ Now, please carefully read the following text to be translated and directly outp
                     )
 
                 source_cmp = getattr(translate_input, "unicode", text) or text
+                is_protected_zone = any(
+                    marker in lbl.lower()
+                    for marker in ("reference", "bibliography", "code", "algorithm", "formula")
+                ) or bool((paragraph.pipeline_trace or {}).get("preserved_code"))
+                if (
+                    not para_failed
+                    and not para_incomplete
+                    and not is_protected_zone
+                    and not _is_pure_passthrough(source_cmp)
+                ):
+                    comp_ok, comp_reason = validate_translation_completeness(
+                        source_cmp,
+                        translated_text,
+                        target_lang=lang_out_key,
+                    )
+                    if not comp_ok:
+                        val_reason = val_reason or comp_reason
+                        para_incomplete = True
+
                 if para_failed:
                     disposition = "untranslated-exception"
                     reason = "engine_error_fallback"
@@ -2595,12 +2658,20 @@ Now, please carefully read the following text to be translated and directly outp
                     if missing_placeholders or leaked_placeholders:
                         reason = "leaked_or_missing_placeholders"
                     else:
-                        reason = "truncated_or_missing_protected_content"
+                        reason = val_reason or "truncated_or_missing_protected_content"
                     if not para_incomplete and isinstance(self.translate_engine, BaseTranslator):
                         self.translate_engine._inc_incomplete_once()
                 elif _is_pure_passthrough(text):
                     disposition = "passthrough"
                     reason = "pure_passthrough_text"
+                elif (
+                    translated_text.strip() == source_cmp.strip()
+                    and is_immutable_technical_text(source_cmp)
+                ):
+                    # Identifiers, numbers, units, URLs and short codes are correct
+                    # when unchanged; this is not a translation failure.
+                    disposition = "passthrough"
+                    reason = "immutable_technical_text"
                 elif (
                     translated_text.strip() == source_cmp.strip()
                     or post_ok is False
@@ -2610,6 +2681,13 @@ Now, please carefully read the following text to be translated and directly outp
                 else:
                     disposition = "translated"
                     reason = None
+                    if doc_tm is not None:
+                        doc_tm.record_term_observations(
+                            text,
+                            translated_text,
+                            domain=domain,
+                            abbreviations=abbrevs,
+                        )
                     if (
                         tm_cached is None
                         and not has_placeholders
@@ -2633,6 +2711,9 @@ Now, please carefully read the following text to be translated and directly outp
                     translated_text=translated_text,
                     leaked_placeholders=leaked_placeholders,
                     missing_placeholders=missing_placeholders,
+                    validation_reason=val_reason,
+                    retry_attempted=retry_attempted,
+                    retry_outcome=retry_outcome,
                 )
                 engine_name = getattr(self.translate_engine, 'name', self.translate_engine.__class__.__name__)
                 logger.info(

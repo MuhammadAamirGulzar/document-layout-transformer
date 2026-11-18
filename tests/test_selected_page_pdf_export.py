@@ -4,8 +4,34 @@ import pymupdf
 import pytest
 
 from babeldoc.format.pdf.document_il.backend.pdf_creater import PDFCreater
+from babeldoc.format.pdf.document_il import Box
+from babeldoc.format.pdf.document_il import Cropbox
+from babeldoc.format.pdf.document_il import Page
 from babeldoc.format.pdf.high_level import migrate_toc
 from babeldoc.format.pdf.translation_config import TranslateResult
+
+
+def test_continuation_can_paint_with_source_colorspace_and_graphics_state():
+    creator = object.__new__(PDFCreater)
+    creator.docs = SimpleNamespace(page=[
+        Page(page_number=0),
+        Page(page_number=1, continuation_of_page=0,
+             cropbox=Cropbox(box=Box(0, 0, 100, 100))),
+    ])
+    with pymupdf.open() as document:
+        source = document.new_page(width=100, height=100)
+        resources = document.get_new_xref()
+        document.update_object(resources, "<< /ColorSpace << /CS0 /DeviceRGB >> /ExtGState << /GS0 << /ca 1 >> >> >>")
+        document.xref_set_key(source.xref, "Resources", f"{resources} 0 R")
+
+        creator._ensure_continuation_pages_in_pdf(document)
+
+        continuation = document[1]
+        contents = document.get_new_xref()
+        document.update_object(contents, "<< >>")
+        document.update_stream(contents, b"q /GS0 gs /CS0 cs 1 0 0 scn 20 20 40 40 re f Q")
+        continuation.set_contents(contents)
+        assert continuation.get_pixmap(alpha=False).pixel(35, 60) == (255, 0, 0)
 
 
 @pytest.mark.parametrize(

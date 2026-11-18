@@ -1,0 +1,188 @@
+{
+  "version": "1.0",
+  "pre_rules": [
+    {
+      "domain": "any",
+      "pattern": "\\bKurdistan\\s+Region\\b",
+      "replacement": "إقليم كردستان",
+      "ignore_case": true
+    },
+    {
+      "domain": "any",
+      "pattern": "\\bNinewa\\b",
+      "replacement": "نينوى",
+      "ignore_case": true
+    },
+    {
+      "domain": "any",
+      "pattern": "\\bBasra\\b",
+      "replacement": "البصرة",
+      "ignore_case": true
+    },
+    {
+      "domain": "any",
+      "pattern": "\\bAnbar\\b",
+      "replacement": "الأنبار",
+      "ignore_case": true
+    },
+    {
+      "domain": "any",
+      "pattern": "\\bErbil\\b",
+      "replacement": "أربيل",
+      "ignore_case": true
+    },
+    {
+      "domain": "any",
+      "pattern": "\\bBaghdad\\b",
+      "replacement": "بغداد",
+      "ignore_case": true
+    },
+    {
+      "domain": "policy_un",
+      "pattern": "\\bWorld\\s+Health\\s+Organization\\b",
+      "replacement": "منظمة الصحة العالمية (WHO)",
+      "ignore_case": true
+    },
+    {
+      "domain": "policy_un",
+      "pattern": "\\bUnited\\s+Nations\\s+Development\\s+Programme\\b",
+      "replacement": "برنامج الأمم المتحدة الإنمائي (UNDP)",
+      "ignore_case": true
+    },
+    {
+      "domain": "policy_un",
+      "pattern": "\\bMulti-?Indicator\\s+Cluster\\s+Survey\\b",
+      "replacement": "المسح العنقودي متعدد المؤشرات (MICS)",
+      "ignore_case": true
+    }
+  ],
+  "post_rules": [
+    {
+      "source_pattern": "\\bNinewa\\b",
+      "pattern": "(?<![\\u0621-\\u064A])([وبلكف]?)(?:نيينوى|نينوا|Ninewa)\\b",
+      "replacement": "\\1نينوى"
+    },
+    {
+      "source_pattern": "\\bErbil\\b",
+      "pattern": "(?<![\\u0621-\\u064A])([وبلكف]?)(?:اربيل|إربيل|Erbil)\\b",
+      "replacement": "\\1أربيل"
+    },
+    {
+      "source_pattern": "\\bKurdistan\\s+Region\\b",
+      "pattern": "(?<![\\u0621-\\u064A])([وبلكف]?)(?:إقليم\\s+كوردستان|اقليم\\s+كردستان|اقليم\\s+كوردستان)\\b",
+      "replacement": "\\1إقليم كردستان"
+    },
+    {
+      "source_pattern": "\\bBasra\\b",
+      "pattern": "(?<![\\u0621-\\u064A])([وبلكف]?)بصرة\\b",
+      "replacement": "\\1البصرة"
+    },
+    {
+      "source_pattern": "\\bAnbar\\b",
+      "pattern": "(?<![\\u0621-\\u064A])([وبلكف]?)(?:أنبار|الانبار)\\b",
+      "replacement": "\\1الأنبار"
+    },
+    {
+      "source_pattern": "\\bUNICEF\\b",
+      "pattern": "(?<![\\u0621-\\u064A])([وبلكف]?)(?:يونسيف|يونيسف|اليونسيف|Unicef)\\b",
+      "replacement": "\\1اليونيسف"
+    },
+    {
+      "source_pattern": "\\bWHO\\b",
+      "pattern": "(?<![\\u0621-\\u064A])([وبلكف]?)(?:منظمة\\s+الصحة\\s+العالميه|منظمه\\s+الصحة\\s+العالمية)\\b",
+      "replacement": "\\1منظمة الصحة العالمية"
+    },
+    {
+      "source_pattern": "\\bUNDP\\b",
+      "pattern": "(?<![\\u0621-\\u064A])([وبلكف]?)(?:برنامج\\s+الامم\\s+المتحدة\\s+الانمائي)\\b",
+      "replacement": "\\1برنامج الأمم المتحدة الإنمائي"
+    }
+  ],
+  "tracked_terms": [
+    {
+      "source_term": "UNICEF",
+      "source_pattern": "\\bUNICEF\\b|United\\s+Nations\\s+Children['\\u2019]s\\s+Fund\\b",
+      "canonical": "اليونيسف",
+      "variant_patterns": [
+        "اليونيسف",
+        "يونيسف",
+        "يونسيف",
+        "اليونسيف",
+        "منظمة الأمم المتحدة للطفولة"
+      ]
+    },
+    {
+      "source_term": "Country programme document",
+      "source_pattern": "\\bCountry\\s+programme\\s+document\\b",
+      "canonical": "وثيقة البرنامج القطري",
+      "variant_patterns": [
+        "وثيقة البرنامج القطري",
+        "وثيقة برنامج البلد",
+        "وثيقة البلدان البرنامج",
+        "وثيقة برنامج الدول"
+      ]
+    },
+    {
+      "source_term": "Summary budget table",
+      "source_pattern": "\\bSummary\\s+budget\\s+table\\b",
+      "canonical": "جدول الميزانية الموجز",
+      "variant_patterns": [
+        "جدول الميزانية الموجز",
+        "ملخص جدول الميزانية",
+        "جدول ملخص الميزانية"
+      ]
+    },
+    {
+      "source_term": "UNSDCF",
+      "source_pattern": "\\bUNSDCF\\b|United\\s+Nations\\s+Sustainable\\s+Development\\s+Cooperation\\s+Framework\\b",
+      "canonical": "إطار الأمم المتحدة للتعاون",
+      "variant_patterns": [
+        "UNSDCF",
+        "إطار الأمم المتحدة للتعاون",
+        "إطار التعاون",
+        "نتائج المعهد الدولي"
+      ]
+    },
+    {
+      "source_term": "Child Welfare Commission",
+      "source_pattern": "\\bChild\\s+Welfare\\s+Commission\\b",
+      "canonical": "هيئة رعاية الطفولة",
+      "variant_patterns": [
+        "هيئة رعاية الطفولة",
+        "لجنة رعاية الطفل",
+        "مفوضية رعاية الطفولة"
+      ]
+    },
+    {
+      "source_term": "Ninewa",
+      "source_pattern": "\\bNinewa\\b",
+      "canonical": "نينوى",
+      "variant_patterns": [
+        "نينوى",
+        "نيينوى",
+        "نينوا"
+      ]
+    },
+    {
+      "source_term": "Kurdistan Region",
+      "source_pattern": "\\bKurdistan\\s+Region\\b",
+      "canonical": "إقليم كردستان",
+      "variant_patterns": [
+        "إقليم كردستان",
+        "إقليم كوردستان",
+        "اقليم كردستان",
+        "اقليم كوردستان"
+      ]
+    },
+    {
+      "source_term": "MICS",
+      "source_pattern": "\\bMICS\\b",
+      "canonical": "MICS",
+      "variant_patterns": [
+        "MICS",
+        "ميكس",
+        "مايكس"
+      ]
+    }
+  ]
+}

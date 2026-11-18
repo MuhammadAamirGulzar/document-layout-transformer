@@ -895,16 +895,21 @@ class PDFCreater:
         draw_op.append(b" n Q\n")
 
     def _ensure_continuation_pages_in_pdf(self, pdf: pymupdf.Document) -> None:
-        """Insert blank PyMuPDF pages with initialized /Resources/Font for continuation IL pages."""
+        """Insert continuation pages with source resources for moved text and graphics."""
         if not any(getattr(p, "continuation_of_page", None) is not None for p in self.docs.page):
             return
+        docs_have_gaps = any(
+            getattr(p, "continuation_of_page", None) is None and p.page_number != idx
+            for idx, p in enumerate(self.docs.page)
+        )
         for idx, il_page in enumerate(self.docs.page):
-            if il_page.page_number != idx:
+            if not docs_have_gaps and il_page.page_number != idx:
                 il_page.page_number = idx
             if (
                 getattr(il_page, "continuation_of_page", None) is not None
-                and pdf.page_count < len(self.docs.page)
+                and (docs_have_gaps or pdf.page_count < len(self.docs.page))
             ):
+                insert_pno = max(0, min(il_page.page_number, pdf.page_count))
                 crop = (
                     il_page.cropbox.box
                     if il_page.cropbox and il_page.cropbox.box
@@ -916,47 +921,36 @@ class PDFCreater:
                 )
                 width = max(1.0, crop.x2 - crop.x) if crop else 595.0
                 height = max(1.0, crop.y2 - crop.y) if crop else 842.0
-                new_page = pdf.new_page(pno=idx, width=width, height=height)
+                new_page = pdf.new_page(pno=insert_pno, width=width, height=height)
                 try:
-                    inherited_font_dict = "<< >>"
-                    if idx > 0 and idx - 1 < pdf.page_count:
-                        src_xref = pdf[idx - 1].xref
-                        src_res_type, src_res_val = pdf.xref_get_key(src_xref, "Resources")
-                        if src_res_type == "xref":
-                            m_res = re.search(r"(\d+)\s+0\s+R", src_res_val)
-                            if m_res:
-                                _, src_font_val = pdf.xref_get_key(int(m_res.group(1)), "Font")
-                            else:
-                                src_font_val = "null"
-                        elif src_res_type == "dict":
-                            _, src_font_val = pdf.xref_get_key(src_xref, "Resources/Font")
-                        else:
-                            src_font_val = "null"
-                        if src_font_val and src_font_val != "null":
-                            m_fxref = re.fullmatch(r"\s*(\d+)\s+0\s+R\s*", src_font_val)
-                            if m_fxref:
-                                resolved = pdf.xref_object(int(m_fxref.group(1)))
-                                if resolved and resolved.strip().startswith("<<"):
-                                    inherited_font_dict = resolved.strip()
-                            elif src_font_val.strip().startswith("<<"):
-                                inherited_font_dict = src_font_val.strip()
-
-                    res_type, res_val = pdf.xref_get_key(new_page.xref, "Resources")
-                    if res_type == "null":
-                        pdf.xref_set_key(new_page.xref, "Resources", f"<< /Font {inherited_font_dict} >>")
-                    elif res_type == "dict":
-                        font_type, _ = pdf.xref_get_key(new_page.xref, "Resources/Font")
-                        if font_type == "null" or inherited_font_dict != "<< >>":
-                            pdf.xref_set_key(new_page.xref, "Resources/Font", inherited_font_dict)
-                    elif res_type == "xref":
-                        match = re.search(r"(\d+)\s+0\s+R", res_val)
-                        if match:
-                            res_xref = int(match.group(1))
-                            font_type, _ = pdf.xref_get_key(res_xref, "Font")
-                            if font_type == "null" or inherited_font_dict != "<< >>":
-                                pdf.xref_set_key(res_xref, "Font", inherited_font_dict)
+                    resource_dict = "<< >>"
+                    if insert_pno > 0 and insert_pno - 1 < pdf.page_count:
+                        src_xref = pdf[insert_pno - 1].xref
+                        visited: set[int] = set()
+                        while src_xref not in visited:
+                            visited.add(src_xref)
+                            res_type, res_value = pdf.xref_get_key(src_xref, "Resources")
+                            if res_type in {"xref", "dict"}:
+                                if res_type == "xref":
+                                    res_value = pdf.xref_object(int(res_value.split()[0]))
+                                if res_value.strip().startswith("<<"):
+                                    resource_dict = res_value
+                                break
+                            parent_type, parent_value = pdf.xref_get_key(src_xref, "Parent")
+                            if parent_type != "xref":
+                                break
+                            src_xref = int(parent_value.split()[0])
+                    pdf.xref_set_key(new_page.xref, "Resources", resource_dict)
+                    font_type, font_value = pdf.xref_get_key(new_page.xref, "Resources/Font")
+                    if font_type == "xref":
+                        # Font registration on the continuation must not
+                        # mutate the source's shared font dictionary.
+                        font_dict = pdf.xref_object(int(font_value.split()[0]))
+                        pdf.xref_set_key(new_page.xref, "Resources/Font", font_dict)
+                    elif font_type == "null":
+                        pdf.xref_set_key(new_page.xref, "Resources/Font", "<< >>")
                 except Exception:
-                    logger.debug("Failed to pre-initialize Resources/Font on continuation page %s", idx)
+                    logger.debug("Failed to initialize resources on continuation page %s", idx)
 
     def _aligned_dual_page_pairs(
         self,
@@ -1602,19 +1596,29 @@ class PDFCreater:
             if translation_config.only_include_translated_page:
                 selected_orig_pages: list[int] = []
                 selected_trans_pages: list[int] = []
+                docs_have_gaps = any(
+                    getattr(p, "continuation_of_page", None) is None
+                    and p.page_number != idx
+                    for idx, p in enumerate(self.docs.page)
+                )
                 orig_cursor = 0
                 for page in self.docs.page:
                     if getattr(page, "continuation_of_page", None) is not None:
                         src_orig = page.continuation_of_page
-                        if self.translation_config.should_translate_page(src_orig + 1):
-                            selected_trans_pages.append(page.page_number)
+                        if docs_have_gaps or self.translation_config.should_translate_page(src_orig + 1):
+                            if 0 <= page.page_number < pdf.page_count:
+                                selected_trans_pages.append(page.page_number)
                     else:
-                        if self.translation_config.should_translate_page(orig_cursor + 1):
-                            selected_orig_pages.append(orig_cursor)
-                            selected_trans_pages.append(page.page_number)
+                        orig_idx = page.page_number if docs_have_gaps else orig_cursor
+                        if docs_have_gaps or self.translation_config.should_translate_page(orig_idx + 1):
+                            if 0 <= orig_idx < pdf.page_count:
+                                selected_orig_pages.append(orig_idx)
+                            if 0 <= page.page_number < pdf.page_count:
+                                selected_trans_pages.append(page.page_number)
                         orig_cursor += 1
                 selected_pages = sorted(set(selected_orig_pages))
-                pdf.select(sorted(set(selected_trans_pages)))
+                if selected_trans_pages:
+                    pdf.select(sorted(set(selected_trans_pages)))
 
             # Add detailed logging before saving
             if self.detailed_logger:

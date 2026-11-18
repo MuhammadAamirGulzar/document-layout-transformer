@@ -80,6 +80,31 @@ def test_retry_cannot_drop_a_value_that_was_kept(make_engine):
     cache.set.assert_not_called()
 
 
+def test_failed_block_retry_recovers_protected_values_in_their_sentences(make_engine):
+    first = (
+        "The regional programme provided services to 25 districts during the winter season "
+        "and expanded access for underserved communities."
+    )
+    second = (
+        "The survey published its findings at https://example.org/data?id=57 "
+        "after reviewing the records with local teams."
+    )
+    sentence_outputs = {
+        tm._protect_numerals(first)[0]: "قدم البرنامج الإقليمي خدمات إلى {0} منطقة في فصل الشتاء ووسع نطاق الوصول للمجتمعات المحرومة.",
+        tm._protect_numerals(second)[0]: "نشر المسح نتائجه على {0} بعد مراجعة السجلات مع الفرق المحلية.",
+    }
+    retry = Mock(side_effect=lambda payload: sentence_outputs.get(payload, "راجع الفريق السجلات."))
+    engine, cache = make_engine("قدم البرنامج خدمات وراجع الفريق السجلات.", retry)
+
+    result = engine.translate(f"{first} {second}")
+
+    assert "خدمات إلى 25 منطقة" in result
+    assert "على https://example.org/data?id=57 بعد" in result
+    assert retry.call_count == 3
+    assert engine.incomplete_count == 0
+    cache.set.assert_called_once()
+
+
 def test_failed_retry_retains_currency_and_exact_grouped_number(make_engine):
     retry = Mock(return_value="تفكر الجامعة في تثبيت نظام.")
     engine, cache = make_engine("تفكر الجامعة في تثبيت نظام.", retry)
@@ -94,11 +119,11 @@ def test_failed_retry_retains_currency_and_exact_grouped_number(make_engine):
     cache.set.assert_not_called()
 
 
-def test_dropped_full_iban_keeps_the_existing_strict_guard(make_engine):
+def test_dropped_full_iban_falls_back_without_crashing_document_translation(make_engine):
     retry = Mock()
     engine, cache = make_engine("احفظ الحساب.", retry)
-    with pytest.raises(AssertionError, match="Byte-identity"):
-        engine.translate("Keep QA64SCBL00000000000137502560.")
+    source = "Keep QA64SCBL00000000000137502560."
+    assert engine.translate(source) == source
     retry.assert_not_called()
     cache.set.assert_not_called()
 
@@ -107,17 +132,20 @@ def test_dropped_grouped_iban_is_flagged_without_a_literal_retry(make_engine):
     retry = Mock()
     engine, cache = make_engine("احفظ الحساب.", retry)
     source = "Keep QA64 SCBL 0000 0000 0001 3750 2560 on file."
-    assert engine.translate(source) == "احفظ الحساب."
+    # A sensitive identifier is never exposed to a literal model retry.  If the
+    # placeholder is dropped, the safe final fallback is the complete source
+    # block rather than an Arabic sentence with the account silently missing.
+    assert engine.translate(source) == source
     retry.assert_not_called()
     assert engine.incomplete_count == 1
     cache.set.assert_not_called()
 
 
-def test_3_3b_keeps_existing_behavior(make_engine):
-    retry = Mock()
+def test_3_3b_retries_missing_protected_values_like_other_nllb_sizes(make_engine):
+    retry = Mock(return_value="رئيس لجنة IBAN")
     engine, _ = make_engine("رئيس اللجنة", retry, model="nllb-3.3b")
-    assert engine.translate("Head of IBAN Committee") == "رئيس اللجنة"
-    retry.assert_not_called()
+    assert engine.translate("Head of IBAN Committee") == "رئيس لجنة IBAN"
+    retry.assert_called_once()
 
 
 def test_status_and_page_can_report_incomplete_translation(monkeypatch):

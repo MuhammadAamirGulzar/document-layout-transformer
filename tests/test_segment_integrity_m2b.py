@@ -171,7 +171,7 @@ def test_error_fallback_returns_source_but_never_caches(make_fake_cache, cls, kw
     ],
 )
 def test_oversized_input_is_split_without_truncating_tail(make_fake_cache, cls, kwargs):
-    engine = cls("en", "ar", **kwargs)
+    engine = cls("en", "fr", **kwargs)
     engine._tokenizer = FakeSeq2SeqTokenizer()
     engine._model = FakeSeq2SeqModel()
     engine._forced_bos_token_id = 3
@@ -207,7 +207,7 @@ def test_output_max_length_no_eos_on_single_clause_flags_incomplete_and_skips_ca
 
 
 def test_output_ending_at_exact_max_length_with_eos_is_complete(make_fake_cache):
-    engine = tm.MarianMTTranslator("en", "ar", max_length=7)
+    engine = tm.MarianMTTranslator("en", "fr", max_length=7)
     engine._tokenizer = FakeSeq2SeqTokenizer()
     engine._model = FakeSeq2SeqModel()
     engine._load_model = lambda: None
@@ -222,7 +222,7 @@ def test_output_ending_at_exact_max_length_with_eos_is_complete(make_fake_cache)
 
 
 def test_multi_clause_output_truncation_recovers_by_splitting_on_clause(make_fake_cache):
-    engine = tm.NLLBTranslator("en", "ar", model_name="nllb-1.3b", max_length=20)
+    engine = tm.NLLBTranslator("en", "fr", model_name="nllb-1.3b", max_length=20)
     engine._tokenizer = FakeSeq2SeqTokenizer()
     # Input fits within encoder max_length=20 (16 words -> 18 tokens),
     # but decoder truncates > 10 words unless split cleanly at the semicolon.
