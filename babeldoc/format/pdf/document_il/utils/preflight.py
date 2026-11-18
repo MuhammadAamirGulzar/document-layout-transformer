@@ -11,6 +11,7 @@ from typing import Any
 import pymupdf
 
 from babeldoc.format.pdf.document_il.utils.layout_semantics import paragraph_semantic_zone
+from babeldoc.format.pdf.document_il.utils.quality_report import is_regex_quantifier_match
 
 logger = logging.getLogger(__name__)
 
@@ -219,6 +220,23 @@ def audit_output_pdf(
     src_doc = None
     try:
         doc = pymupdf.open(path)
+        source_full_text = ""
+        if source_pdf_path and Path(source_pdf_path).exists():
+            try:
+                with pymupdf.open(Path(source_pdf_path)) as sdoc:
+                    source_full_text = "\n".join((p.get_text("text") or "") for p in sdoc)
+            except Exception:
+                source_full_text = ""
+        if il_document is not None:
+            il_code_texts = [
+                (getattr(p, "unicode", "") or "")
+                for pg in (getattr(il_document, "page", None) or [])
+                for p in (getattr(pg, "pdf_paragraph", None) or [])
+                if (getattr(p, "pipeline_trace", None) or {}).get("preserved_code")
+                or paragraph_semantic_zone(p, pg) == "code"
+            ]
+            if il_code_texts:
+                source_full_text = f"{source_full_text}\n" + "\n".join(il_code_texts)
         actual_pages = len(doc)
         empty_pages: list[int] = []
         leaked_pages: list[int] = []
@@ -247,7 +265,16 @@ def audit_output_pdf(
                 contents = b""
             if not contents and not text.strip():
                 empty_pages.append(idx)
-            if _LEAKED_PLACEHOLDER_RE.search(text):
+            has_real_leak = False
+            for m_leak in _LEAKED_PLACEHOLDER_RE.finditer(text):
+                tok = m_leak.group(0)
+                if tok in source_full_text:
+                    continue
+                if is_regex_quantifier_match(text, m_leak):
+                    continue
+                has_real_leak = True
+                break
+            if has_real_leak:
                 leaked_pages.append(idx)
             if "\ufffd" in text:
                 replacement_char_pages.append(idx)

@@ -72,6 +72,7 @@ from babeldoc.format.pdf.document_il.utils.structured_tokens import (
     caps_phrase_to_sentence_case as _caps_phrase_to_sentence_case,
     is_code_like as _is_code_like,
     is_immutable_technical_text,
+    lex_translatable_and_protected_spans,
     is_plain_caps_word as _is_plain_caps_word,
     is_valid_bic as _is_valid_bic,
     protect_structured_tokens as _protect_numerals,
@@ -888,60 +889,205 @@ class BaseTranslator(ABC):
                 segments = clauses
         return segments or [source_full]
 
+    _CLAUSE_SPLIT_RE = re.compile(
+        r"([;:\u2014\u2013]\s+|,\s+(?=(?:however|while|whereas|and|or|but|which|where|including|such\s+as|after|before|although|because|if|when)\b))",
+        re.IGNORECASE,
+    )
+
+    def _split_clauses_with_separators(self, text: str) -> list[tuple[str, str]]:
+        """Split a sentence into ``(clause_text, trailing_separator)`` pairs."""
+        parts = self._CLAUSE_SPLIT_RE.split(text)
+        if len(parts) <= 1:
+            return [(text, "")]
+        out: list[tuple[str, str]] = []
+        i = 0
+        while i < len(parts):
+            clause = parts[i]
+            sep = parts[i + 1] if i + 1 < len(parts) else ""
+            if clause or sep:
+                out.append((clause, sep))
+            i += 2
+        return out if len(out) >= 2 else [(text, "")]
+
+    def _try_translate_span_unit(self, span_text: str, target_lang: str) -> str | None:
+        """Translate and validate a single sentence/clause/prose span, returning None if unsafe."""
+        stripped = span_text.strip()
+        if not stripped:
+            return span_text
+        seg_prot, seg_map = _protect_numerals(stripped)
+        try:
+            raw = self._generate_translation(seg_prot)
+            restored = _restore_numerals(raw, seg_map, strict=False) if seg_map else raw
+            if seg_map:
+                restored = self._canonicalize_literal_values(restored, seg_map.values())
+            exact = all(
+                self._protected_value_count(restored, value) == count
+                for value, count in Counter(seg_map.values()).items()
+            )
+            if not exact:
+                return None
+            if self._find_unresolved_placeholders(seg_prot, restored, seg_map):
+                return None
+            if not self._retry_target_satisfied(restored):
+                return None
+            if _is_degenerate_translation(stripped, restored) or _HALLUCINATION_STOCK_RE.search(restored):
+                return None
+            valid, _ = validate_translation_completeness(
+                stripped,
+                restored,
+                target_lang=target_lang,
+                extra_protected=tuple(seg_map.values()),
+            )
+            if not valid:
+                return None
+            # For short 2-3 word spans exempted by length in validate_translation_completeness,
+            # still reject outputs that leave lowercase English words untranslated in Arabic mode.
+            tgt_norm = str(target_lang or "").lower().rsplit("-", 1)[-1]
+            if tgt_norm in {"ar", "ara", "arabic", "arb_arab"}:
+                clean_out = _strip_immutable_for_completeness(restored, tuple(seg_map.values()))
+                rem_lower = [
+                    w for w in re.findall(r"\b[A-Za-z][A-Za-z'\u2019\-]{1,}\b", clean_out)
+                    if not w.isupper() and w[0].islower()
+                ]
+                ar_chars = re.findall(rf"[{_ARABIC_LETTER_RANGE}]", clean_out)
+                if rem_lower and len(ar_chars) < sum(len(w) for w in rem_lower):
+                    return None
+            return restored.strip()
+        except Exception as exc:  # noqa: BLE001 - recovery must never raise
+            logger.warning("Span recovery failed for one segment: %s", exc)
+            return None
+
+    def _recover_clause_by_lexed_spans(
+        self,
+        clause_text: str,
+        target_lang: str,
+    ) -> tuple[str, int, int] | None:
+        """Lex *clause_text* into prose, protected tokens, and separators, translating prose spans."""
+        lexed = lex_translatable_and_protected_spans(clause_text)
+        protected_count = sum(1 for kind, _ in lexed if kind == "protected")
+        prose_indices = [
+            idx for idx, (kind, val) in enumerate(lexed)
+            if kind == "prose" and len(re.findall(r"[A-Za-z]{2,}", val)) >= 2
+        ]
+        if protected_count == 0 or not prose_indices or (protected_count < 2 and len(prose_indices) < 2):
+            return None
+        out_tokens: list[str] = []
+        tr_cnt = 0
+        kept_cnt = 0
+        for kind, val in lexed:
+            if kind in {"protected", "separator"}:
+                out_tokens.append(val)
+                continue
+            words = re.findall(r"[A-Za-z]{2,}", val)
+            if not words:
+                out_tokens.append(val)
+                continue
+            if len(words) < 2:
+                out_tokens.append(val)
+                kept_cnt += 1
+                continue
+            lead_ws = val[: len(val) - len(val.lstrip())]
+            trail_ws = val[len(val.rstrip()) :]
+            accepted = self._try_translate_span_unit(val.strip(), target_lang)
+            if accepted is not None:
+                lead = lead_ws or (" " if out_tokens and not out_tokens[-1][-1:].isspace() else "")
+                trail = trail_ws or " "
+                out_tokens.append(f"{lead}{accepted}{trail}")
+                tr_cnt += 1
+            else:
+                out_tokens.append(val)
+                kept_cnt += 1
+        if tr_cnt == 0:
+            return None
+        reconstructed = re.sub(r"[^\S\r\n]{2,}", " ", "".join(out_tokens)).strip()
+        return reconstructed, tr_cnt, kept_cnt
+
     def _recover_by_spans(self, source_full: str, target_lang: str):
         """Keep valid Arabic prose while retaining only the spans that cannot be proven safe.
 
-        Each segment is protected, translated, restored and validated on its own,
-        so one failed protected token no longer turns the whole block English.  A
-        segment that fails any check keeps its exact source text.  Returns
-        ``(text, translated_segments, kept_segments)`` or ``None`` when no
-        segment could be recovered (or the block cannot be split).
+        Operates hierarchically with bounded attempts:
+        1. Sentence segments;
+        2. Clause sub-segments for any sentence that fails;
+        3. Lexed natural-language spans around immutable/protected tokens when a
+           clause fails due to dense protected values.
+        Returns ``(text, translated_segments, kept_segments)`` or ``None`` when no
+        span could be safely translated.
         """
-        segments = self._split_retry_segments(source_full)
-        if len(segments) < 2:
-            return None
+        web_spans = [(s, e) for s, e, _ in iter_web_references(source_full)]
+        cites = [m.span() for m in AUTHOR_YEAR_CITATION.finditer(source_full)] + web_spans
+        sentences = [s.strip() for s in split_sentences(source_full, citation_spans=cites) if s and s.strip()]
+        if not sentences:
+            sentences = [source_full.strip()]
+
         parts: list[str] = []
         translated_count = 0
         kept_count = 0
-        for seg in segments:
-            if _is_pure_passthrough(seg) or is_immutable_technical_text(seg):
-                parts.append(seg)
+        if len(sentences) == 1:
+            # For a single short sentence (<= 60 chars), only use sub-sentence span
+            # recovery when the sentence itself has dense protected tokens (>= 3) or
+            # when _protected_integrity_fallback could not already preserve translated
+            # Arabic prose in the first output.
+            if len(source_full) <= 60:
+                lexed_sent = lex_translatable_and_protected_spans(source_full)
+                if sum(1 for k, _ in lexed_sent if k == "protected") < 3:
+                    return None
+
+        for sent in sentences:
+            if _is_pure_passthrough(sent) or is_immutable_technical_text(sent):
+                parts.append(sent)
                 continue
-            seg_prot, seg_map = _protect_numerals(seg)
-            accepted: str | None = None
-            try:
-                raw = self._generate_translation(seg_prot)
-                restored = _restore_numerals(raw, seg_map, strict=False) if seg_map else raw
-                if seg_map:
-                    restored = self._canonicalize_literal_values(restored, seg_map.values())
-                exact = all(
-                    self._protected_value_count(restored, value) == count
-                    for value, count in Counter(seg_map.values()).items()
-                )
-                if (
-                    exact
-                    and not self._find_unresolved_placeholders(seg_prot, restored, seg_map)
-                    and self._retry_target_satisfied(restored)
-                ):
-                    valid, _ = validate_translation_completeness(
-                        seg,
-                        restored,
-                        target_lang=target_lang,
-                        extra_protected=tuple(seg_map.values()),
-                    )
-                    if valid:
-                        accepted = restored.strip()
-            except Exception as exc:  # noqa: BLE001 - recovery must never raise
-                logger.warning("Span recovery failed for one segment: %s", exc)
-            if accepted:
-                parts.append(accepted)
-                translated_count += 1
+            if len(sentences) > 1:
+                accepted = self._try_translate_span_unit(sent, target_lang)
+                if accepted is not None:
+                    parts.append(accepted)
+                    translated_count += 1
+                    continue
+
+            # Bounded retry on smaller clause units
+            clauses = self._split_clauses_with_separators(sent)
+            if len(clauses) >= 2:
+                clause_out: list[str] = []
+                for c_text, c_sep in clauses:
+                    if not c_text.strip():
+                        clause_out.append(c_text + c_sep)
+                        continue
+                    if _is_pure_passthrough(c_text) or is_immutable_technical_text(c_text):
+                        clause_out.append(c_text.strip() + c_sep)
+                        continue
+                    c_acc = self._try_translate_span_unit(c_text, target_lang)
+                    if c_acc is not None:
+                        clause_out.append(c_acc + c_sep)
+                        translated_count += 1
+                    else:
+                        lex_rec = self._recover_clause_by_lexed_spans(c_text, target_lang)
+                        if lex_rec is not None:
+                            clause_out.append(lex_rec[0] + c_sep)
+                            translated_count += lex_rec[1]
+                            kept_count += lex_rec[2]
+                        else:
+                            clause_out.append(c_text.strip() + c_sep)
+                            kept_count += 1
+                parts.append(re.sub(r"[^\S\r\n]{2,}", " ", "".join(clause_out)).strip())
+                continue
+
+            # Single clause: try lexed prose spans around protected tokens
+            lex_rec = self._recover_clause_by_lexed_spans(sent, target_lang)
+            if lex_rec is not None:
+                parts.append(lex_rec[0])
+                translated_count += lex_rec[1]
+                kept_count += lex_rec[2]
             else:
-                parts.append(seg)
+                parts.append(sent)
                 kept_count += 1
+
         if translated_count == 0:
             return None
-        return " ".join(p for p in parts if p), translated_count, kept_count
+        reassembled = " ".join(p for p in parts if p)
+        _, expected_map = _protect_numerals(source_full)
+        for val, exp_cnt in Counter(expected_map.values()).items():
+            if self._protected_value_count(reassembled, val) != exp_cnt:
+                return None
+        return reassembled, translated_count, kept_count
 
     def _retry_semantic_segments(
         self,
@@ -973,14 +1119,14 @@ class BaseTranslator(ABC):
             if self._find_unresolved_placeholders(seg_prot, seg_restored, seg_map):
                 return "", False
             if any(
-                self._protected_value_count(seg_restored, val) < cnt
+                self._protected_value_count(seg_restored, val) != cnt
                 for val, cnt in Counter(seg_map.values()).items()
             ):
                 return "", False
             translated_parts.append(seg_restored.strip())
 
         reassembled = " ".join(part for part in translated_parts if part)
-        if expected and any(self._protected_value_count(reassembled, v) < c for v, c in expected.items()):
+        if expected and any(self._protected_value_count(reassembled, v) != c for v, c in expected.items()):
             return reassembled, False
         was_inc = getattr(state, "incomplete", False)
         state.incomplete = False

@@ -3133,13 +3133,11 @@ class Typesetting:
             orig_sboxes = [c.box for c in cells if c.box is not None]
             orig_src_bottom = min((b.y for b in orig_sboxes), default=None)
             orig_src_top = max((b.y2 for b in orig_sboxes), default=None)
-            is_fixed_or_irregular = any(
-                "fixed_rtl" in (c.layout_label or "").lower()
-                or (c.pipeline_trace or {}).get("preserve_irregular_table")
-                or (c.pipeline_trace or {}).get("anchored_numeric_columns")
+            is_irregular_preserved = any(
+                (c.pipeline_trace or {}).get("preserve_irregular_table")
                 for c in cells
             )
-            if not is_fixed_or_irregular:
+            if not is_irregular_preserved and len(cells) >= 2:
                 row_groups: dict[int, list[il_version_1.PdfParagraph]] = {}
                 unindexed: list[il_version_1.PdfParagraph] = []
                 for c in cells:
@@ -3155,14 +3153,21 @@ class Typesetting:
                         if in_this:
                             row_groups[idx] = in_this
                 ordered_rows = [row_groups[k] for k in sorted(row_groups)]
-                for r_idx in range(len(ordered_rows) - 1):
+                for r_idx in range(len(ordered_rows)):
+                    cur_row = ordered_rows[r_idx]
                     upper_boxes = [
-                        b for c in ordered_rows[r_idx]
+                        b for c in cur_row
                         if (b := self._rendered_text_box(c)) is not None
                     ]
                     if not upper_boxes:
                         continue
                     upper_bottom = min(b.y for b in upper_boxes)
+                    # Synchronize all cell boxes in cur_row to cover the expanded row height
+                    for c in cur_row:
+                        if c.box is not None and upper_bottom < c.box.y:
+                            c.box.y = upper_bottom - 1.0
+                    if r_idx + 1 >= len(ordered_rows):
+                        continue
                     lower_boxes = [
                         b for c in ordered_rows[r_idx + 1]
                         if (b := self._rendered_text_box(c)) is not None
@@ -3172,11 +3177,29 @@ class Typesetting:
                     lower_top = max(b.y2 for b in lower_boxes)
                     overlap = lower_top - (upper_bottom - 3.0)
                     if overlap > 0.25:
+                        tx0_row = min((c.box.x for c in cells if c.box), default=0.0)
+                        tx2_row = max((c.box.x2 for c in cells if c.box), default=0.0)
                         for tail_row in ordered_rows[r_idx + 1:]:
                             for cell in tail_row:
                                 self._shift_rendered_paragraph_vertically(cell, overlap)
+                                if cell.box is not None:
+                                    cell.box.y -= overlap
+                                    cell.box.y2 -= overlap
                                 tr = self._ensure_pipeline_trace(cell)
                                 tr["table_row_shifted"] = True
+                        # Shift horizontal grid rules below upper_bottom downward with the rows
+                        if orig_src_bottom is not None:
+                            for shape in list(getattr(page, "pdf_curve", None) or []) + list(getattr(page, "pdf_rectangle", None) or []):
+                                sb = getattr(shape, "box", None)
+                                if (
+                                    sb is not None
+                                    and sb.x >= tx0_row - 6.0
+                                    and sb.x2 <= tx2_row + 6.0
+                                    and (orig_src_bottom - 6.0) <= sb.y <= (lower_top + 4.0)
+                                    and (sb.y2 - sb.y) <= 8.0
+                                ):
+                                    sb.y -= overlap
+                                    sb.y2 -= overlap
 
             rboxes = [b for c in cells if (b := self._rendered_text_box(c)) is not None]
             sboxes = [c.box for c in cells if c.box is not None]
@@ -4027,6 +4050,11 @@ class Typesetting:
             ):
                 continue
 
+            src_boxes_before_pagination = {
+                id(p): Box(p.box.x, p.box.y, p.box.x2, p.box.y2)
+                for p in (src_page.pdf_paragraph or [])
+                if p.box is not None
+            }
             src_page.pdf_paragraph = [
                 p for p in (src_page.pdf_paragraph or []) if id(p) in keep_paragraphs
             ]
@@ -4059,6 +4087,7 @@ class Typesetting:
                 placed_top = cursor_y2
                 placed_bottom = cursor_y2 - item_h
                 for para in group_paras:
+                    orig_pbox = src_boxes_before_pagination.get(id(para))
                     self._translate_rendered_paragraph(para, dx=dx, dy=dy)
                     self._clear_paragraph_xobj_id(para)
                     moved_rbox = self._rendered_text_box(para)
@@ -4066,6 +4095,14 @@ class Typesetting:
                         para.box = moved_rbox
                     trace = self._ensure_pipeline_trace(para)
                     trace["paginated_from_page"] = src_page.page_number
+                    if orig_pbox is not None:
+                        trace["paginated_source_box"] = [orig_pbox.x, orig_pbox.y, orig_pbox.x2, orig_pbox.y2]
+                    if rbox.y < crop.y + 4.0:
+                        trace["paginated_offpage"] = True
+                    if has_footnotes and footnote_barrier_top is not None and rbox.y < footnote_barrier_top - 0.5:
+                        trace["paginated_footnote_overlap"] = True
+                    elif has_footnotes and orig_pbox is not None and footnote_barrier_top is not None and orig_pbox.y < footnote_barrier_top - 0.5:
+                        trace["paginated_footnote_overlap"] = True
                     trace.pop("page_overflow", None)
 
                 for rect in attached_rects:
@@ -4126,6 +4163,8 @@ class Typesetting:
                     cont_count = 0
             document.page[:] = new_pages
             document.total_pages = len(document.page)
+            merged_back = self._merge_sparse_continuation_pages_back(document)
+            created_continuations = max(0, created_continuations - merged_back)
             shared = getattr(self.translation_config, "shared_context_cross_split_part", None)
             if shared is not None and hasattr(shared, "continuation_pages"):
                 shared.continuation_pages = {
@@ -4140,6 +4179,207 @@ class Typesetting:
             )
         self._record_pagination_metrics(document)
         return created_continuations
+
+    def _merge_sparse_continuation_pages_back(self, document: il_version_1.Document) -> int:
+        """Merge sparse continuation pages back onto their preceding page when collision-free."""
+        pages = list(getattr(document, "page", None) or [])
+        if len(pages) < 2:
+            return 0
+        merged_count = 0
+        idx = 1
+        while idx < len(pages):
+            cont_page = pages[idx]
+            prev_page = pages[idx - 1]
+            cont_src = getattr(cont_page, "continuation_of_page", None)
+            if cont_src is None:
+                idx += 1
+                continue
+            prev_src = getattr(prev_page, "continuation_of_page", None)
+            if cont_src != prev_page.page_number and (prev_src is None or cont_src != prev_src):
+                idx += 1
+                continue
+            # Never merge continuation pages that carry relocated drawn artwork/cards/forms
+            if (
+                (cont_page.pdf_rectangle or [])
+                or (cont_page.pdf_curve or [])
+                or (cont_page.pdf_form or [])
+            ):
+                idx += 1
+                continue
+            c_paras = [
+                p for p in (cont_page.pdf_paragraph or [])
+                if self._rendered_text_box(p) is not None
+            ]
+            if not c_paras or len(c_paras) > 1:
+                idx += 1
+                continue
+            # Verify genuine pagination ownership and never merge rigid/atomic groups, tables, or formulas
+            cannot_merge = False
+            for p in c_paras:
+                tr = p.pipeline_trace or {}
+                pag_from = tr.get("paginated_from_page")
+                if pag_from is not None and pag_from not in {prev_page.page_number, cont_src}:
+                    cannot_merge = True
+                    break
+                if (
+                    tr.get("paginated_offpage")
+                    or tr.get("paginated_footnote_overlap")
+                    or tr.get("overflow_reason") == "bottom_zone_collision"
+                    or tr.get("region_group_id")
+                    or tr.get("region_type") in {"card", "form_pair", "figure", "table"}
+                    or self._is_table_cell(p, cont_page)
+                    or self._is_fixed_table_paragraph(p)
+                    or self._is_bottom_fixed_paragraph(p, cont_page)
+                    or tr.get("region_fallback") == "unresolved_readable_overflow"
+                ):
+                    cannot_merge = True
+                    break
+                if any(getattr(comp, "pdf_formula", None) is not None for comp in (p.pdf_paragraph_composition or [])):
+                    cannot_merge = True
+                    break
+            if cannot_merge:
+                idx += 1
+                continue
+
+            c_boxes = [self._rendered_text_box(p) for p in c_paras]
+            c_boxes = [b for b in c_boxes if b is not None]
+            if not c_boxes:
+                idx += 1
+                continue
+            # Ensure c_paras belong to a single horizontal stream
+            if len(c_boxes) > 1 and not all(
+                self._box_x_overlap_significant(c_boxes[0], b) for b in c_boxes[1:]
+            ):
+                idx += 1
+                continue
+            total_h = max(b.y2 for b in c_boxes) - min(b.y for b in c_boxes)
+            total_chars = sum(len((p.unicode or "").strip()) for p in c_paras)
+            if total_h > 32.0 or total_chars > 90:
+                idx += 1
+                continue
+
+            crop = prev_page.cropbox.box if prev_page.cropbox and prev_page.cropbox.box else None
+            if crop is None:
+                idx += 1
+                continue
+            zones = self._get_page_vertical_zones(prev_page)
+            has_footnotes = zones["has_footnotes"] > 0.5
+            footnote_barrier_top = None
+            if has_footnotes:
+                fn_tops = [
+                    max(
+                        (rb.y2 if (rb := self._rendered_text_box(p)) is not None else p.box.y2),
+                        p.box.y2 if p.box is not None else 0.0,
+                    )
+                    for p in (prev_page.pdf_paragraph or [])
+                    if self._is_footnote_paragraph(p) and (p.box is not None or self._rendered_text_box(p) is not None)
+                ]
+                if fn_tops:
+                    footnote_barrier_top = max(fn_tops)
+            target_floor = max(
+                zones["body_floor"] if has_footnotes else zones["content_floor"],
+                (footnote_barrier_top + 4.0) if footnote_barrier_top is not None else zones["content_floor"],
+                crop.y + 8.0,
+            )
+            c_min_x = min(b.x for b in c_boxes)
+            c_max_x2 = max(b.x2 for b in c_boxes)
+            c_lane = Box(c_min_x, min(b.y for b in c_boxes), c_max_x2, max(b.y2 for b in c_boxes))
+
+            # If prev_page is a multi-column page, do not merge an overflowing column tail back
+            prev_movable_lanes = [
+                rb for p in (prev_page.pdf_paragraph or [])
+                if not self._is_bottom_fixed_paragraph(p, prev_page)
+                and not self._is_top_band_header(p, prev_page)
+                and (rb := self._rendered_text_box(p)) is not None
+            ]
+            if any(not self._box_x_overlap_significant(rb, c_lane) for rb in prev_movable_lanes):
+                idx += 1
+                continue
+
+            # Find lowest existing content in the same horizontal lane on prev_page
+            # Use max(rb.y, p.box.y) so an expanded layout box that had vertical padding
+            # below its rendered glyphs is not overlapped by merged continuation text.
+            lane_bottoms = [
+                min(rb.y, p.box.y if p.box is not None else rb.y)
+                for p in (prev_page.pdf_paragraph or [])
+                if not self._is_bottom_fixed_paragraph(p, prev_page)
+                and not self._is_top_band_header(p, prev_page)
+                and (rb := self._rendered_text_box(p)) is not None
+                and self._box_x_overlap_significant(rb, c_lane)
+            ]
+            available_top = (min(lane_bottoms) - 4.0) if lane_bottoms else zones["body_ceiling"]
+            candidate_bottom = available_top - total_h
+
+            # Verify no collision with any drawn rect/curve or any existing paragraph's
+            # rendered OR reserved layout box on prev_page, and never invert reading order
+            # by hoisting a bottom paragraph above a kept paragraph that originally sat above it.
+            cand_box = Box(c_min_x, candidate_bottom, c_max_x2, available_top)
+            shape_collision = False
+            for p_src in c_paras:
+                psb = (p_src.pipeline_trace or {}).get("paginated_source_box")
+                if isinstance(psb, (list, tuple)) and len(psb) == 4:
+                    orig_y2 = float(psb[3])
+                    # Never hoist a paragraph more than 25% of the page height above its source y2
+                    if available_top - orig_y2 > (crop.y2 - crop.y) * 0.25:
+                        shape_collision = True
+                        break
+            for kp in (prev_page.pdf_paragraph or []):
+                if self._is_bottom_fixed_paragraph(kp, prev_page) or self._is_top_band_header(kp, prev_page):
+                    continue
+                kb = kp.box
+                if kb is not None and (
+                    min(cand_box.x2, kb.x2) - max(cand_box.x, kb.x) > 1.0
+                    and min(cand_box.y2, kb.y2) - max(cand_box.y, kb.y) > 1.0
+                ):
+                    shape_collision = True
+                    break
+            for shape in list(prev_page.pdf_rectangle or []) + list(prev_page.pdf_curve or []):
+                sb = getattr(shape, "box", None)
+                if sb is None:
+                    continue
+                if (sb.x2 - sb.x) > (crop.x2 - crop.x) * 0.85:
+                    continue
+                if (
+                    min(cand_box.x2, sb.x2) - max(cand_box.x, sb.x) > 1.0
+                    and min(cand_box.y2, sb.y2) - max(cand_box.y, sb.y) > 1.0
+                ):
+                    shape_collision = True
+                    break
+
+            if not shape_collision and candidate_bottom >= target_floor:
+                # Place c_paras cleanly into [candidate_bottom, available_top] on prev_page
+                dy = available_top - max(b.y2 for b in c_boxes)
+                for p in c_paras:
+                    self._translate_rendered_paragraph(p, dy=dy)
+                    moved_b = self._rendered_text_box(p)
+                    if moved_b is not None:
+                        p.box = moved_b
+                    tr = self._ensure_pipeline_trace(p)
+                    tr["merged_from_sparse_continuation"] = True
+                    prev_page.pdf_paragraph.append(p)
+                removed_num = cont_page.page_number
+                pages.pop(idx)
+                for later_p in pages[idx:]:
+                    if getattr(later_p, "page_number", None) is not None and later_p.page_number > removed_num:
+                        later_p.page_number -= 1
+                    later_src = getattr(later_p, "continuation_of_page", None)
+                    if later_src is not None and later_src > removed_num:
+                        later_p.continuation_of_page = later_src - 1
+                merged_count += 1
+                continue
+            idx += 1
+
+        if merged_count:
+            document.page[:] = pages
+            document.total_pages = len(document.page)
+            shared = getattr(self.translation_config, "shared_context_cross_split_part", None)
+            if shared is not None and hasattr(shared, "continuation_pages"):
+                shared.continuation_pages = {
+                    p.page_number: p.continuation_of_page
+                    for p in document.page
+                    if p.continuation_of_page is not None
+                }
+        return merged_count
 
     def _anchor_inline_highlight_curves(self, page: il_version_1.Page) -> None:
         """Relocate inline background highlight rectangles from LTR source lines to RTL rendered lines.
@@ -5651,6 +5891,61 @@ class Typesetting:
                 ):
                     self._compact_paragraph_to_box(para, perm_box, min_ratio=min_r)
                     rbox = self._rendered_text_box(para) or rbox
+                    # If a card/figure label still overflows its inner sub-box even after
+                    # bounded readable compaction, try expanding perm_box into verified free
+                    # space inside the outer card/figure container where no sibling label
+                    # overlaps before reporting an escape.
+                    outer_rb = trace.get("outer_region_bounds")
+                    if (
+                        isinstance(outer_rb, (list, tuple))
+                        and len(outer_rb) == 4
+                        and trace.get("region_type") in {"card", "figure"}
+                        and (
+                            rbox.x < perm_box.x - 2.0
+                            or rbox.x2 > perm_box.x2 + 2.0
+                            or (strict_y and (rbox.y < perm_box.y - 2.0 or rbox.y2 > perm_box.y2 + 2.0))
+                        )
+                    ):
+                        outer_box = Box(
+                            float(outer_rb[0]) + 2.0,
+                            float(outer_rb[1]) + 2.0,
+                            float(outer_rb[2]) - 2.0,
+                            float(outer_rb[3]) - 2.0,
+                        )
+                        cand_x0 = max(outer_box.x, min(perm_box.x, rbox.x))
+                        cand_y0 = max(outer_box.y, min(perm_box.y, rbox.y))
+                        cand_x2 = min(outer_box.x2, max(perm_box.x2, rbox.x2))
+                        cand_y2 = min(outer_box.y2, max(perm_box.y2, rbox.y2))
+                        if (
+                            cand_x2 > cand_x0 + 8.0
+                            and cand_y2 > cand_y0 + 6.0
+                            and (
+                                cand_x0 < perm_box.x - 0.5
+                                or cand_x2 > perm_box.x2 + 0.5
+                                or cand_y0 < perm_box.y - 0.5
+                                or cand_y2 > perm_box.y2 + 0.5
+                            )
+                        ):
+                            cand_box = Box(cand_x0, cand_y0, cand_x2, cand_y2)
+                            sibling_collision = False
+                            for sib in paragraphs:
+                                if sib is para:
+                                    continue
+                                sbox = self._rendered_text_box(sib)
+                                if sbox is None:
+                                    continue
+                                if (
+                                    min(cand_box.x2, sbox.x2) - max(cand_box.x, sbox.x) > 1.5
+                                    and min(cand_box.y2, sbox.y2) - max(cand_box.y, sbox.y) > 1.5
+                                ):
+                                    sibling_collision = True
+                                    break
+                            if not sibling_collision:
+                                perm_box = cand_box
+                                trace["region_bounds"] = [cand_box.x, cand_box.y, cand_box.x2, cand_box.y2]
+                                trace["expanded_into_container_free_space"] = True
+                                self._compact_paragraph_to_box(para, perm_box, min_ratio=min_r)
+                                rbox = self._rendered_text_box(para) or rbox
                 escaped_x = rbox.x < perm_box.x - 2.5 or rbox.x2 > perm_box.x2 + 2.5
                 escaped_y = strict_y and (rbox.y < perm_box.y - 2.5 or rbox.y2 > perm_box.y2 + 2.5)
                 is_table_or_form = (
@@ -6388,6 +6683,8 @@ class Typesetting:
             current_line_w = 0.0
 
             for token_idx, token in enumerate(tokens):
+                if not token:
+                    continue
                 line_idx_current = len(lines_tokens)
                 if is_bullet_para and line_idx_current > 0:
                     avail = effective_line_width - bullet_indent
@@ -6408,20 +6705,82 @@ class Typesetting:
                     current_line_w = 0.0
                     continue
                 # Dynamic Table of Contents leader dot adjustment:
-                # If this token is a run of leader dots (4+ dots) followed by a page number,
-                # dynamically resize the dot count so title + dots + page_number fills avail on a single line!
-                if all(u.unicode == '.' for u in token) and len(token) >= 4:
-                    rem = tokens[token_idx + 1:]
-                    non_space = [t for t in rem if not t[0].is_space]
-                    if non_space and all(u.unicode.isdigit() for u in non_space[-1]):
-                        pnum_w = sum(u.width * scale for u in non_space[-1])
-                        dot_unit = token[0]
-                        dot_w = dot_unit.width * scale
-                        avail_dots = avail - current_line_w - pnum_w - (space_width * 3)
-                        if avail_dots > (dot_w * 4):
-                            needed = int(avail_dots / dot_w)
-                            token[:] = [copy.copy(dot_unit) for _ in range(needed)]
+                # Recognize both contiguous ("........") and spaced (". . . .") leader runs
+                # followed by a page number (numeric, Roman, or alphanumeric like "A-1").
+                # Dynamically resize or shorten the dot leader so title + leader + page_number
+                # stays in its horizontal lane and never wraps or pushes the page number off-page!
+                if token and all((u.try_get_unicode() or "") in {'.', '·', '…'} for u in token):
+                    # Check if this is part of a spaced leader run (e.g. "." " " "." " " ".")
+                    spaced_end_idx = token_idx
+                    dot_tokens_count = 1 if len(token) == 1 else len(token)
+                    is_spaced_leader = False
+                    if len(token) == 1:
+                        probe = token_idx + 1
+                        while probe + 1 < len(tokens):
+                            t_sp = tokens[probe]
+                            t_dt = tokens[probe + 1]
+                            if (
+                                len(t_sp) == 1
+                                and t_sp[0].is_space
+                                and len(t_dt) == 1
+                                and (t_dt[0].try_get_unicode() or "") in {'.', '·', '…'}
+                            ):
+                                dot_tokens_count += 1
+                                spaced_end_idx = probe + 1
+                                probe += 2
+                            else:
+                                break
+                        if dot_tokens_count >= 3:
+                            is_spaced_leader = True
+                            # Collapse subsequent spaced dot tokens into this token; mark consumed tokens as empty spaces
+                            space_sample = tokens[token_idx + 1][0]
+                            for clear_i in range(token_idx + 1, spaced_end_idx + 1):
+                                tokens[clear_i] = []
+                    if len(token) >= 3 or is_spaced_leader:
+                        rem = [t for t in tokens[spaced_end_idx + 1:] if t]
+                        non_space = [t for t in rem if not t[0].is_space]
+                        last_tok_str = "".join(u.try_get_unicode() or "" for u in non_space[-1]) if non_space else ""
+                        is_toc_pnum = bool(
+                            non_space
+                            and len(non_space) == 1
+                            and re.fullmatch(r"(?:[A-Z]-?\d+|\d+|[ivxlcdmIVXLCDM]{1,6})", last_tok_str)
+                        )
+                        if is_toc_pnum:
+                            if not hasattr(paragraph, "pipeline_trace") or paragraph.pipeline_trace is None:
+                                paragraph.pipeline_trace = {}
+                            paragraph.pipeline_trace["is_toc_row"] = True
+                            paragraph.pipeline_trace["toc_page_number"] = last_tok_str
+                            pnum_w = sum(u.width * scale for u in non_space[-1])
+                            reserved_pnum_lane = max(pnum_w + (space_width * 3.0), 22.0)
+                            dot_unit = token[0]
+                            dot_w = max(0.5, dot_unit.width * scale)
+                            # If the title alone + minimum leader + page number exceeds avail,
+                            # wrap the title BEFORE the leader so the final title line + leader + page_num
+                            # sit cleanly on the next line with the page number in its dedicated lane.
+                            min_leader_w = dot_w * 4
+                            if current_line_tokens and (current_line_w + min_leader_w + reserved_pnum_lane > avail):
+                                while current_line_tokens and current_line_tokens[-1].is_space:
+                                    current_line_tokens.pop()
+                                if current_line_tokens:
+                                    lines_tokens.append(current_line_tokens)
+                                current_line_tokens = []
+                                current_line_w = 0.0
+                            avail_dots = avail - current_line_w - reserved_pnum_lane
+                            if is_spaced_leader:
+                                step_w = max(1.0, dot_w + space_width)
+                                needed = max(3, int(avail_dots / step_w)) if avail_dots > step_w * 3 else 3
+                                new_leader: list[TypesettingUnit] = []
+                                for d_i in range(needed):
+                                    new_leader.append(copy.copy(dot_unit))
+                                    if d_i + 1 < needed:
+                                        new_leader.append(copy.copy(space_sample))
+                                token[:] = new_leader
+                            else:
+                                needed = max(4, int(avail_dots / dot_w)) if avail_dots > dot_w * 4 else 4
+                                token[:] = [copy.copy(dot_unit) for _ in range(needed)]
 
+                if not token:
+                    continue
                 token_w = sum(u.width * scale for u in token)
 
                 # Skip leading space on a line

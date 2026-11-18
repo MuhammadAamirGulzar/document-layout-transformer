@@ -1035,14 +1035,14 @@ class ILTranslator:
         # Check if text contains Table of Contents (TOC) entries with dotted leader lines
         # e.g. "1. Introduction ................................................................................................. 1306"
         # or spaced leaders: "1. Introduction . . . . . . . . 1306"
-        toc_leader_pattern = re.compile(r'^(.*?)\s*((?:\.\s*){3,}\.)\s*(\d+)\s*$')
+        from babeldoc.format.pdf.document_il.utils.layout_semantics import parse_toc_row
 
         # If text has multiple non-empty lines
         lines = text.split("\n")
         non_empty = [l for l in lines if l.strip()]
 
         # Only preserve lines for short labels/legends/table cells or TOC entries
-        is_toc_block = any(toc_leader_pattern.match(l.strip()) for l in non_empty)
+        is_toc_block = any(parse_toc_row(l) is not None for l in non_empty)
         is_short_labels = (
             force_preserve_lines
             or (len(non_empty) > 1 and max(len(l.split()) for l in non_empty) <= 6)
@@ -1053,12 +1053,11 @@ class ILTranslator:
             translated_lines = []
             for line in lines:
                 stripped_line = line.strip()
-                toc_match = toc_leader_pattern.match(stripped_line) if stripped_line else None
-                if toc_match:
-                    title, dots, page_num = toc_match.group(1).strip(), toc_match.group(2), toc_match.group(3)
-                    compact_dots = "." * dots.count(".") if " " in dots else dots
-                    tr_title = translate_segment(title) if title else ""
-                    translated_lines.append(f"{tr_title} {compact_dots} {page_num}")
+                toc_row = parse_toc_row(line) if stripped_line else None
+                if toc_row is not None:
+                    tr_title = translate_segment(toc_row.title) if toc_row.title else ""
+                    compact_dots = "." * toc_row.raw_leader_count
+                    translated_lines.append(f"{tr_title} {compact_dots} {toc_row.page_number}")
                 elif stripped_line:
                     tr = translate_segment(line)
                     translated_lines.append(tr)
@@ -1068,12 +1067,11 @@ class ILTranslator:
         else:
             # Check if single-line paragraph is a TOC entry
             if len(non_empty) == 1:
-                toc_match = toc_leader_pattern.match(non_empty[0])
-                if toc_match:
-                    title, dots, page_num = toc_match.group(1).strip(), toc_match.group(2), toc_match.group(3)
-                    compact_dots = "." * dots.count(".") if " " in dots else dots
-                    tr_title = translate_segment(title) if title else ""
-                    return f"{tr_title} {compact_dots} {page_num}"
+                toc_row = parse_toc_row(non_empty[0])
+                if toc_row is not None:
+                    tr_title = translate_segment(toc_row.title) if toc_row.title else ""
+                    compact_dots = "." * toc_row.raw_leader_count
+                    return f"{tr_title} {compact_dots} {toc_row.page_number}"
 
             # For flowing body text paragraphs, join soft linebreaks with a space so
             # the translation model receives complete, grammatically coherent sentences

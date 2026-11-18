@@ -473,3 +473,54 @@ def is_immutable_technical_text(text: str | None) -> bool:
         if not word.isupper() or len(word) > 3:
             return False
     return True
+
+
+_STRUCTURAL_SEP_EDGE_RE = re.compile(
+    r"^(\s*[,.;:!?()\[\]\u2013\u2014\-/]*\s*)(.*?)(\s*[,.;:!?()\[\]\u2013\u2014\-/]*\s*)$",
+    re.DOTALL,
+)
+
+
+def lex_translatable_and_protected_spans(text: str) -> list[tuple[str, str]]:
+    """Lex *text* into ordered ``(kind, value)`` tokens where ``kind`` is
+    ``'prose'``, ``'protected'``, or ``'separator'``.
+
+    Concatenating ``value`` across all returned tuples reproduces *text* verbatim.
+    """
+    if not text:
+        return []
+    protected, mapping = protect_structured_tokens(text)
+    if not mapping:
+        return [("prose", text)]
+
+    tag_re = re.compile(r"(\{\d+\})")
+    raw_parts = tag_re.split(protected)
+    tokens: list[tuple[str, str]] = []
+    for part in raw_parts:
+        if not part:
+            continue
+        if part in mapping:
+            tokens.append(("protected", mapping[part]))
+            continue
+        m = _STRUCTURAL_SEP_EDGE_RE.match(part)
+        if m:
+            lead_sep, core, trail_sep = m.group(1), m.group(2), m.group(3)
+            if lead_sep:
+                tokens.append(("separator", lead_sep))
+            if core:
+                # Further split internal semicolon / colon / dash separators
+                sub_parts = re.split(r"(\s*[;:\u2013\u2014]\s*)", core)
+                for sp in sub_parts:
+                    if not sp:
+                        continue
+                    if re.fullmatch(r"\s*[;:\u2013\u2014]\s*", sp):
+                        tokens.append(("separator", sp))
+                    elif is_immutable_technical_text(sp):
+                        tokens.append(("separator", sp))
+                    else:
+                        tokens.append(("prose", sp))
+            if trail_sep:
+                tokens.append(("separator", trail_sep))
+        else:
+            tokens.append(("prose", part))
+    return tokens

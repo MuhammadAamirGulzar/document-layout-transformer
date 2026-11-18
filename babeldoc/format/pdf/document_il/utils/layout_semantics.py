@@ -1,6 +1,7 @@
 """P0-3: Reading order, cross-region merge guards, code/algorithm preservation, and figure token semantics."""
 from __future__ import annotations
 
+from dataclasses import dataclass
 import re
 from typing import Any
 
@@ -784,6 +785,7 @@ def assign_page_region_groups(page: il_version_1.Page) -> dict[str, dict[str, An
                 ]
             else:
                 trace["region_bounds"] = [tight.x, tight.y, tight.x2, tight.y2]
+            trace["outer_region_bounds"] = [fbox.x, fbox.y, fbox.x2, fbox.y2]
             groups.setdefault(gid, {"region_type": "figure", "members": [], "bounds": [fbox.x, fbox.y, fbox.x2, fbox.y2]})["members"].append(p)
             continue
 
@@ -801,6 +803,7 @@ def assign_page_region_groups(page: il_version_1.Page) -> dict[str, dict[str, An
             trace["region_group_id"] = gid
             trace["region_type"] = "card"
             trace["region_bounds"] = [tight_box.x, tight_box.y, tight_box.x2, tight_box.y2]
+            trace["outer_region_bounds"] = [outer_box.x, outer_box.y, outer_box.x2, outer_box.y2]
             groups.setdefault(gid, {"region_type": "card", "members": [], "bounds": [outer_box.x, outer_box.y, outer_box.x2, outer_box.y2]})["members"].append(p)
 
     # 4. Pair horizontally adjacent checkbox/radio/label+value fields
@@ -976,3 +979,55 @@ def assign_page_region_groups(page: il_version_1.Page) -> dict[str, dict[str, An
                     p.pipeline_trace["column_lane"] = [float(lx0), float(lx1)]
 
     return groups
+
+
+@dataclass
+class SemanticTocRow:
+    """Semantic representation of a Table-of-Contents row."""
+
+    title: str
+    indent_level: int
+    leader_style: str  # "." or ". "
+    page_number: str
+    raw_leader_count: int = 12
+
+
+_TOC_ROW_RE = re.compile(
+    r"^(?P<lead_ws>\s*)(?P<title>.+?)\s*(?P<leader>(?:(?:\.|·|…)\s*){3,}(?:\.|·|…))\s*(?P<page>(?:[A-Z]-?\d+|\d+|[ivxlcdmIVXLCDM]{1,6}))\s*$"
+)
+
+
+def parse_toc_row(line: str, indent_px: float = 0.0) -> SemanticTocRow | None:
+    """Parse a TOC entry line with contiguous or spaced leader dots and a trailing page number."""
+    if not line:
+        return None
+    m = _TOC_ROW_RE.match(line)
+    if not m:
+        return None
+    title = (m.group("title") or "").strip()
+    leader = m.group("leader") or ""
+    page_num = (m.group("page") or "").strip()
+    if not title or not page_num:
+        return None
+    # Reject rows where the "title" is purely punctuation or another dot run
+    if not re.search(r"[\w\u0600-\u06FF]", title):
+        return None
+    dot_count = sum(1 for c in leader if c in ".·…")
+    if dot_count < 3:
+        return None
+    spaced = " " in leader.strip()
+    leader_style = ". " if spaced else "."
+    lead_spaces = len(m.group("lead_ws") or "")
+    # Estimate section nesting depth from leading section numbers (e.g. "1.2.3") or indentation
+    sec_m = re.match(r"^(?:\u2066|\u200e)?(\d+(?:\.\d+)+)\b", title)
+    if sec_m:
+        depth = min(4, sec_m.group(1).count("."))
+    else:
+        depth = min(4, int(round(max(indent_px, lead_spaces * 4.0) / 14.0)))
+    return SemanticTocRow(
+        title=title,
+        indent_level=max(0, depth),
+        leader_style=leader_style,
+        page_number=page_num,
+        raw_leader_count=dot_count,
+    )

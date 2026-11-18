@@ -25,14 +25,60 @@ _LEAKED_PLACEHOLDER_PATTERNS = (
 )
 
 
+_REGEX_ATOM_BEFORE_QUANTIFIER_RE = re.compile(
+    r"(?:"
+    r"\[[^\]]+\]"
+    r"|\\[dDwWsSbB.\\+*?^$()\[\]{}|]"
+    r"|\\x[0-9a-fA-F]{2}"
+    r"|\\u[0-9a-fA-F]{4}"
+    r")$"
+)
+_REGEX_GROUP_OR_TOKEN_BEFORE_QUANTIFIER_RE = re.compile(
+    r"(?:\([^()\n]{1,40}\)|[A-Za-z0-9_.])\$?$"
+)
+_REGEX_CONTEXT_CUE_RE = re.compile(
+    r"(?:\\[dDwWsSbB]|\[\^?[A-Za-z0-9_\-\\]+\]|\^\s*(?:\[|\\|\()|\$\s*$)"
+)
+
+
+def is_regex_quantifier_match(
+    text: str,
+    match: re.Match[str],
+    *,
+    is_code_region: bool = False,
+) -> bool:
+    """Return True when a ``{n}`` match is a regex repetition quantifier such as ``\\d{4}`` or ``[A-Z]{2}``."""
+    token = match.group(0)
+    if not re.fullmatch(r"\{\d+\}", token):
+        return False
+    start, end = match.start(), match.end()
+    prefix = text[max(0, start - 64) : start]
+    # In RTL-rendered text, BiDi can place the quantifier visually to the left of its atom.
+    suffix = text[end : min(len(text), end + 64)]
+    if _REGEX_ATOM_BEFORE_QUANTIFIER_RE.search(prefix):
+        return True
+    if re.match(r"^(?:\[[^\]]+\]|\\[dDwWsSbB])", suffix):
+        return True
+    window = prefix + token + suffix
+    if (
+        (is_code_region or bool(_REGEX_CONTEXT_CUE_RE.search(window)))
+        and _REGEX_GROUP_OR_TOKEN_BEFORE_QUANTIFIER_RE.search(prefix)
+    ):
+        return True
+    return False
+
+
 def detect_leaked_placeholders(
     rendered_texts: list[str] | str,
     source_text: str = "",
+    *,
+    is_code_region: bool = False,
 ) -> list[str]:
     """Return sorted unique internal placeholder tokens left in rendered output.
 
-    Tokens that already appeared verbatim in *source_text* are ignored so
-    literal code or text like ``{0}`` is not misclassified as a leak.
+    Tokens that already appeared verbatim in *source_text* or that form a
+    recognized regular-expression quantifier (such as ``\\d{4}`` or ``[A-Z]{2}``)
+    are ignored so literal code or regex patterns are not misclassified as leaks.
     """
     if isinstance(rendered_texts, str):
         texts = [rendered_texts]
@@ -44,8 +90,11 @@ def detect_leaked_placeholders(
         for pattern in _LEAKED_PLACEHOLDER_PATTERNS:
             for match in pattern.finditer(text):
                 token = match.group(0)
-                if token not in source:
-                    leaked.add(token)
+                if token in source:
+                    continue
+                if is_regex_quantifier_match(text, match, is_code_region=is_code_region):
+                    continue
+                leaked.add(token)
     return sorted(leaked)
 
 
