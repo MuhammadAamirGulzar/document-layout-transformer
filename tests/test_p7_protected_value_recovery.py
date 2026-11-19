@@ -215,11 +215,11 @@ def test_international_formats_nested_parentheses_and_magnitude_exact_counts(mon
         "stored at 20 °C, adjustment −€45.00 (€45.00)."
     )
     prot, mapping = protect_structured_tokens(src)
-    assert "$1.2M" in prot or "1.2M" in mapping.values()
-    assert "1.234,56" in mapping.values()
-    assert "1,25,000" in mapping.values()
+    assert "$1.2M" in mapping.values()
+    assert "€1.234,56" in mapping.values()
+    assert "PKR 1,25,000" in mapping.values()
     assert "(€45.00)" in mapping.values()
-    assert "45.00" in mapping.values()
+    assert "−€45.00" in mapping.values()
 
     expected = Counter(mapping.values())
     good_ar = (
@@ -233,7 +233,7 @@ def test_international_formats_nested_parentheses_and_magnitude_exact_counts(mon
         "تشمل المبالغ USD 1,234.56 و €1.234,56 و PKR 1,25,000 و $1.2M، "
         "ومحفوظة عند 20 °C، مع تعديل (€45.00)."
     )
-    assert "45.00" in BaseTranslator._mismatched_protected_values(dropped_standalone, expected)
+    assert "−€45.00" in BaseTranslator._mismatched_protected_values(dropped_standalone, expected)
 
     # Genuine duplication of (€45.00) must also fail.
     duplicated_nested = good_ar + " (€45.00)"
@@ -332,3 +332,90 @@ def test_translate_batch_recovery_and_source_span_report_telemetry(monkeypatch):
     assert report["summary"]["validation_retry_partial_count"] == 1
 
 
+def test_single_sentence_multi_clause_exhausted_recovery_never_appends_unanchored_numbers(
+    monkeypatch,
+):
+    """A single sentence with multiple clauses whose numbers are dropped on all retry
+    attempts must NEVER append detached values like 'العيادات (300، 45).'; it retains
+    the source text so each value stays anchored to its own entity, flags incomplete,
+    and skips cache."""
+    src = (
+        "District teams repaired water pipes serving 300 schools "
+        "while inspectors audited 45 clinics."
+    )
+    dropped_ar = "أصلحت فرق المقاطعة أنابيب المياه التي تخدم المدارس بينما قام المفتشون بتدقيق العيادات."
+
+    # Every retry attempt (whole sentence, clause placeholder, clause literal) drops numbers.
+    def retry_fn(_seg: str) -> str:
+        return dropped_ar
+
+    engine, cache = _nllb_with_cache(monkeypatch, dropped_ar, retry_fn)
+
+    out = engine.translate(src)
+
+    assert out == src
+    assert "(300" not in out
+    assert "(\u200e300" not in out
+    assert "العيادات (" not in out
+    assert "300 schools" in out
+    assert "45 clinics" in out
+    assert engine.incomplete_count == 1
+    assert engine.source_spans_retained_count >= 1
+    assert engine._get_call_state().retry_outcome == "failed"
+    cache.set.assert_not_called()
+
+
+def test_single_sentence_multi_clause_partial_and_full_clause_recovery_preserve_entity_binding(
+    monkeypatch,
+):
+    """Through translate(), single-sentence multi-clause prose splits on subordinating
+    conjunctions ('while'):
+    - Partial recovery preserves validated Arabic for the first clause and retains ONLY
+      the failing source clause verbatim (never appending detached '(45)').
+    - Full recovery caches clean Arabic when both clauses validate with anchored values."""
+    src = (
+        "District teams repaired water pipes serving 300 schools "
+        "while inspectors audited 45 clinics."
+    )
+    dropped_ar = "أصلحت فرق المقاطعة أنابيب المياه التي تخدم المدارس بينما قام المفتشون بتدقيق العيادات."
+
+    # 1) Partial recovery: first clause keeps 300 with schools; second clause still drops 45.
+    def partial_retry(seg: str) -> str:
+        if "schools" in seg and "clinics" in seg:
+            return dropped_ar
+        if "300 schools" in seg:
+            return "أصلحت فرق المقاطعة أنابيب المياه التي تخدم 300 مدرسة"
+        return "بينما قام المفتشون بتدقيق العيادات."
+
+    engine_p, cache_p = _nllb_with_cache(monkeypatch, dropped_ar, partial_retry)
+    out_p = engine_p.translate(src)
+
+    assert "تخدم 300 مدرسة" in out_p
+    assert "while inspectors audited 45 clinics." in out_p
+    assert "(\u200e45" not in out_p and "(45" not in out_p
+    assert engine_p.incomplete_count == 1
+    assert engine_p.source_spans_retained_count == 1
+    state_p = engine_p._get_call_state()
+    assert state_p.retry_outcome == "partial"
+    assert state_p.validation_reason == "partial_span_recovery"
+    cache_p.set.assert_not_called()
+
+    # 2) Full recovery: both clauses validate independently with anchored values.
+    def full_retry(seg: str) -> str:
+        if "schools" in seg and "clinics" in seg:
+            return dropped_ar
+        if "300 schools" in seg:
+            return "أصلحت فرق المقاطعة أنابيب المياه التي تخدم 300 مدرسة"
+        if "45 clinics" in seg:
+            return "بينما قام المفتشون بتدقيق 45 عيادة."
+        return dropped_ar
+
+    engine_f, cache_f = _nllb_with_cache(monkeypatch, dropped_ar, full_retry)
+    out_f = engine_f.translate(src)
+
+    assert "تخدم 300 مدرسة" in out_f
+    assert "بتدقيق 45 عيادة." in out_f
+    assert "while inspectors" not in out_f
+    assert engine_f.incomplete_count == 0
+    assert engine_f.source_spans_retained_count == 0
+    cache_f.set.assert_called_once_with(src, out_f)

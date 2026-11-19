@@ -626,96 +626,33 @@ class BaseTranslator(ABC):
                 unresolved.append(match.group(0))
         return unresolved
 
-    def _retain_missing_protected_values(self, translated, source, mapping, expected):
-        """Keep exact non-sensitive values visible when model attempts drop them."""
-        retained = []
-        effective = self._effective_protected_counts(translated, expected)
-        for value, expected_count in expected.items():
-            missing_count = expected_count - effective.get(value, 0)
-            if missing_count <= 0:
-                continue
-            compact_value = re.sub(r"\s+", "", value)
-            if _is_valid_bic(value) or _IBAN_PATTERN.fullmatch(compact_value):
-                continue
-
-            tags = [tag for tag, mapped in mapping.items() if mapped == value]
-            source_value = value
-            for tag in tags:
-                currency_match = re.search(
-                    rf"([€£¥$])\s*{re.escape(tag)}", source
-                )
-                if currency_match:
-                    source_value = f"{currency_match.group(1)} {value}"
-                    break
-            retained.extend([source_value] * missing_count)
-
-        if not retained:
-            return translated
-
-        literal_text = "، ".join(f"\u200e{value}\u200e" for value in retained)
-        stripped = translated.rstrip()
-        punctuation = re.search(r"([.!?؟،؛:]+)$", stripped)
-        if punctuation:
-            body = stripped[:punctuation.start()].rstrip()
-            return f"{body} ({literal_text}){punctuation.group(1)}"
-        return f"{stripped} ({literal_text})"
-
     def _protected_integrity_fallback(self, translated, protected_source, mapping, expected):
-        """Produce an incomplete result without losing or duplicating protected data."""
+        """Return *translated* only when all protected values stay intact and anchored; else source.
+
+        Never append dropped protected values in a detached parenthetical list
+        (e.g. ``(300، 45)`` at the end of a sentence), because doing so severs
+        which value belongs to which entity or clause.  When recovery cannot
+        prove exact source-span association, preserve ``source_full`` verbatim.
+        """
         source_full = (
             _restore_numerals(protected_source, mapping, strict=False)
             if mapping
             else protected_source
         )
-        critical = {
-            value
-            for value in expected
-            if _is_valid_bic(value)
-            or _IBAN_PATTERN.fullmatch(re.sub(r"\s+", "", value))
-        }
-        if any(
-            self._protected_value_count(translated, value) != expected[value]
-            for value in critical
-        ):
+        if not translated or not str(translated).strip():
             return source_full
-
-        # Re-attaching a dropped value is only safe when the block is a single
-        # sentence: the value then sits next to the clause it belongs to.  In a
-        # multi-sentence block it would land at the end of an unrelated
-        # sentence and silently describe the wrong thing, so keep the source.
-        effective = self._effective_protected_counts(translated, expected)
-        if any(
-            effective.get(value, 0) < expected[value]
-            for value in expected
-        ):
-            web_spans = [(s, e) for s, e, _ in iter_web_references(source_full)]
-            cites = [m.span() for m in AUTHOR_YEAR_CITATION.finditer(source_full)] + web_spans
-            sentence_count = len(
-                [s for s in split_sentences(source_full, citation_spans=cites) if s and s.strip()]
-            )
-            if sentence_count > 1:
-                return source_full
-
-        retained = self._retain_missing_protected_values(
-            translated,
-            protected_source,
-            mapping,
-            expected,
-        )
-        exact = not self._mismatched_protected_values(retained, expected)
-        unresolved = self._find_unresolved_placeholders(
-            protected_source,
-            retained,
-            mapping,
-        )
+        if expected and self._mismatched_protected_values(translated, expected):
+            return source_full
+        if self._find_unresolved_placeholders(protected_source, translated, mapping):
+            return source_full
         target_lang = str(getattr(self, "tgt_nllb", "") or getattr(self, "lang_out", ""))
         semantically_valid, _ = validate_translation_completeness(
             source_full,
-            retained,
+            translated,
             target_lang=target_lang,
             extra_protected=tuple(expected.keys()),
         )
-        return retained if exact and not unresolved and semantically_valid else source_full
+        return translated if semantically_valid else source_full
 
     def translate_batch(
         self,
@@ -942,6 +879,7 @@ class BaseTranslator(ABC):
         r"[;:\u2014\u2013]\s+"
         r"|,\s+(?=(?:however|while|whereas|and|or|but|which|where|including|such\s+as|after|before|although|because|if|when|"
         r"economic|financial|growth|inflation|output|support|processed|ended|began|an?\b|the\b)\b)"
+        r"|(?<!\ba)\s+(?=(?:while|whereas|although|because)\s+[A-Za-z])"
         r")",
         re.IGNORECASE,
     )
@@ -1101,10 +1039,10 @@ class BaseTranslator(ABC):
         translated_count = 0
         kept_count = 0
         if len(sentences) == 1:
-            # For a single short sentence (<= 60 chars), only use sub-sentence span
-            # recovery when the sentence itself has dense protected tokens (>= 3) or
-            # when _protected_integrity_fallback could not already preserve translated
-            # Arabic prose in the first output.
+            # For a single short sentence (<= 60 chars), only attempt sub-sentence
+            # span recovery when it carries dense protected tokens (>= 3); shorter
+            # atomic phrases fall back cleanly to the verbatim source span instead
+            # of issuing unbounded extra model calls.
             if len(source_full) <= 60:
                 lexed_sent = lex_translatable_and_protected_spans(source_full)
                 if sum(1 for k, _ in lexed_sent if k == "protected") < 3:

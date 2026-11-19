@@ -208,6 +208,7 @@ def audit_output_pdf(
     *,
     source_pdf_path: str | Path | None = None,
     il_document: Any | None = None,
+    source_page_ranges: list[tuple[int, int]] | None = None,
 ) -> dict[str, Any]:
     """Run post-write QA verification on the actual saved output PDF."""
     if not output_pdf_path:
@@ -224,7 +225,13 @@ def audit_output_pdf(
         if source_pdf_path and Path(source_pdf_path).exists():
             try:
                 with pymupdf.open(Path(source_pdf_path)) as sdoc:
-                    source_full_text = "\n".join((p.get_text("text") or "") for p in sdoc)
+                    source_full_text = "\n".join(
+                        p.get_text("text") or "" for i, p in enumerate(sdoc)
+                        if source_page_ranges is None or any(
+                            start <= i + 1 and (end == -1 or i + 1 <= end)
+                            for start, end in source_page_ranges
+                        )
+                    )
             except Exception:
                 source_full_text = ""
         if il_document is not None:
@@ -410,7 +417,13 @@ def audit_output_pdf(
         missing_immutable_tokens: list[dict[str, Any]] = []
         if source_pdf_path and Path(source_pdf_path).exists():
             src_doc = pymupdf.open(source_pdf_path)
-            src_text = "\n".join((p.get_text("text") or "") for p in src_doc)
+            src_text = "\n".join(
+                p.get_text("text") or "" for i, p in enumerate(src_doc)
+                if source_page_ranges is None or any(
+                    start <= i + 1 and (end == -1 or i + 1 <= end)
+                    for start, end in source_page_ranges
+                )
+            )
             out_text = "\n".join(out_full_text_parts)
             src_counts = _extract_immutable_audit_tokens(src_text)
             out_counts = _extract_immutable_audit_tokens(out_text)

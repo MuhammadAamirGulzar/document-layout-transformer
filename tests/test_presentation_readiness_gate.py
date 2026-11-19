@@ -107,7 +107,7 @@ def test_gate_preserves_mixed_immutable_content_without_overprotecting_prose():
         "report-v2.json",
         "/srv/reports/report-v2.json",
         "ops@example.org",
-        "12,450.00",
+        "12,450.00 USD",
         "p < 0.001",
         "95%",
         "98-34=64",

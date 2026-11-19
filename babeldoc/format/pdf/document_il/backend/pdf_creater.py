@@ -1087,7 +1087,7 @@ class PDFCreater:
                 original_pdf.page_count, translated_pdf.page_count,
             )
             docs = getattr(self, "docs", None)
-            if selected_pages is not None and docs is not None and any(
+            if selected_pages is not None and docs is not None and len(docs.page) != translated_pdf.page_count and any(
                 getattr(p, "continuation_of_page", None) is not None
                 for p in (docs.page or [])
             ):
@@ -1114,6 +1114,8 @@ class PDFCreater:
                         orig_idx = orig_cursor if orig_cursor < original_pdf.page_count else None
                         aligned_pairs.append((orig_idx, trans_idx))
                         orig_cursor += 1
+                if len(aligned_pairs) != translated_pdf.page_count:
+                    raise ValueError("Selected dual-page mapping does not cover every translated page")
             if translation_config.use_alternating_pages_dual:
                 return self.create_alternating_pages_dual_pdf(
                     original_pdf, translated_pdf, translation_config,

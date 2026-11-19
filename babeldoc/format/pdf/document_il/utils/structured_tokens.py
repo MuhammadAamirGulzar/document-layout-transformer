@@ -71,6 +71,16 @@ _MEASUREMENT_UNITS = (
     r"mg/L|µg/L|ug/L|mmol/L|µg/mL|kg/ha|km/h|kWh|MWh|GWh|ppm|ppb|mmHg|"
     r"mL|mg|kg|km|cm|mm|Hz|kHz|MHz|GHz|°C|°F"
 )
+# A quantity's symbol/unit belongs to the same protected span as its value.
+# Leaving either side outside a placeholder lets a model attach it to another number.
+_QUANTITY_NUMBER = r"(?:\d{1,3}(?:\.\d{3})+,\d+|\d{1,2}(?:,\d{2})+,\d{3}(?:\.\d+)?|\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?:[KMBT]|[ \t]*(?:bn|mn))?"
+_CURRENCY = r"(?:US\$|[$€£¥₹]|USD|EUR|GBP|SAR|AED|QAR|PKR|JPY|CHF|CAD|AUD)"
+QUANTITY_PATTERN = (
+    rf"(?<![\w.])[+\-−]?(?:{_CURRENCY}[ \t]*[+\-−]?[ \t]*{_QUANTITY_NUMBER}"
+    rf"|{_QUANTITY_NUMBER}[ \t]*{_CURRENCY}"
+    rf"|\d+(?:\.\d+)?[ \t]+(?:bn|mn)"
+    rf"|{_QUANTITY_NUMBER}[ \t]+(?:bps|BPS|basis[ \t]+points?|(?:نقطة|نقاط)[ \t]+أساس))(?!\w|\.\d)"
+)
 PERCENT_VALUE_RE = re.compile(
     r"^([+\-\u2212]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?:[eE][+\-]?\d+)?)\s*([%\u066A])$"
 )
@@ -141,6 +151,8 @@ STRUCTURED_TOKEN_PATTERN = re.compile(
     r'(\b\d+(?:st|nd|rd|th)\b)|'
     r'(\b\d+[-\u2013\u2014]\d+\b)|'
     r'(\b\d+(?:\.\d+){2,3}\b)|'
+    # Amounts and basis points before standalone codes/numbers.
+    rf'({QUANTITY_PATTERN})|'
     # Financial/statistical acronyms
     r'(\b(?:QCB(?:RR|LR|DR)?|AOIR|QMR|NDS\d*|CPI|PPI|GDP|GNP|IMF|OPEC|FISIM|BBAN|IBAN|BIC|SWIFT|STP|TERMS|QATCH|Y-o-Y|Q-o-Q|MoM|RHS|LHS|USD|EUR|GBP|SAR|AED|QR|BPS|bps)\b)|'
     # International phone numbers (spaces or hyphens)
@@ -171,6 +183,7 @@ PASSTHROUGH_ATOM_RE = re.compile(
 
 _BIDI_ISOLATE_TOKEN_RE = re.compile(
     r"(?:"
+    rf"{QUANTITY_PATTERN}|"
     r"(?:https?://|www\.)[^\s<>\"\u201d\u2019\u200e\u200f]*[^\s<>\"\u201d\u2019.,;:!?)\]\u200e\u200f]"
     r"|(?<![A-Za-z0-9.])10\.\d{4,9}/[^\s<>\"\u201d\u2019\u200e\u200f]*[^\s<>\"\u201d\u2019.,;:!?)\]\u200e\u200f]"
     r"|[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"
@@ -503,7 +516,15 @@ def isolate_ltr_structured_spans(text: str) -> str:
     """Wrap LTR technical tokens in LRM marks inside Arabic prose without duplicating marks."""
     if not text or not re.search(r"[\u0600-\u06FF]", text):
         return text
-    wrapped = _BIDI_ISOLATE_TOKEN_RE.sub(lambda m: f"\u200e{m.group(0)}\u200e", text)
+    def wrap(match: re.Match[str]) -> str:
+        token = match.group(0)
+        # Arabic unit labels keep their native direction. Currency and Latin
+        # unit spans are isolated together, including their signs and symbols.
+        if re.search(r"[\u0621-\u064A]", token):
+            return token
+        return f"\u200e{token}\u200e"
+
+    wrapped = _BIDI_ISOLATE_TOKEN_RE.sub(wrap, text)
     wrapped = re.sub(r"\u200e{2,}", "\u200e", wrapped)
     return wrapped
 

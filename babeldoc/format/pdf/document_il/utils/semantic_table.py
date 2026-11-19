@@ -535,6 +535,7 @@ def build_semantic_table(
         if item.paragraph.pipeline_trace is None:
             item.paragraph.pipeline_trace = {}
         trace = item.paragraph.pipeline_trace
+        trace.setdefault("table_source_box", [item.box.x, item.box.y, item.box.x2, item.box.y2])
         trace["semantic_table"] = {
             **sem_cell.to_trace_dict(),
             "layout_kind": layout_kind if is_coherent else "irregular",
@@ -593,7 +594,10 @@ def collect_page_table_regions(
     paragraphs: list[il_version_1.PdfParagraph] | None = None,
 ) -> list[tuple[il_version_1.Box, list[il_version_1.PdfParagraph], str]]:
     """Group table cells/paragraphs into distinct table regions on a page."""
-    source_paragraphs = list(paragraphs if paragraphs is not None else (page.pdf_paragraph or []))
+    source_paragraphs = [
+        p for p in (paragraphs if paragraphs is not None else (page.pdf_paragraph or []))
+        if not any(marker in (p.layout_label or "").lower() for marker in ("table_footnote", "table_caption", "table_title"))
+    ]
     groups: list[tuple[il_version_1.Box, list[il_version_1.PdfParagraph], str]] = []
     assigned: set[int] = set()
 

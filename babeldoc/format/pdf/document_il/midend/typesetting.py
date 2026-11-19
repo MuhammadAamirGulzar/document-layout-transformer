@@ -2296,8 +2296,11 @@ class Typesetting:
     @staticmethod
     def _is_fixed_table_paragraph(paragraph: il_version_1.PdfParagraph) -> bool:
         """Whether a paragraph owns a physical cell in a preserved table grid."""
+        label = (paragraph.layout_label or "").lower()
+        if any(marker in label for marker in ("table_footnote", "table_caption", "table_title")):
+            return False
         return (
-            "table" in (paragraph.layout_label or "").lower()
+            "table" in label
             or bool((paragraph.pipeline_trace or {}).get("table_id"))
         )
 
@@ -3158,7 +3161,11 @@ class Typesetting:
         table_extents: list[tuple[str, float, float, float, float, float]] = []
         table_groups: list[tuple[str, list[il_version_1.PdfParagraph], float, float, float, float, float]] = []
         for tid, cells in by_table.items():
-            orig_sboxes = [c.box for c in cells if c.box is not None]
+            def source_box(cell):
+                bounds = (cell.pipeline_trace or {}).get("table_source_box")
+                return Box(*bounds) if bounds is not None else cell.box
+
+            orig_sboxes = [source_box(c) for c in cells if c.box is not None]
             orig_src_bottom = min((b.y for b in orig_sboxes), default=None)
             orig_src_top = max((b.y2 for b in orig_sboxes), default=None)
             tb_x0 = min((b.x for b in orig_sboxes), default=0.0)
@@ -3209,8 +3216,8 @@ class Typesetting:
                 # booktabs numeric columns shift vertically in lockstep with row labels.
                 row_bands_src = [
                     (
-                        min((c.box.y for c in r if c.box), default=0.0),
-                        max((c.box.y2 for c in r if c.box), default=0.0),
+                        min((source_box(c).y for c in r if c.box), default=0.0),
+                        max((source_box(c).y2 for c in r if c.box), default=0.0),
                     )
                     for r in ordered_rows
                 ]
@@ -3297,8 +3304,49 @@ class Typesetting:
                                     and (orig_src_bottom - 6.0) <= sb.y <= (lower_top + 4.0)
                                     and (sb.y2 - sb.y) <= 8.0
                                 ):
-                                    sb.y -= overlap
-                                    sb.y2 -= overlap
+                                    if isinstance(shape, PdfCurve):
+                                        self._translate_rendered_curve(shape, dy=-overlap)
+                                    else:
+                                        sb.y -= overlap
+                                        sb.y2 -= overlap
+
+                # Text boxes are measured again after translation, but table paths
+                # still carry their source coordinates. Place horizontal separators
+                # in the actual row gaps and move the path as well as its audit box.
+                for curve in page.pdf_curve or []:
+                    sb = curve.box
+                    if sb is None or sb.y2 - sb.y > 2.0:
+                        continue
+                    if sb.x < tb_x0 - 6.0 or sb.x2 > tb_x2 + 6.0 or sb.x2 - sb.x < (tb_x2 - tb_x0) * 0.35:
+                        continue
+                    # Undo our existing translation when assigning the source rule
+                    # to a boundary, so repeated calls keep the same row ownership.
+                    shift_y = float(curve.relocation_transform[5]) if curve.relocation_transform else 0.0
+                    original_y = (sb.y + sb.y2) * 0.5 - shift_y
+                    if not tb_y0 - 6.0 <= original_y <= tb_y2 + 6.0:
+                        continue
+                    above = [i for i, (y, y2) in enumerate(row_bands_src) if (y + y2) * 0.5 > original_y]
+                    below = [i for i, (y, y2) in enumerate(row_bands_src) if (y + y2) * 0.5 <= original_y]
+                    upper = max(above) if above else None
+                    lower = min(below) if below else None
+
+                    def rendered_row_boxes(index):
+                        return [b for c in ordered_rows[index] if (b := self._rendered_text_box(c)) is not None] + [ch.box for ch in row_chars[index]]
+
+                    upper_boxes = rendered_row_boxes(upper) if upper is not None else []
+                    lower_boxes = rendered_row_boxes(lower) if lower is not None else []
+                    high = min((b.y for b in upper_boxes), default=original_y + 1.5) - 1.5
+                    low = max((b.y2 for b in lower_boxes), default=original_y - 1.5) + 1.5
+                    if upper_boxes and lower_boxes:
+                        target_y = (low + high) * 0.5 if low <= high else None
+                    elif upper_boxes:
+                        target_y = min(original_y, high)
+                    elif lower_boxes:
+                        target_y = max(original_y, low)
+                    else:
+                        target_y = None
+                    if target_y is not None:
+                        self._translate_rendered_curve(curve, dy=target_y - (sb.y + sb.y2) * 0.5)
 
             rboxes = [b for c in cells if (b := self._rendered_text_box(c)) is not None] + [
                 ch.box for ch in table_chars if ch.box is not None
@@ -3307,6 +3355,14 @@ class Typesetting:
             if rboxes and sboxes and orig_src_bottom is not None and orig_src_top is not None:
                 tx0 = min(min(b.x for b in rboxes), min(b.x for b in sboxes), tb_x0)
                 r_bottom = min(b.y for b in rboxes)
+                r_bottom = min([r_bottom] + [
+                    c.box.y for c in page.pdf_curve or []
+                    if c.box is not None and c.box.y2 - c.box.y <= 2.0
+                    and c.box.x >= tb_x0 - 6.0 and c.box.x2 <= tb_x2 + 6.0
+                    and c.box.x2 - c.box.x >= (tb_x2 - tb_x0) * 0.35
+                    and c.relocation_transform
+                    and orig_src_bottom - 6.0 <= c.box.y - float(c.relocation_transform[5]) <= orig_src_top + 6.0
+                ])
                 tx2 = max(max(b.x2 for b in rboxes), max(b.x2 for b in sboxes), tb_x2)
                 r_top = max(b.y2 for b in rboxes)
                 table_groups.append((tid, cells, tx0, r_bottom, tx2, orig_src_bottom, r_top, orig_src_top))
@@ -3342,8 +3398,11 @@ class Typesetting:
                         for shape in list(getattr(page, "pdf_curve", None) or []) + list(getattr(page, "pdf_rectangle", None) or []):
                             sb = getattr(shape, "box", None)
                             if sb and sb.x >= x0_b - 4.0 and sb.x2 <= x2_b + 4.0 and sb.y >= src_bot_b - 4.0 and sb.y2 <= src_top_b + 4.0:
-                                sb.y -= dy
-                                sb.y2 -= dy
+                                if isinstance(shape, PdfCurve):
+                                    self._translate_rendered_curve(shape, dy=-dy)
+                                else:
+                                    sb.y -= dy
+                                    sb.y2 -= dy
                         table_groups[j] = (tid_b, cells_b, x0_b, bot_b - dy, x2_b, src_bot_b - dy, top_b - dy, src_top_b - dy)
                         moved_body = True
 
@@ -5454,6 +5513,8 @@ class Typesetting:
         label = (paragraph.layout_label or "").lower()
         is_table_text = any(marker in label for marker in ("table_cell", "table_text"))
         is_caption = any(marker in label for marker in ("table_caption", "table_title", "table_footnote"))
+        if is_caption:
+            return False
         if not is_caption and (is_table_text or (paragraph.pipeline_trace or {}).get("cell_id")):
             return True
         # Check if inside a table layout region
@@ -6188,6 +6249,32 @@ class Typesetting:
 
         reported_pairs: set[tuple[int, int]] = set()
         for tid, group in by_table.items():
+            # A cell can stay inside its expanded audit box and still cross a
+            # printed rule. Check the actual separators, not just sibling boxes.
+            for cell in group:
+                rb = rendered_map.get(id(cell))
+                if rb is None:
+                    continue
+                for curve in page.pdf_curve or []:
+                    sb = curve.box
+                    if sb is None or sb.y2 - sb.y > 2.0:
+                        continue
+                    if curve.xobj_id is not None and cell.xobj_id is not None and curve.xobj_id != cell.xobj_id:
+                        continue
+                    group_width = max(c.box.x2 for c in group) - min(c.box.x for c in group)
+                    if sb.x2 - sb.x < group_width * 0.35:
+                        continue
+                    overlap_x = min(rb.x2, sb.x2) - max(rb.x, sb.x)
+                    if overlap_x > 3.0 and rb.y + 1.0 < (sb.y + sb.y2) * 0.5 < rb.y2 - 1.0:
+                        self._ensure_pipeline_trace(cell)["table_cell_overflow"] = True
+                        self._record_layout_issue(
+                            page_number=page.page_number,
+                            kind="table_cell_overflow",
+                            detail=f"Table cell {getattr(cell, 'debug_id', '?')} crosses a horizontal table rule in {tid}",
+                            debug_id=getattr(cell, "debug_id", None),
+                            severity="warning",
+                        )
+                        break
             for idx, first in enumerate(group):
                 r1 = rendered_map.get(id(first))
                 if r1 is None:
