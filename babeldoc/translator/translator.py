@@ -417,6 +417,22 @@ class BaseTranslator(ABC):
         blocks = getattr(self, "_incomplete_blocks", None)
         return blocks.value if blocks is not None else 0
 
+    @property
+    def source_spans_retained_count(self):
+        """Number of sentence/clause/prose spans that kept their source text after recovery."""
+        spans = getattr(self, "_source_spans_retained", None)
+        return spans.value if spans is not None else 0
+
+    def _note_source_spans_retained(self, count: int) -> None:
+        if count <= 0:
+            return
+        spans = getattr(self, "_source_spans_retained", None)
+        if spans is None:
+            spans = AtomicInteger()
+            self._source_spans_retained = spans
+        for _ in range(count):
+            spans.inc()
+
     def _get_call_state(self):
         state = getattr(self, "_call_state", None)
         if state is None:
@@ -550,6 +566,29 @@ class BaseTranslator(ABC):
         """Boundary-aware count of protected literal occurrences in *text*."""
         return _protected_value_count_shared(text, value)
 
+    @classmethod
+    def _effective_protected_counts(cls, text: str, expected: Counter[str]) -> dict[str, int]:
+        """Count occurrences of each expected token without double-counting tokens nested inside longer expected tokens."""
+        counts = {value: cls._protected_value_count(text, value) for value in expected}
+        ordered = sorted(expected.keys(), key=len, reverse=True)
+        for idx, outer in enumerate(ordered):
+            outer_cnt = counts.get(outer, 0)
+            if outer_cnt <= 0:
+                continue
+            for inner in ordered[idx + 1 :]:
+                if len(inner) >= len(outer):
+                    continue
+                inner_in_outer = cls._protected_value_count(outer, inner)
+                if inner_in_outer > 0:
+                    counts[inner] = counts[inner] - (outer_cnt * inner_in_outer)
+        return counts
+
+    @classmethod
+    def _mismatched_protected_values(cls, text: str, expected: Counter[str]) -> set[str]:
+        """Return expected protected values whose effective occurrence count != expected count."""
+        effective = cls._effective_protected_counts(text, expected)
+        return {value for value, exp_cnt in expected.items() if effective.get(value, 0) != exp_cnt}
+
     @staticmethod
     def _find_unresolved_placeholders(
         protected_source: str,
@@ -590,10 +629,9 @@ class BaseTranslator(ABC):
     def _retain_missing_protected_values(self, translated, source, mapping, expected):
         """Keep exact non-sensitive values visible when model attempts drop them."""
         retained = []
+        effective = self._effective_protected_counts(translated, expected)
         for value, expected_count in expected.items():
-            missing_count = expected_count - self._protected_value_count(
-                translated, value
-            )
+            missing_count = expected_count - effective.get(value, 0)
             if missing_count <= 0:
                 continue
             compact_value = re.sub(r"\s+", "", value)
@@ -641,16 +679,30 @@ class BaseTranslator(ABC):
         ):
             return source_full
 
+        # Re-attaching a dropped value is only safe when the block is a single
+        # sentence: the value then sits next to the clause it belongs to.  In a
+        # multi-sentence block it would land at the end of an unrelated
+        # sentence and silently describe the wrong thing, so keep the source.
+        effective = self._effective_protected_counts(translated, expected)
+        if any(
+            effective.get(value, 0) < expected[value]
+            for value in expected
+        ):
+            web_spans = [(s, e) for s, e, _ in iter_web_references(source_full)]
+            cites = [m.span() for m in AUTHOR_YEAR_CITATION.finditer(source_full)] + web_spans
+            sentence_count = len(
+                [s for s in split_sentences(source_full, citation_spans=cites) if s and s.strip()]
+            )
+            if sentence_count > 1:
+                return source_full
+
         retained = self._retain_missing_protected_values(
             translated,
             protected_source,
             mapping,
             expected,
         )
-        exact = all(
-            self._protected_value_count(retained, value) == count
-            for value, count in expected.items()
-        )
+        exact = not self._mismatched_protected_values(retained, expected)
         unresolved = self._find_unresolved_placeholders(
             protected_source,
             retained,
@@ -728,17 +780,7 @@ class BaseTranslator(ABC):
         src_full = (
             _restore_numerals(text, mapping, strict=False) if mapping else text
         )
-        structural = {
-            value for value in expected
-            if value.lower().startswith(("http://", "https://", "www.")) or _ATOMIC_EXPRESSION.fullmatch(value)
-        }
-        missing = {
-            value for value, count in expected.items()
-            if self._protected_value_count(first, value) != count
-        }
-        missing.update(
-            value for value in structural if self._protected_value_count(first, value) != expected[value]
-        )
+        missing = self._mismatched_protected_values(first, expected)
         if not missing and not unresolved:
             target_lang = str(getattr(self, "tgt_nllb", "") or getattr(self, "lang_out", ""))
             valid, val_reason = validate_translation_completeness(
@@ -767,8 +809,12 @@ class BaseTranslator(ABC):
             state.retry_outcome = "failed"
             partial = self._recover_by_spans(src_full, target_lang)
             if partial is not None:
+                if partial[2] == 0:
+                    state.retry_outcome = "succeeded"
+                    return partial[0], not getattr(state, "incomplete", False)
                 state.retry_outcome = "partial"
                 state.validation_reason = "partial_span_recovery"
+                self._note_source_spans_retained(partial[2])
                 self._inc_incomplete_once()
                 logger.warning(
                     "Span recovery kept %d translated and %d source segment(s) (%s); not caching.",
@@ -830,10 +876,7 @@ class BaseTranslator(ABC):
                     and not self._find_unresolved_placeholders(retry_text, candidate, remaining)
                     and self._retry_target_satisfied(candidate)
                     and candidate_valid
-                    and all(
-                        self._protected_value_count(candidate, value) == count
-                        for value, count in expected.items()
-                    )
+                    and not self._mismatched_protected_values(candidate, expected)
                 ):
                     state.retry_outcome = "succeeded"
                     return candidate, (not was_incomplete)
@@ -845,10 +888,7 @@ class BaseTranslator(ABC):
             target_lang = str(getattr(self, "tgt_nllb", "") or getattr(self, "lang_out", ""))
             state.retry_attempted = True
             segmented, valid = self._retry_semantic_segments(src_full, mapping, target_lang)
-            if valid and all(
-                self._protected_value_count(segmented, value) == count
-                for value, count in expected.items()
-            ):
+            if valid and not self._mismatched_protected_values(segmented, expected):
                 state.retry_outcome = "succeeded"
                 return segmented, not was_incomplete
         if getattr(state, "retry_attempted", False):
@@ -857,8 +897,14 @@ class BaseTranslator(ABC):
         partial = self._recover_by_spans(src_full, target_lang)
         if partial is not None:
             state.retry_attempted = True
+            if partial[2] == 0:
+                # Every sentence/clause validated exactly (protected values,
+                # Arabic completeness, no placeholders): a genuine recovery.
+                state.retry_outcome = "succeeded"
+                return partial[0], not was_incomplete
             state.retry_outcome = "partial"
             state.validation_reason = "partial_span_recovery"
+            self._note_source_spans_retained(partial[2])
             self._inc_incomplete_once()
             logger.warning(
                 "Span recovery kept %d translated and %d source segment(s) after protected-content mismatch; not caching.",
@@ -866,6 +912,8 @@ class BaseTranslator(ABC):
             )
             return partial[0], False
         self._inc_incomplete_once()
+        self._note_source_spans_retained(1)
+        state.validation_reason = state.validation_reason or "source_text_retained"
         logger.warning(
             "Translated output is missing protected content or kept unresolved placeholders. "
             "Check the translated block."
@@ -890,7 +938,11 @@ class BaseTranslator(ABC):
         return segments or [source_full]
 
     _CLAUSE_SPLIT_RE = re.compile(
-        r"([;:\u2014\u2013]\s+|,\s+(?=(?:however|while|whereas|and|or|but|which|where|including|such\s+as|after|before|although|because|if|when)\b))",
+        r"("
+        r"[;:\u2014\u2013]\s+"
+        r"|,\s+(?=(?:however|while|whereas|and|or|but|which|where|including|such\s+as|after|before|although|because|if|when|"
+        r"economic|financial|growth|inflation|output|support|processed|ended|began|an?\b|the\b)\b)"
+        r")",
         re.IGNORECASE,
     )
 
@@ -909,50 +961,76 @@ class BaseTranslator(ABC):
             i += 2
         return out if len(out) >= 2 else [(text, "")]
 
+    def _validate_span_candidate(
+        self,
+        stripped: str,
+        seg_prot: str,
+        seg_map: dict[str, str],
+        raw: str,
+        target_lang: str,
+    ) -> str | None:
+        """Return the restored span text only if it proves exactly safe, else ``None``."""
+        restored = _restore_numerals(raw, seg_map, strict=False) if seg_map else raw
+        if seg_map:
+            restored = self._canonicalize_literal_values(restored, seg_map.values())
+        # Exact multiplicity (missing AND duplicated) against the source Counter.
+        if seg_map and self._mismatched_protected_values(restored, Counter(seg_map.values())):
+            return None
+        if self._find_unresolved_placeholders(seg_prot, restored, seg_map):
+            return None
+        if not self._retry_target_satisfied(restored):
+            return None
+        if _is_degenerate_translation(stripped, restored) or _HALLUCINATION_STOCK_RE.search(restored):
+            return None
+        valid, _ = validate_translation_completeness(
+            stripped,
+            restored,
+            target_lang=target_lang,
+            extra_protected=tuple(seg_map.values()),
+        )
+        if not valid:
+            return None
+        # For short 2-3 word spans exempted by length in validate_translation_completeness,
+        # still reject outputs that leave lowercase English words untranslated in Arabic mode.
+        tgt_norm = str(target_lang or "").lower().rsplit("-", 1)[-1]
+        if tgt_norm in {"ar", "ara", "arabic", "arb_arab"}:
+            clean_out = _strip_immutable_for_completeness(restored, tuple(seg_map.values()))
+            rem_lower = [
+                w for w in re.findall(r"\b[A-Za-z][A-Za-z'\u2019\-]{1,}\b", clean_out)
+                if not w.isupper() and w[0].islower()
+            ]
+            ar_chars = re.findall(rf"[{_ARABIC_LETTER_RANGE}]", clean_out)
+            if rem_lower and len(ar_chars) < sum(len(w) for w in rem_lower):
+                return None
+        return restored.strip()
+
     def _try_translate_span_unit(self, span_text: str, target_lang: str) -> str | None:
-        """Translate and validate a single sentence/clause/prose span, returning None if unsafe."""
+        """Translate and validate one sentence/clause/prose span, or return ``None`` if unsafe.
+
+        Bounded two-rung ladder.  The local model is deterministic, so re-sending
+        the identical placeholder text can only reproduce the same failure.  The
+        second rung therefore sends a *different* input: the literal values
+        inline, which seq2seq models copy far more reliably than ``{N}`` tags.
+        Both rungs go through the same exact-multiplicity validation.
+        """
         stripped = span_text.strip()
         if not stripped:
             return span_text
         seg_prot, seg_map = _protect_numerals(stripped)
         try:
             raw = self._generate_translation(seg_prot)
-            restored = _restore_numerals(raw, seg_map, strict=False) if seg_map else raw
+            accepted = self._validate_span_candidate(stripped, seg_prot, seg_map, raw, target_lang)
+            if accepted is not None:
+                return accepted
             if seg_map:
-                restored = self._canonicalize_literal_values(restored, seg_map.values())
-            exact = all(
-                self._protected_value_count(restored, value) == count
-                for value, count in Counter(seg_map.values()).items()
-            )
-            if not exact:
-                return None
-            if self._find_unresolved_placeholders(seg_prot, restored, seg_map):
-                return None
-            if not self._retry_target_satisfied(restored):
-                return None
-            if _is_degenerate_translation(stripped, restored) or _HALLUCINATION_STOCK_RE.search(restored):
-                return None
-            valid, _ = validate_translation_completeness(
-                stripped,
-                restored,
-                target_lang=target_lang,
-                extra_protected=tuple(seg_map.values()),
-            )
-            if not valid:
-                return None
-            # For short 2-3 word spans exempted by length in validate_translation_completeness,
-            # still reject outputs that leave lowercase English words untranslated in Arabic mode.
-            tgt_norm = str(target_lang or "").lower().rsplit("-", 1)[-1]
-            if tgt_norm in {"ar", "ara", "arabic", "arb_arab"}:
-                clean_out = _strip_immutable_for_completeness(restored, tuple(seg_map.values()))
-                rem_lower = [
-                    w for w in re.findall(r"\b[A-Za-z][A-Za-z'\u2019\-]{1,}\b", clean_out)
-                    if not w.isupper() and w[0].islower()
-                ]
-                ar_chars = re.findall(rf"[{_ARABIC_LETTER_RANGE}]", clean_out)
-                if rem_lower and len(ar_chars) < sum(len(w) for w in rem_lower):
-                    return None
-            return restored.strip()
+                raw_literal = self._generate_translation(stripped)
+                # Literal rung: nothing was masked, so values are validated as-is.
+                accepted = self._validate_span_candidate(
+                    stripped, stripped, seg_map, raw_literal, target_lang
+                )
+                if accepted is not None:
+                    return accepted
+            return None
         except Exception as exc:  # noqa: BLE001 - recovery must never raise
             logger.warning("Span recovery failed for one segment: %s", exc)
             return None
@@ -1084,9 +1162,8 @@ class BaseTranslator(ABC):
             return None
         reassembled = " ".join(p for p in parts if p)
         _, expected_map = _protect_numerals(source_full)
-        for val, exp_cnt in Counter(expected_map.values()).items():
-            if self._protected_value_count(reassembled, val) != exp_cnt:
-                return None
+        if expected_map and self._mismatched_protected_values(reassembled, Counter(expected_map.values())):
+            return None
         return reassembled, translated_count, kept_count
 
     def _retry_semantic_segments(
@@ -1118,15 +1195,12 @@ class BaseTranslator(ABC):
                 seg_restored = self._canonicalize_literal_values(seg_restored, seg_map.values())
             if self._find_unresolved_placeholders(seg_prot, seg_restored, seg_map):
                 return "", False
-            if any(
-                self._protected_value_count(seg_restored, val) != cnt
-                for val, cnt in Counter(seg_map.values()).items()
-            ):
+            if seg_map and self._mismatched_protected_values(seg_restored, Counter(seg_map.values())):
                 return "", False
             translated_parts.append(seg_restored.strip())
 
         reassembled = " ".join(part for part in translated_parts if part)
-        if expected and any(self._protected_value_count(reassembled, v) != c for v, c in expected.items()):
+        if expected and self._mismatched_protected_values(reassembled, expected):
             return reassembled, False
         was_inc = getattr(state, "incomplete", False)
         state.incomplete = False
@@ -1754,6 +1828,11 @@ class _Seq2SeqTranslator(BaseTranslator):
                 chunk, raw_outputs
             ):
                 state = self._get_call_state()
+                saved_para_incomplete = getattr(state, "para_incomplete", False)
+                saved_para_failed = getattr(state, "para_failed", False)
+                saved_val_reason = getattr(state, "validation_reason", None)
+                saved_retry_attempted = getattr(state, "retry_attempted", False)
+                saved_retry_outcome = getattr(state, "retry_outcome", None)
                 state.failed = False
                 state.incomplete = False
                 state.incomplete_counted = False
@@ -1776,6 +1855,20 @@ class _Seq2SeqTranslator(BaseTranslator):
                 translated, cacheable = self._finalize_protected_translation(
                     protected_text, decoded, numeral_map, before_untranslated
                 )
+                if saved_para_incomplete:
+                    state.para_incomplete = True
+                if saved_para_failed:
+                    state.para_failed = True
+                if saved_retry_attempted:
+                    state.retry_attempted = True
+                # Preserve the worst/most-informative outcome across sentences in the batch
+                outcome_rank = {None: 0, "succeeded": 1, "partial": 2, "failed": 3}
+                cur_out = getattr(state, "retry_outcome", None)
+                if outcome_rank.get(saved_retry_outcome, 0) > outcome_rank.get(cur_out, 0):
+                    state.retry_outcome = saved_retry_outcome
+                    state.validation_reason = saved_val_reason
+                elif not getattr(state, "validation_reason", None) and saved_val_reason:
+                    state.validation_reason = saved_val_reason
                 if cacheable and use_cache:
                     self.cache.set(raw_text, translated)
                 results[idx] = translated

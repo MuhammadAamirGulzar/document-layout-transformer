@@ -67,11 +67,18 @@ KNOWN_CODES = frozenset({
 
 _BIC_CONTEXT = re.compile(r"\b(?:SWIFT|BIC|bank\s+identifier)\b", re.IGNORECASE)
 
+_MEASUREMENT_UNITS = (
+    r"mg/L|µg/L|ug/L|mmol/L|µg/mL|kg/ha|km/h|kWh|MWh|GWh|ppm|ppb|mmHg|"
+    r"mL|mg|kg|km|cm|mm|Hz|kHz|MHz|GHz|°C|°F"
+)
 PERCENT_VALUE_RE = re.compile(
     r"^([+\-\u2212]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?:[eE][+\-]?\d+)?)\s*([%\u066A])$"
 )
+UNIT_VALUE_RE = re.compile(
+    rf"^([+\-\u2212]?(?:\d{{1,3}}(?:,\d{{3}})+|\d+)(?:\.\d+)?)\s*({_MEASUREMENT_UNITS})$"
+)
 NUMERIC_VALUE_RE = re.compile(
-    r"^[+\-\u2212]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)*(?:[eE][+\-]?\d+)?$"
+    r"^[+\-\u2212]?(?:\d{1,3}(?:\.\d{3})+,\d+|\d{1,2}(?:,\d{2})+,\d{3}(?:\.\d+)?|\d{1,3}(?:,\d{3})+|\d+(?:\.\d+)*)(?:[eE][+\-]?\d+)?[KMBT]?$"
 )
 
 STRUCTURED_TOKEN_PATTERN = re.compile(
@@ -139,10 +146,12 @@ STRUCTURED_TOKEN_PATTERN = re.compile(
     # International phone numbers (spaces or hyphens)
     r'(\+\d{1,4}(?:[\s\-]\d{2,4}){2,4})|'
     # Numbers with scientific/measurement units
-    r'((?<![A-Za-z0-9_.])[+\-\u2212]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?\s*(?:mg/L|µg/L|ug/L|mmol/L|µg/mL|kg/ha|km/h|kWh|MWh|GWh|ppm|ppb|mmHg|mL|mg|kg|km|cm|mm|Hz|kHz|MHz|GHz|°C|°F)(?![A-Za-z0-9_]))|'
-    # Generic formatted numbers / percentages
+    rf'((?<![A-Za-z0-9_.])[+\-\u2212]?(?:\d{{1,3}}(?:,\d{{3}})+|\d+)(?:\.\d+)?\s*(?:{_MEASUREMENT_UNITS})(?![A-Za-z0-9_]))|'
+    # European (1.234,56), South Asian (1,25,000), magnitude (1.2M), and standard numbers / percentages
+    r'((?<![A-Za-z0-9_.])[+\-\u2212]?(?:\d{1,3}(?:\.\d{3})+,\d+|\d{1,2}(?:,\d{2})+,\d{3}(?:\.\d+)?)(?![A-Za-z0-9_])(?!\.\d))|'
+    r'((?<![A-Za-z0-9_.])[+\-\u2212]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?[KMBT](?![A-Za-z0-9_]))|'
     r'((?<![A-Za-z0-9_.])[+\-\u2212]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?:\s*[%\u066A])?(?!\w)(?!\.\d))|'
-    r'((?<!\w)\d+(?:\.\d+)?(?!\w))'
+    r'((?<!\w)\d+(?:\.\d+)?(?!\w|\.\d))'
 )
 
 PASSTHROUGH_ATOM_RE = re.compile(
@@ -229,20 +238,37 @@ def caps_phrase_to_sentence_case(text: str) -> str:
 
 
 def canonicalize_literal_values(text: str, values) -> str:
-    """Canonicalize Arabic/spaced percentage forms back to source tokens."""
+    """Canonicalize Arabic/spaced percentage forms and dash-range spacing back to source tokens."""
     if not text:
         return text
     for value in set(values):
         pct_match = PERCENT_VALUE_RE.match(value)
-        if not pct_match:
+        if pct_match:
+            num = re.escape(pct_match.group(1))
+            left = r"(?<![A-Za-z0-9_.\u066B\u066C+\-\u2212])(?<!\d,)"
+            right = r"(?![A-Za-z_\d])"
+            pct_pattern = re.compile(
+                rf"{left}(?:{num}\s*(?:[%\u066A]|في\s+المائة|بالمائة|بالمئة)|[%\u066A]\s*{num}(?![.,\u066B\u066C]\d)){right}"
+            )
+            text = pct_pattern.sub(lambda _m, orig=value: orig, text)
             continue
-        num = re.escape(pct_match.group(1))
-        left = r"(?<![A-Za-z0-9_.\u066B\u066C+\-\u2212])(?<!\d,)"
-        right = r"(?![A-Za-z_\d])"
-        pct_pattern = re.compile(
-            rf"{left}(?:{num}\s*(?:[%\u066A]|في\s+المائة|بالمائة|بالمئة)|[%\u066A]\s*{num}(?![.,\u066B\u066C]\d)){right}"
-        )
-        text = pct_pattern.sub(lambda _m, orig=value: orig, text)
+        range_match = re.fullmatch(r"(\d+)\s*([-\u2013\u2014])\s*(\d+)", value)
+        if range_match:
+            a, _sep, b = range_match.groups()
+            left = r"(?<![A-Za-z0-9_.\u066B\u066C+\-\u2010\u2011\u2012\u2013\u2014\u2212])(?<!\d/)"
+            right = r"(?![A-Za-z0-9_])(?![.,\u066B\u066C]\d)(?![-\u2010\u2011\u2012\u2013\u2014/]\d)"
+            range_pattern = re.compile(
+                rf"{left}{re.escape(a)}\s*[-\u2010\u2011\u2012\u2013\u2014]\s*{re.escape(b)}{right}"
+            )
+            text = range_pattern.sub(lambda _m, orig=value: orig, text)
+            continue
+        unit_match = UNIT_VALUE_RE.match(value)
+        if unit_match:
+            num, unit = unit_match.groups()
+            left = r"(?<![A-Za-z0-9_.\u066B\u066C+\-\u2010\u2011\u2012\u2013\u2014\u2212])(?<!\d,)"
+            right = r"(?![A-Za-z0-9_])"
+            unit_pattern = re.compile(rf"{left}{re.escape(num)}\s*{re.escape(unit)}{right}")
+            text = unit_pattern.sub(lambda _m, orig=value: orig, text)
     return text
 
 
@@ -261,10 +287,38 @@ def protected_value_count(text: str, value: str) -> int:
             rf"{left}(?:{num}\s*(?:[%\u066A]|في\s+المائة|بالمائة|بالمئة)|[%\u066A]\s*{num}(?![.,\u066B\u066C]\d)){right}"
         )
         return len(pct_pattern.findall(text))
+    range_match = re.fullmatch(r"(\d+)\s*([-\u2013\u2014])\s*(\d+)", value)
+    if range_match:
+        a, _sep, b = range_match.groups()
+        left = r"(?<![A-Za-z0-9_.\u066B\u066C+\-\u2010\u2011\u2012\u2013\u2014\u2212])(?<!\d/)"
+        right = r"(?![A-Za-z0-9_])(?![.,\u066B\u066C]\d)(?![-\u2010\u2011\u2012\u2013\u2014/]\d)"
+        range_pattern = re.compile(
+            rf"{left}{re.escape(a)}\s*[-\u2010\u2011\u2012\u2013\u2014]\s*{re.escape(b)}{right}"
+        )
+        return len(range_pattern.findall(text))
+    unit_match = UNIT_VALUE_RE.match(value)
+    if unit_match:
+        num, unit = unit_match.groups()
+        left = r"(?<![A-Za-z0-9_.\u066B\u066C+\-\u2010\u2011\u2012\u2013\u2014\u2212])(?<!\d,)"
+        right = r"(?![A-Za-z0-9_])"
+        return len(re.findall(rf"{left}{re.escape(num)}\s*{re.escape(unit)}{right}", text))
     if NUMERIC_VALUE_RE.match(value):
-        left = r"(?<![A-Za-z0-9_.\u066B\u066C+\-\u2212])(?<!\d,)"
-        right = r"(?![A-Za-z0-9_])(?![.,\u066B\u066C]\d)(?!\s*[%\u066A])"
+        left = r"(?<![A-Za-z0-9_.\u066B\u066C+\-\u2010\u2011\u2012\u2013\u2014\u2212])(?<!\d,)(?<!\d/)(?<!\d:)"
+        right = r"(?![A-Za-z0-9_])(?![.,\u066B\u066C]\d)(?![-\u2010\u2011\u2012\u2013\u2014/:]\d)(?!\s*[%\u066A])"
         return len(re.findall(left + re.escape(value) + right, text))
+    # For parenthetical values like "(±0.5)", "(3 × 4 = 12)", or "(20 °C)",
+    # allow optional spaces next to parens and math/unit operators without relaxing ISO dates.
+    if value.startswith("(") and value.endswith(")") and len(value) >= 3:
+        inner = re.sub(r"\s*([+\u2212±×÷=°])\s*", r"\1", value[1:-1].strip())
+        parts: list[str] = []
+        for tok in re.findall(r"\s+|[+\u2212±×÷=°]|[^\s+\u2212±×÷=°]+", inner):
+            if tok.isspace():
+                parts.append(r"\s+")
+            elif tok in "+\u2212±×÷=°":
+                parts.append(r"\s*" + re.escape(tok) + r"\s*")
+            else:
+                parts.append(re.escape(tok))
+        return len(re.findall(r"\(\s*" + "".join(parts) + r"\s*\)", text))
     left = r"(?<![A-Za-z_\d])" if value[0].isalnum() else (r"(?<!\d)" if value[0] in "+-\u2212" else "")
     right = r"(?![A-Za-z_\d])" if value[-1].isalnum() else ""
     return len(re.findall(left + re.escape(value) + right, text))

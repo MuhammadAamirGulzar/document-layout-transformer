@@ -459,6 +459,15 @@ class ContentLedger:
                 "validation_retry_succeeded_count": sum(1 for e in entries if e.get("retry_outcome") == "succeeded"),
                 "validation_retry_failed_count": sum(1 for e in entries if e.get("retry_outcome") == "failed"),
                 "validation_retry_partial_count": sum(1 for e in entries if e.get("retry_outcome") == "partial"),
+                "source_text_retained_count": sum(
+                    1
+                    for e in entries
+                    if e.get("disposition") == "incomplete"
+                    and (
+                        e.get("retry_outcome") in {"partial", "failed"}
+                        or e.get("validation_reason") in {"partial_span_recovery", "source_text_retained", "protected_content_mismatch"}
+                    )
+                ),
             },
             "preflight": preflight,
             "terminology": terminology,
