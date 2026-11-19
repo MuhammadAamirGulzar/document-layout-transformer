@@ -296,29 +296,94 @@ def build_semantic_table(
             if _box_intersection_ratio(a.box, b.box) > 0.35:
                 heavy_overlaps += 1
 
-    prelim: list[tuple[_VirtualCell, int, int, int, int]] = []
-    slot_counts: dict[tuple[int, int], int] = {}
-    for item in items:
-        r_indices = _covered_band_indices(item.box.y, item.box.y2, row_bands)
-        c_indices = _covered_band_indices(item.box.x, item.box.x2, col_bands)
-        r0, r1 = min(r_indices), max(r_indices)
-        c0, c1 = min(c_indices), max(c_indices)
-        r_span = r1 - r0 + 1
-        c_span = c1 - c0 + 1
-        prelim.append((item, r0, c0, r_span, c_span))
-        for rr in range(r0, r1 + 1):
-            for cc in range(c0, c1 + 1):
-                slot_counts[(rr, cc)] = slot_counts.get((rr, cc), 0) + 1
-
-    slot_collisions = sum(
-        1
-        for item, r0, c0, r_span, c_span in prelim
-        if any(
-            slot_counts.get((rr, cc), 0) > 1
-            for rr in range(r0, r0 + r_span)
-            for cc in range(c0, c0 + c_span)
+    def _assign_cols_and_count_collisions(
+        subset: list[_VirtualCell],
+    ) -> tuple[list[tuple[float, float]], list[tuple[_VirtualCell, int, int, int, int]], int]:
+        sec_cols = _derive_atomic_intervals([(it.box.x, it.box.x2) for it in subset])
+        sec_prelim: list[tuple[_VirtualCell, int, int, int, int]] = []
+        sec_slot_counts: dict[tuple[int, int], int] = {}
+        for item in subset:
+            r_indices = _covered_band_indices(item.box.y, item.box.y2, row_bands)
+            c_indices = _covered_band_indices(item.box.x, item.box.x2, sec_cols)
+            r0, r1 = min(r_indices), max(r_indices)
+            c0, c1 = min(c_indices), max(c_indices)
+            r_span = r1 - r0 + 1
+            c_span = c1 - c0 + 1
+            sec_prelim.append((item, r0, c0, r_span, c_span))
+            for rr in range(r0, r1 + 1):
+                for cc in range(c0, c1 + 1):
+                    sec_slot_counts[(rr, cc)] = sec_slot_counts.get((rr, cc), 0) + 1
+        sec_coll = sum(
+            1
+            for _item, r0, c0, r_span, c_span in sec_prelim
+            if any(
+                sec_slot_counts.get((rr, cc), 0) > 1
+                for rr in range(r0, r0 + r_span)
+                for cc in range(c0, c0 + c_span)
+            )
         )
-    )
+        return sec_cols, sec_prelim, sec_coll
+
+    col_bands, prelim, slot_collisions = _assign_cols_and_count_collisions(items)
+    # List of (section_rows_set, section_col_bands, section_prelim)
+    sections_data: list[tuple[set[int], list[tuple[float, float]], list[tuple[_VirtualCell, int, int, int, int]]]] | None = None
+
+    if (
+        len(items) >= 3
+        and heavy_overlaps == 0
+        and slot_collisions > 0
+        and (slot_collisions / len(items)) > 0.30
+        and num_rows >= 2
+    ):
+        # Attempt vertical row partitioning for vertically stacked sub-tables with
+        # staggered column grids (e.g. multi-panel statistical tables).
+        row_items_map: dict[int, list[_VirtualCell]] = {r: [] for r in range(num_rows)}
+        item_rows_map: dict[int, set[int]] = {}
+        for it in items:
+            rs = set(_covered_band_indices(it.box.y, it.box.y2, row_bands))
+            item_rows_map[id(it)] = rs
+            for r in rs:
+                row_items_map[r].append(it)
+
+        def _unique_items(row_set: set[int]) -> list[_VirtualCell]:
+            seen: set[int] = set()
+            out: list[_VirtualCell] = []
+            for r in sorted(row_set):
+                for it in row_items_map.get(r, ()):
+                    if id(it) not in seen:
+                        seen.add(id(it))
+                        out.append(it)
+            return out
+
+        partitioned: list[tuple[set[int], list[tuple[float, float]], list[tuple[_VirtualCell, int, int, int, int]], int]] = []
+        cur_rows: set[int] = {0}
+        for r_idx in range(1, num_rows):
+            r_items = row_items_map.get(r_idx, ())
+            shares_span = any(bool(item_rows_map[id(it)] & cur_rows) for it in r_items)
+            trial_rows = cur_rows | {r_idx}
+            trial_items = _unique_items(trial_rows)
+            trial_cols, trial_prelim, trial_coll = _assign_cols_and_count_collisions(trial_items)
+            if shares_span or trial_coll == 0:
+                cur_rows = trial_rows
+            else:
+                cur_items = _unique_items(cur_rows)
+                cur_cols, cur_prelim, cur_coll = _assign_cols_and_count_collisions(cur_items)
+                partitioned.append((cur_rows, cur_cols, cur_prelim, cur_coll))
+                cur_rows = {r_idx}
+        last_items = _unique_items(cur_rows)
+        last_cols, last_prelim, last_coll = _assign_cols_and_count_collisions(last_items)
+        partitioned.append((cur_rows, last_cols, last_prelim, last_coll))
+
+        total_sec_coll = sum(sec[3] for sec in partitioned)
+        if (
+            len(partitioned) >= 2
+            and total_sec_coll < slot_collisions
+            and (total_sec_coll / len(items)) <= 0.15
+        ):
+            sections_data = [(s[0], s[1], s[2]) for s in partitioned]
+            prelim = [entry for s in partitioned for entry in s[2]]
+            slot_collisions = total_sec_coll
+            num_cols = max(len(s[1]) for s in partitioned)
 
     issues: list[str] = []
     if heavy_overlaps > 0 and (heavy_overlaps >= 2 or (len(items) >= 3 and heavy_overlaps / max(1, len(items)) >= 0.25)):
@@ -337,26 +402,36 @@ def build_semantic_table(
         base_conf = 0.35
     confidence = max(0.05, min(1.0, base_conf - 0.2 * len(issues)))
 
-    # Identify header rows: rows near the top where cells are centered, labeled
-    # header, span > 1 col above narrower columns, or contain non-numeric headers
-    # followed by rows that introduce numeric data.
-    row_cells_map: dict[int, list[tuple[_VirtualCell, int, int, int, int]]] = {}
-    for entry in prelim:
-        row_cells_map.setdefault(entry[1], []).append(entry)
+    if sections_data is None:
+        sections_data = [(set(range(num_rows)), col_bands, prelim)]
 
-    first_numeric_row: int | None = None
-    for r_idx in range(num_rows):
-        entries = row_cells_map.get(r_idx, [])
-        if any(classify_table_cell_value(e[0].text)[0] == "numeric" for e in entries):
-            first_numeric_row = r_idx
-            break
+    item_section_idx: dict[int, int] = {}
+    item_section_cols: dict[int, list[tuple[float, float]]] = {}
+    for sec_idx, (_sec_rows, sec_cols, sec_prelim) in enumerate(sections_data):
+        for sec_item, *_ in sec_prelim:
+            item_section_idx[id(sec_item)] = sec_idx
+            item_section_cols[id(sec_item)] = sec_cols
 
+    # Identify header rows within each section: top rows of a section with explicit
+    # header markers, centered cells, colspan > 1, or non-numeric labels followed by numeric rows.
     header_rows: set[int] = set()
-    if num_rows >= 2:
-        for r_idx in range(num_rows):
-            entries = row_cells_map.get(r_idx, [])
-            if not entries:
-                continue
+    for _sec_rows, _sec_cols, sec_prelim in sections_data:
+        sec_row_cells: dict[int, list[tuple[_VirtualCell, int, int, int, int]]] = {}
+        for entry in sec_prelim:
+            sec_row_cells.setdefault(entry[1], []).append(entry)
+        sec_rows_sorted = sorted(sec_row_cells.keys())
+        if len(sec_rows_sorted) < 2:
+            continue
+        first_num_row = next(
+            (
+                r for r in sec_rows_sorted
+                if any(classify_table_cell_value(e[0].text)[0] == "numeric" for e in sec_row_cells[r])
+            ),
+            None,
+        )
+        sec_headers: set[int] = set()
+        for pos, r_idx in enumerate(sec_rows_sorted):
+            entries = sec_row_cells[r_idx]
             has_explicit_header = any(
                 "header" in e[0].layout_label or e[0].is_centered
                 for e in entries
@@ -366,17 +441,18 @@ def build_semantic_table(
                 classify_table_cell_value(e[0].text)[0] != "numeric"
                 for e in entries
             )
-            if r_idx == 0 and (has_explicit_header or has_colspan or all_non_numeric):
-                header_rows.add(r_idx)
+            if pos == 0 and (has_explicit_header or has_colspan or all_non_numeric):
+                sec_headers.add(r_idx)
             elif (
-                r_idx > 0
-                and r_idx == max(header_rows, default=-1) + 1
-                and first_numeric_row is not None
-                and r_idx < first_numeric_row
+                pos > 0
+                and sec_rows_sorted[pos - 1] in sec_headers
+                and first_num_row is not None
+                and r_idx < first_num_row
                 and all_non_numeric
-                and (has_explicit_header or any(e[4] > 1 for e in row_cells_map.get(r_idx - 1, [])))
+                and (has_explicit_header or any(e[4] > 1 for e in sec_row_cells[sec_rows_sorted[pos - 1]]))
             ):
-                header_rows.add(r_idx)
+                sec_headers.add(r_idx)
+        header_rows.update(sec_headers)
 
     # Order deterministically top-to-bottom, left-to-right
     prelim.sort(key=lambda e: (e[1], e[2], e[0].box.x))
@@ -418,8 +494,13 @@ def build_semantic_table(
         if item.paragraph is not None:
             para_cell_map[id(item.paragraph)] = sem_cell
 
-    # Link column headers (all header cells strictly above spanning the cell's columns)
-    # and optional row header (column 0 non-numeric label on the same row).
+    cell_section_map: dict[str, int] = {
+        para_cell_map[id(it.paragraph)].cell_id: item_section_idx.get(id(it), 0)
+        for it, *_ in prelim
+        if it.paragraph is not None and id(it.paragraph) in para_cell_map
+    }
+    # Link column headers (all header cells strictly above spanning the cell's columns
+    # within the same vertical section) and optional row header (column 0 non-numeric label).
     header_cells = [c for c in semantic_cells if c.is_header]
     row_first_cell: dict[int, SemanticTableCell] = {}
     for c in semantic_cells:
@@ -427,10 +508,12 @@ def build_semantic_table(
             row_first_cell[c.row_index] = c
 
     for cell in semantic_cells:
+        c_sec = cell_section_map.get(cell.cell_id, 0)
         matched_headers = [
             hdr.cell_id
             for hdr in header_cells
-            if hdr.row_index < cell.row_index
+            if cell_section_map.get(hdr.cell_id, 0) == c_sec
+            and hdr.row_index < cell.row_index
             and not (
                 hdr.col_index + hdr.col_span <= cell.col_index
                 or hdr.col_index >= cell.col_index + cell.col_span
@@ -447,6 +530,8 @@ def build_semantic_table(
         if item.paragraph is None:
             continue
         sem_cell = para_cell_map[id(item.paragraph)]
+        sec_idx = item_section_idx.get(id(item), 0)
+        sec_cols = item_section_cols.get(id(item), col_bands)
         if item.paragraph.pipeline_trace is None:
             item.paragraph.pipeline_trace = {}
         trace = item.paragraph.pipeline_trace
@@ -456,6 +541,8 @@ def build_semantic_table(
             "table_coherent": is_coherent,
             "table_confidence": round(confidence, 3),
             "validation_issues": list(issues),
+            "section_index": sec_idx,
+            "section_col_count": len(sec_cols),
         }
         trace["table_id"] = sem_cell.table_id
         trace["cell_id"] = sem_cell.cell_id
@@ -466,17 +553,23 @@ def build_semantic_table(
         trace["is_header"] = sem_cell.is_header
         trace["header_cell_ids"] = list(sem_cell.header_cell_ids)
         trace["table_coherent"] = is_coherent
+        trace["table_section_index"] = sec_idx
         if anchored_numeric:
             trace["anchored_numeric_columns"] = True
-            # Recover usable whitespace to the right of text in a booktabs
-            # column. A midpoint in a genuine gutter cannot consume a value
-            # in the next column. Preserve explicit ruled slots verbatim.
+            # Recover usable whitespace in booktabs gutters up to gutter midpoints
+            # so headers/labels do not stay artificially cramped without touching
+            # numeric values in adjacent columns. Preserve explicit ruled slots verbatim.
             right_col = sem_cell.col_index + sem_cell.col_span - 1
-            if is_coherent and layout_kind not in {"wired", "grouped"} and right_col + 1 < len(col_bands):
-                current_edge = col_bands[right_col][1]
-                next_edge = col_bands[right_col + 1][0]
+            if is_coherent and layout_kind not in {"wired", "grouped"} and right_col + 1 < len(sec_cols):
+                current_edge = sec_cols[right_col][1]
+                next_edge = sec_cols[right_col + 1][0]
                 if next_edge - current_edge > 3.0:
                     trace["anchored_column_right"] = (current_edge + next_edge) / 2.0 - 1.0
+            if is_coherent and layout_kind not in {"wired", "grouped"} and sem_cell.is_header and sem_cell.col_index > 0:
+                prev_edge = sec_cols[sem_cell.col_index - 1][1]
+                cur_left = sec_cols[sem_cell.col_index][0]
+                if cur_left - prev_edge > 3.0:
+                    trace["anchored_column_left"] = (prev_edge + cur_left) / 2.0 + 1.0
         if not is_coherent:
             trace["preserve_irregular_table"] = True
 

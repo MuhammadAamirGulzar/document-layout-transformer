@@ -2723,9 +2723,11 @@ class Typesetting:
         moved = 0
         for paragraph in sorted(valid, key=order_key):
             # Physical table cells, footnotes, bottom footers, and top headers
-            # act as fixed zone obstacles and must never be pushed downward off-page.
+            # act as fixed zone obstacles and must never be pushed downward off-page
+            # or drifted out of row alignment before table-wide clearance runs.
             is_fixed_zone = (
                 self._is_fixed_table_paragraph(paragraph)
+                or self._is_table_cell(paragraph, page)
                 or self._is_bottom_fixed_paragraph(paragraph, page)
                 or self._is_top_band_header(paragraph, page)
             )
@@ -2956,10 +2958,18 @@ class Typesetting:
                     min_width = max(1.0, min(first_box.x2 - first_box.x, second_box.x2 - second_box.x))
                     if horizontal_overlap < min_width * 0.25 or vertical_overlap <= 0.25:
                         continue
-                    # Sibling cells in the same table row stay horizontally aligned; never push one below the other.
+                    # Cells within the same coherent table stay synchronized by row in
+                    # _resolve_table_row_and_body_clearance; never drift single columns here.
                     if self._is_table_cell(first, page) and self._is_table_cell(second, page):
                         t1 = (first.pipeline_trace or {}).get("table_id")
                         t2 = (second.pipeline_trace or {}).get("table_id")
+                        if (
+                            t1
+                            and t1 == t2
+                            and not (first.pipeline_trace or {}).get("preserve_irregular_table")
+                            and not (second.pipeline_trace or {}).get("preserve_irregular_table")
+                        ):
+                            continue
                         l1 = source_lanes.get(id(first))
                         l2 = source_lanes.get(id(second))
                         same_src_row = bool(
@@ -3127,12 +3137,54 @@ class Typesetting:
             tid = str(trace.get("table_id") or "_default_table")
             by_table.setdefault(tid, []).append(cell)
 
+        def _shift_char_vertically(ch: il_version_1.PdfCharacter, down_dy: float) -> None:
+            if ch.box is not None:
+                ch.box.y -= down_dy
+                ch.box.y2 -= down_dy
+            vbox = getattr(getattr(ch, "visual_bbox", None), "box", None)
+            if vbox is not None and vbox is not ch.box:
+                vbox.y -= down_dy
+                vbox.y2 -= down_dy
+
+        page_table_layouts = [
+            ly.box for ly in getattr(page, "page_layout", []) or []
+            if ly.box and (ly.class_name or "").lower() in {"table", "wired_table", "wireless_table"}
+        ]
+        all_page_chars = [
+            ch for ch in getattr(page, "pdf_character", []) or []
+            if ch.box is not None and (ch.char_unicode or "").strip()
+        ]
+
         table_extents: list[tuple[str, float, float, float, float, float]] = []
         table_groups: list[tuple[str, list[il_version_1.PdfParagraph], float, float, float, float, float]] = []
         for tid, cells in by_table.items():
             orig_sboxes = [c.box for c in cells if c.box is not None]
             orig_src_bottom = min((b.y for b in orig_sboxes), default=None)
             orig_src_top = max((b.y2 for b in orig_sboxes), default=None)
+            tb_x0 = min((b.x for b in orig_sboxes), default=0.0)
+            tb_x2 = max((b.x2 for b in orig_sboxes), default=0.0)
+            tb_y0 = orig_src_bottom if orig_src_bottom is not None else 0.0
+            tb_y2 = orig_src_top if orig_src_top is not None else 0.0
+            for lbox in page_table_layouts:
+                if any(
+                    lbox.x - 2.0 <= (b.x + b.x2) * 0.5 <= lbox.x2 + 2.0
+                    and lbox.y - 2.0 <= (b.y + b.y2) * 0.5 <= lbox.y2 + 2.0
+                    for b in orig_sboxes
+                ):
+                    tb_x0 = min(tb_x0, lbox.x)
+                    tb_x2 = max(tb_x2, lbox.x2)
+                    tb_y0 = min(tb_y0, lbox.y)
+                    tb_y2 = max(tb_y2, lbox.y2)
+
+            table_chars = [
+                ch for ch in all_page_chars
+                if tb_x0 - 2.0 <= (ch.box.x + ch.box.x2) * 0.5 <= tb_x2 + 2.0
+                and tb_y0 - 4.0 <= (ch.box.y + ch.box.y2) * 0.5 <= tb_y2 + 4.0
+            ]
+            if table_chars and orig_src_bottom is not None and orig_src_top is not None:
+                orig_src_bottom = min(orig_src_bottom, min(ch.box.y for ch in table_chars))
+                orig_src_top = max(orig_src_top, max(ch.box.y2 for ch in table_chars))
+
             is_irregular_preserved = any(
                 (c.pipeline_trace or {}).get("preserve_irregular_table")
                 for c in cells
@@ -3153,12 +3205,62 @@ class Typesetting:
                         if in_this:
                             row_groups[idx] = in_this
                 ordered_rows = [row_groups[k] for k in sorted(row_groups)]
+                # Map frozen table characters onto their owning row index so
+                # booktabs numeric columns shift vertically in lockstep with row labels.
+                row_bands_src = [
+                    (
+                        min((c.box.y for c in r if c.box), default=0.0),
+                        max((c.box.y2 for c in r if c.box), default=0.0),
+                    )
+                    for r in ordered_rows
+                ]
+                row_chars: list[list[il_version_1.PdfCharacter]] = [[] for _ in ordered_rows]
+                if table_chars and row_bands_src:
+                    for ch in table_chars:
+                        cy = (ch.box.y + ch.box.y2) * 0.5
+                        best_r = min(
+                            range(len(row_bands_src)),
+                            key=lambda ri: (
+                                0.0
+                                if row_bands_src[ri][0] - 1.5 <= cy <= row_bands_src[ri][1] + 1.5
+                                else abs((row_bands_src[ri][0] + row_bands_src[ri][1]) * 0.5 - cy)
+                            ),
+                        )
+                        row_chars[best_r].append(ch)
+
                 for r_idx in range(len(ordered_rows)):
                     cur_row = ordered_rows[r_idx]
+                    # First resolve any intra-slot stacked sub-cells (e.g. rXcY vs rXcY#2)
+                    # inside cur_row so vertically stacked fragments never collide.
+                    if len(cur_row) >= 2:
+                        sorted_cur = sorted(
+                            [c for c in cur_row if c.box is not None],
+                            key=lambda c: (-c.box.y2, c.box.x),
+                        )
+                        for si, upper_c in enumerate(sorted_cur):
+                            ub = self._rendered_text_box(upper_c)
+                            if ub is None:
+                                continue
+                            for lower_c in sorted_cur[si + 1:]:
+                                lb = self._rendered_text_box(lower_c)
+                                if lb is None:
+                                    continue
+                                h_ov_in = max(0.0, min(ub.x2, lb.x2) - max(ub.x, lb.x))
+                                min_w_in = max(1.0, min(ub.x2 - ub.x, lb.x2 - lb.x))
+                                u_col = (upper_c.pipeline_trace or {}).get("col_index")
+                                l_col = (lower_c.pipeline_trace or {}).get("col_index")
+                                same_slot = (u_col is not None and u_col == l_col) or h_ov_in >= min_w_in * 0.30
+                                v_ov_in = max(0.0, min(ub.y2, lb.y2) - max(ub.y, lb.y))
+                                if same_slot and v_ov_in > 0.5:
+                                    sub_shift = max(0.0, lb.y2 - (ub.y - 2.0))
+                                    if sub_shift > 0.25:
+                                        self._shift_rendered_paragraph_vertically(lower_c, sub_shift)
+                                        self._ensure_pipeline_trace(lower_c)["table_row_shifted"] = True
+
                     upper_boxes = [
                         b for c in cur_row
                         if (b := self._rendered_text_box(c)) is not None
-                    ]
+                    ] + [ch.box for ch in row_chars[r_idx] if ch.box is not None]
                     if not upper_boxes:
                         continue
                     upper_bottom = min(b.y for b in upper_boxes)
@@ -3171,42 +3273,41 @@ class Typesetting:
                     lower_boxes = [
                         b for c in ordered_rows[r_idx + 1]
                         if (b := self._rendered_text_box(c)) is not None
-                    ]
+                    ] + [ch.box for ch in row_chars[r_idx + 1] if ch.box is not None]
                     if not lower_boxes:
                         continue
                     lower_top = max(b.y2 for b in lower_boxes)
                     overlap = lower_top - (upper_bottom - 3.0)
                     if overlap > 0.25:
-                        tx0_row = min((c.box.x for c in cells if c.box), default=0.0)
-                        tx2_row = max((c.box.x2 for c in cells if c.box), default=0.0)
-                        for tail_row in ordered_rows[r_idx + 1:]:
-                            for cell in tail_row:
+                        for tail_idx in range(r_idx + 1, len(ordered_rows)):
+                            for cell in ordered_rows[tail_idx]:
                                 self._shift_rendered_paragraph_vertically(cell, overlap)
-                                if cell.box is not None:
-                                    cell.box.y -= overlap
-                                    cell.box.y2 -= overlap
                                 tr = self._ensure_pipeline_trace(cell)
                                 tr["table_row_shifted"] = True
+                            for ch in row_chars[tail_idx]:
+                                _shift_char_vertically(ch, overlap)
                         # Shift horizontal grid rules below upper_bottom downward with the rows
                         if orig_src_bottom is not None:
                             for shape in list(getattr(page, "pdf_curve", None) or []) + list(getattr(page, "pdf_rectangle", None) or []):
                                 sb = getattr(shape, "box", None)
                                 if (
                                     sb is not None
-                                    and sb.x >= tx0_row - 6.0
-                                    and sb.x2 <= tx2_row + 6.0
+                                    and sb.x >= tb_x0 - 6.0
+                                    and sb.x2 <= tb_x2 + 6.0
                                     and (orig_src_bottom - 6.0) <= sb.y <= (lower_top + 4.0)
                                     and (sb.y2 - sb.y) <= 8.0
                                 ):
                                     sb.y -= overlap
                                     sb.y2 -= overlap
 
-            rboxes = [b for c in cells if (b := self._rendered_text_box(c)) is not None]
+            rboxes = [b for c in cells if (b := self._rendered_text_box(c)) is not None] + [
+                ch.box for ch in table_chars if ch.box is not None
+            ]
             sboxes = [c.box for c in cells if c.box is not None]
             if rboxes and sboxes and orig_src_bottom is not None and orig_src_top is not None:
-                tx0 = min(min(b.x for b in rboxes), min(b.x for b in sboxes))
+                tx0 = min(min(b.x for b in rboxes), min(b.x for b in sboxes), tb_x0)
                 r_bottom = min(b.y for b in rboxes)
-                tx2 = max(max(b.x2 for b in rboxes), max(b.x2 for b in sboxes))
+                tx2 = max(max(b.x2 for b in rboxes), max(b.x2 for b in sboxes), tb_x2)
                 r_top = max(b.y2 for b in rboxes)
                 table_groups.append((tid, cells, tx0, r_bottom, tx2, orig_src_bottom, r_top, orig_src_top))
 
@@ -6029,15 +6130,22 @@ class Typesetting:
             rbox = rendered_map.get(id(cell))
             if rbox is None or cell.box is None:
                 continue
-            is_fixed_slot = (
-                "fixed" in (cell.layout_label or "").lower()
-                or trace.get("anchored_numeric_columns")
-            )
-            overflow_detected = is_fixed_slot and (
-                rbox.x < cell.box.x - 1.5
-                or rbox.x2 > cell.box.x2 + 1.5
-                or rbox.y < cell.box.y - 1.5
-                or rbox.y2 > cell.box.y2 + 1.5
+            is_fixed_slot = "fixed" in (cell.layout_label or "").lower()
+            is_anchored_booktabs = bool(trace.get("anchored_numeric_columns")) and not is_fixed_slot
+            # For anchored unruled booktabs cells, allow vertical row growth (already synchronized
+            # across the row by _resolve_table_row_and_body_clearance) while guarding horizontal gutters.
+            overflow_detected = (
+                is_fixed_slot and (
+                    rbox.x < cell.box.x - 1.5
+                    or rbox.x2 > cell.box.x2 + 1.5
+                    or rbox.y < cell.box.y - 1.5
+                    or rbox.y2 > cell.box.y2 + 1.5
+                )
+            ) or (
+                is_anchored_booktabs and (
+                    rbox.x < cell.box.x - 1.5
+                    or rbox.x2 > cell.box.x2 + 1.5
+                )
             )
             if overflow_detected:
                 p_trace = self._ensure_pipeline_trace(cell)
@@ -6203,17 +6311,39 @@ class Typesetting:
         for cell in page.pdf_paragraph or []:
             trace = cell.pipeline_trace or {}
             right_edge = trace.get("anchored_column_right")
+            left_edge = trace.get("anchored_column_left")
             if cell.box is not None and right_edge is not None:
                 cell.box.x2 = max(cell.box.x2, right_edge)
+            if cell.box is not None and left_edge is not None:
+                cell.box.x = min(cell.box.x, left_edge)
+        page_chars = [
+            ch for ch in getattr(page, "pdf_character", []) or []
+            if ch.box is not None and (ch.char_unicode or "").strip()
+        ]
         rows = self._cluster_table_cells_into_rows(page)
         for row in rows:
             if any(
                 "fixed_rtl" in (cell.layout_label or "").lower()
                 or (cell.pipeline_trace or {}).get("preserve_irregular_table")
-                or (cell.pipeline_trace or {}).get("anchored_numeric_columns")
                 for cell in row
             ):
                 continue
+            row_ys = [c.box.y for c in row if c.box] + [c.box.y2 for c in row if c.box]
+            row_xs = [c.box.x for c in row if c.box] + [c.box.x2 for c in row if c.box]
+            if any((cell.pipeline_trace or {}).get("anchored_numeric_columns") for cell in row):
+                # Do not horizontally shift cells on rows containing frozen numeric glyphs;
+                # header/non-numeric rows without frozen glyphs may share empty gutter slack.
+                if not row_ys or not row_xs:
+                    continue
+                r_y0, r_y2 = min(row_ys) - 1.5, max(row_ys) + 1.5
+                r_x0, r_x2 = min(row_xs) - 4.0, max(row_xs) + 4.0
+                has_row_chars = any(
+                    r_x0 <= (ch.box.x + ch.box.x2) * 0.5 <= r_x2
+                    and r_y0 <= (ch.box.y + ch.box.y2) * 0.5 <= r_y2
+                    for ch in page_chars
+                )
+                if has_row_chars or not all((c.pipeline_trace or {}).get("is_header") for c in row):
+                    continue
             if len(row) < 2:
                 continue
 

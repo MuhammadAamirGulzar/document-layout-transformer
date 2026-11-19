@@ -1191,6 +1191,10 @@ class ParagraphFinder:
                 ):
                     horizontal_rules.append(box)
             if len(vertical_rules) < 2:
+                # Split any table row where unruled column gutters were collapsed into
+                # one horizontal line BEFORE isolating numeric values or indexing cells.
+                if len(horizontal_rules) >= 1 and not self.translation_config.ocr_workaround:
+                    self._split_unruled_table_collapsed_cells(paragraphs, table_box)
                 # Three-line ("booktabs") tables have horizontal rules only.
                 # There is no grid to rebuild, but each isolated number must
                 # still stay in its original row and column rather than be
@@ -1523,6 +1527,109 @@ class ParagraphFinder:
                 boundaries.append(cut)
         boundaries.append(cell.x2)
         return [Box(x, cell.y, x2, cell.y2) for x, x2 in zip(boundaries, boundaries[1:])]
+
+    def _split_unruled_table_collapsed_cells(
+        self, paragraphs: list[PdfParagraph], table_box: Box
+    ) -> None:
+        """Split table rows collapsed along wide column gutters in unruled/booktabs tables."""
+        new_paragraphs: list[PdfParagraph] = []
+        changed = False
+        for paragraph in paragraphs:
+            box = paragraph.box
+            compositions = paragraph.pdf_paragraph_composition or []
+            if (
+                not box
+                or not (table_box.x - 2.0 <= box.x and box.x2 <= table_box.x2 + 2.0)
+                or not (table_box.y - 2.0 <= box.y and box.y2 <= table_box.y2 + 2.0)
+                or len(compositions) != 1
+                or not compositions[0].pdf_line
+            ):
+                new_paragraphs.append(paragraph)
+                continue
+
+            line = compositions[0].pdf_line
+            all_chars = list(line.pdf_character or [])
+
+            def _cbox(ch: PdfCharacter) -> Box | None:
+                return ch.visual_bbox.box if ch.visual_bbox and ch.visual_bbox.box else ch.box
+
+            non_space = [
+                ch
+                for ch in all_chars
+                if (ch.char_unicode or "").strip() and _cbox(ch) is not None
+            ]
+            if len(non_space) < 2:
+                new_paragraphs.append(paragraph)
+                continue
+
+            non_space.sort(key=lambda ch: _cbox(ch).x)
+            line_h = max(6.0, float(box.y2 - box.y))
+            pos_gaps = [
+                _cbox(non_space[i + 1]).x - _cbox(non_space[i]).x2
+                for i in range(len(non_space) - 1)
+            ]
+            word_gaps = [g for g in pos_gaps if 1.2 <= g <= line_h * 0.72]
+            baseline_word_gap = (
+                sorted(word_gaps)[len(word_gaps) // 2] if word_gaps else line_h * 0.28
+            )
+            gutter_thresh = max(10.0, line_h * 1.15, baseline_word_gap * 2.8)
+
+            split_indices = [
+                i + 1 for i, g in enumerate(pos_gaps) if g >= gutter_thresh
+            ]
+            if not split_indices:
+                new_paragraphs.append(paragraph)
+                continue
+
+            bounds = [0, *split_indices, len(non_space)]
+            # Keep original space/dummy chars whose X falls inside each chunk's X-span
+            chunks: list[list[PdfCharacter]] = []
+            for k in range(len(bounds) - 1):
+                seg_ns = non_space[bounds[k] : bounds[k + 1]]
+                span_x0 = min(_cbox(c).x for c in seg_ns)
+                span_x2 = max(_cbox(c).x2 for c in seg_ns)
+                seg_all = [
+                    ch
+                    for ch in all_chars
+                    if _cbox(ch) is not None
+                    and span_x0 - 0.5 <= (_cbox(ch).x + _cbox(ch).x2) * 0.5 <= span_x2 + 0.5
+                ]
+                chunks.append(seg_all or seg_ns)
+            chunk_texts = [get_char_unicode_string(chunk).strip() for chunk in chunks]
+            if any(not txt for txt in chunk_texts):
+                new_paragraphs.append(paragraph)
+                continue
+
+            has_numeric_chunk = any(NUMERIC_PATTERN.fullmatch(txt) for txt in chunk_texts)
+            all_concise_cells = all(len(txt.split()) <= 5 for txt in chunk_texts) and all(
+                pos_gaps[idx - 1] >= max(11.0, baseline_word_gap * 3.0)
+                for idx in split_indices
+            )
+            if not (has_numeric_chunk or all_concise_cells):
+                new_paragraphs.append(paragraph)
+                continue
+
+            changed = True
+            for chunk in chunks:
+                line_comp = self.create_line(chunk)
+                c_boxes = [_cbox(c) for c in chunk if _cbox(c) is not None]
+                sub_para = PdfParagraph(
+                    box=Box(
+                        min(b.x for b in c_boxes),
+                        min(b.y for b in c_boxes),
+                        max(b.x2 for b in c_boxes),
+                        max(b.y2 for b in c_boxes),
+                    ),
+                    pdf_paragraph_composition=[line_comp],
+                    layout_label="table_cell",
+                    xobj_id=getattr(paragraph, "xobj_id", 0),
+                    debug_id=generate_base58_id(),
+                )
+                self.update_paragraph_data(sub_para, update_unicode=True)
+                new_paragraphs.append(sub_para)
+
+        if changed:
+            paragraphs[:] = new_paragraphs
 
     def _preserve_numeric_table_values(
         self, page: Page, paragraphs: list[PdfParagraph], table_box: Box
