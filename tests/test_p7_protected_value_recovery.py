@@ -419,3 +419,97 @@ def test_single_sentence_multi_clause_partial_and_full_clause_recovery_preserve_
     assert engine_f.incomplete_count == 0
     assert engine_f.source_spans_retained_count == 0
     cache_f.set.assert_called_once_with(src, out_f)
+
+
+def test_standard_dotted_code_and_written_percentage_recover_arabic_without_weakening_checks(
+    monkeypatch,
+):
+    """1) Standard letter-dot-number codes (F.748.57, [ITU-T F.748.56], GC.18/INF/4)
+       protect atomically so valid Arabic is accepted instead of failing left-dot lookup.
+    2) Written percentages ('60 per cent') accept valid Arabic '60٪' / '60 في المائة',
+       and clause recovery salvages comma-separated numeric clauses.
+    3) Control: a plausible Arabic sentence that attaches a number to the wrong
+       entity/unit (e.g. moving '%' from 60 onto 25 or swapping quantities) is still rejected."""
+    from babeldoc.format.pdf.document_il.utils.structured_tokens import (
+        protect_structured_tokens,
+        protected_value_count,
+    )
+
+    # 1) Standard dotted code & slash-document-code protection & exact validation
+    itu_src = (
+        "Recommendation ITU-T F.748.57 establishes a framework of technical requirements "
+        "referenced in [ITU-T F.748.56] and document GC.18/Res.9."
+    )
+    itu_prot, itu_map = protect_structured_tokens(itu_src)
+    assert "F.748.57" in itu_map.values()
+    assert "F.748.56" in itu_map.values()
+    assert "GC.18/Res.9" in itu_map.values()
+    assert "748.57" not in itu_map.values()
+
+    itu_ar = (
+        "تضع التوصية ITU-T F.748.57 إطاراً للمتطلبات التقنية "
+        "المشار إليها في [ITU-T F.748.56] والوثيقة GC.18/Res.9."
+    )
+    engine_itu, cache_itu = _nllb_with_cache(monkeypatch, itu_ar, lambda _s: itu_ar)
+    out_itu = engine_itu.translate(itu_src)
+    assert "ITU-T F.748.57" in out_itu
+    assert "[ITU-T F.748.56]" in out_itu
+    assert "GC.18/Res.9" in out_itu
+    assert "تضع التوصية" in out_itu
+    assert engine_itu.incomplete_count == 0
+    cache_itu.set.assert_called_once()
+
+    # 2) Written percentage ('60 per cent') accepted as Arabic '60٪' / '60 في المائة',
+    #    and multi-clause numeric sentence recovers cleanly via clause split when initial drops 25.
+    un_src = (
+        "49. Of the 25 United Nations entities that responded to the question about specific "
+        "country strategies, 15 entities (60 per cent) indicated that they had a strategy."
+    )
+    _, un_map = protect_structured_tokens(un_src)
+    assert "60 per cent" in un_map.values()
+    assert protected_value_count("أشارت 15 كيانات (60٪) إلى وجود استراتيجية.", "60 per cent") == 1
+    assert protected_value_count("أشارت 15 كيانات (60 في المائة) إلى وجود استراتيجية.", "60 per cent") == 1
+    # Dropping the percent unit must NOT satisfy "60 per cent"
+    assert protected_value_count("أشارت 15 كيانات (60) إلى وجود استراتيجية.", "60 per cent") == 0
+
+    dropped_first = "49. من بين كيانات الأمم المتحدة التي أجابت، أشارت 15 كيانات (60٪) إلى وجود استراتيجية."
+
+    def clause_retry(seg: str) -> str:
+        if "United Nations entities" in seg and "indicated" in seg:
+            return dropped_first
+        if "United Nations entities" in seg:
+            return (
+                "من بين 25 كياناً من كيانات الأمم المتحدة التي أجابت عن السؤال حول استراتيجيات البلدان"
+                if "25" in seg
+                else "من بين {0} كياناً من كيانات الأمم المتحدة التي أجابت عن السؤال حول استراتيجيات البلدان"
+            )
+        if "indicated" in seg:
+            return (
+                "أشارت 15 كياناً (60٪) إلى أن لديها استراتيجية."
+                if "15" in seg
+                else "أشارت {0} كياناً (60٪) إلى أن لديها استراتيجية."
+            )
+        return dropped_first
+
+    engine_un, cache_un = _nllb_with_cache(monkeypatch, dropped_first, clause_retry)
+    out_un = engine_un.translate(un_src)
+    assert "25 كياناً" in out_un
+    assert "15 كياناً (60٪)" in out_un
+    assert "Of the 25" not in out_un
+    assert engine_un.incomplete_count == 0
+    cache_un.set.assert_called_once()
+
+    # 3) Control: plausible Arabic attaching '%' / quantity to the WRONG entity must be rejected
+    #    (attaches '%' to 25 and leaves 60 bare as a plain count, mis-binding both values).
+    wrong_entity_ar = (
+        "49. من بين 25٪ من كيانات الأمم المتحدة التي أجابت عن الاستراتيجيات، "
+        "أشارت 15 كياناً (60 كياناً) إلى وجود استراتيجية."
+    )
+    engine_bad, cache_bad = _nllb_with_cache(
+        monkeypatch, wrong_entity_ar, lambda _s: wrong_entity_ar
+    )
+    out_bad = engine_bad.translate(un_src)
+    assert out_bad == un_src
+    assert "25٪" not in out_bad
+    assert engine_bad.incomplete_count == 1
+    cache_bad.set.assert_not_called()

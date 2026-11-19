@@ -879,6 +879,7 @@ class BaseTranslator(ABC):
         r"[;:\u2014\u2013]\s+"
         r"|,\s+(?=(?:however|while|whereas|and|or|but|which|where|including|such\s+as|after|before|although|because|if|when|"
         r"economic|financial|growth|inflation|output|support|processed|ended|began|an?\b|the\b)\b)"
+        r"|(?<!\d),\s+(?=\d+\s+[A-Za-z])"
         r"|(?<!\ba)\s+(?=(?:while|whereas|although|because)\s+[A-Za-z])"
         r")",
         re.IGNORECASE,

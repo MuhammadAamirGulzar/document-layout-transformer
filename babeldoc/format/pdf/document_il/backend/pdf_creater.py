@@ -952,29 +952,110 @@ class PDFCreater:
                 except Exception:
                     logger.debug("Failed to initialize resources on continuation page %s", idx)
 
+    @staticmethod
+    def _resolve_original_source_pages(
+        docs_pages: list[il_version_1.Page],
+    ) -> list[int | None]:
+        """Return each IL page's true 0-based original source page index, or None for continuations."""
+        resolved: list[int | None] = []
+        prior_continuations = 0
+        orig_cursor = 0
+        for il_page in docs_pages:
+            if getattr(il_page, "continuation_of_page", None) is not None:
+                resolved.append(None)
+                prior_continuations += 1
+                continue
+            src_num = getattr(il_page, "source_page_number", None)
+            if src_num is not None:
+                orig_idx = int(src_num)
+            elif getattr(il_page, "page_number", None) is not None:
+                orig_idx = int(il_page.page_number) - prior_continuations
+            else:
+                orig_idx = orig_cursor
+            resolved.append(orig_idx)
+            orig_cursor += 1
+        return resolved
+
+    @staticmethod
+    def _resolve_continuation_owners(
+        docs_pages: list[il_version_1.Page],
+        orig_source_pages: list[int | None],
+    ) -> list[int | None]:
+        """Return the owning original 0-based source page for every IL page (including continuations)."""
+        shifted_to_orig: dict[int, int] = {}
+        owners: list[int | None] = []
+        last_orig: int | None = None
+        for il_page, orig_idx in zip(docs_pages, orig_source_pages):
+            if orig_idx is not None:
+                if getattr(il_page, "page_number", None) is not None:
+                    shifted_to_orig[int(il_page.page_number)] = orig_idx
+                last_orig = orig_idx
+                owners.append(orig_idx)
+            else:
+                cont_ref = getattr(il_page, "continuation_of_page", None)
+                owner = shifted_to_orig.get(cont_ref) if cont_ref is not None else None
+                if owner is None:
+                    owner = last_orig if last_orig is not None else cont_ref
+                owners.append(owner)
+        return owners
+
     def _aligned_dual_page_pairs(
         self,
         original_count: int,
         translated_count: int,
+        selected_pages: list[int] | None = None,
     ) -> list[tuple[int | None, int]]:
         """Map translated page indices (including continuation pages) to original page indices."""
         docs = getattr(self, "docs", None)
-        if not docs or not docs.page or len(docs.page) != translated_count:
+        docs_pages = list(docs.page) if docs and docs.page else []
+        if not docs_pages:
             total = max(original_count, translated_count)
             return [
                 (i if i < original_count else None, i)
                 for i in range(translated_count)
             ] if total else []
 
-        pairs: list[tuple[int | None, int]] = []
-        orig_cursor = 0
-        for trans_idx, il_page in enumerate(docs.page):
-            if getattr(il_page, "continuation_of_page", None) is not None:
-                pairs.append((None, trans_idx))
+        orig_source_pages = self._resolve_original_source_pages(docs_pages)
+        if len(docs_pages) != translated_count:
+            if selected_pages is not None:
+                selected_set = set(selected_pages)
+                owners = self._resolve_continuation_owners(docs_pages, orig_source_pages)
+                kept_origs = [
+                    orig_idx
+                    for orig_idx, owner in zip(orig_source_pages, owners)
+                    if owner in selected_set
+                ]
+                if len(kept_origs) != translated_count:
+                    raise ValueError(
+                        "Selected dual-page mapping does not cover every translated page"
+                    )
             else:
-                orig_idx = orig_cursor if orig_cursor < original_count else None
-                pairs.append((orig_idx, trans_idx))
-                orig_cursor += 1
+                total = max(original_count, translated_count)
+                return [
+                    (i if i < original_count else None, i)
+                    for i in range(translated_count)
+                ] if total else []
+        else:
+            kept_origs = orig_source_pages
+
+        orig_index_map = (
+            {orig_pno: pos for pos, orig_pno in enumerate(selected_pages)}
+            if selected_pages is not None
+            else None
+        )
+        pairs: list[tuple[int | None, int]] = []
+        for trans_idx, orig_idx in enumerate(kept_origs):
+            if orig_idx is None:
+                pairs.append((None, trans_idx))
+            elif orig_index_map is not None:
+                mapped = orig_index_map.get(orig_idx)
+                if mapped is None or mapped >= original_count:
+                    raise ValueError(
+                        f"Translated page {trans_idx} references unselected source page {orig_idx}"
+                    )
+                pairs.append((mapped, trans_idx))
+            else:
+                pairs.append((orig_idx if 0 <= orig_idx < original_count else None, trans_idx))
         return pairs
 
     def create_side_by_side_dual_pdf(
@@ -1084,38 +1165,10 @@ class PDFCreater:
             if selected_pages is not None:
                 original_pdf.select(selected_pages)
             aligned_pairs = self._aligned_dual_page_pairs(
-                original_pdf.page_count, translated_pdf.page_count,
+                original_pdf.page_count,
+                translated_pdf.page_count,
+                selected_pages=selected_pages,
             )
-            docs = getattr(self, "docs", None)
-            if selected_pages is not None and docs is not None and len(docs.page) != translated_pdf.page_count and any(
-                getattr(p, "continuation_of_page", None) is not None
-                for p in (docs.page or [])
-            ):
-                selected_set = set(selected_pages)
-                kept_trans = []
-                for idx, il_page in enumerate(docs.page):
-                    src_orig = (
-                        il_page.continuation_of_page
-                        if il_page.continuation_of_page is not None
-                        else idx - sum(
-                            1
-                            for prev in docs.page[:idx]
-                            if getattr(prev, "continuation_of_page", None) is not None
-                        )
-                    )
-                    if src_orig in selected_set:
-                        kept_trans.append(il_page)
-                aligned_pairs = []
-                orig_cursor = 0
-                for trans_idx, il_page in enumerate(kept_trans):
-                    if getattr(il_page, "continuation_of_page", None) is not None:
-                        aligned_pairs.append((None, trans_idx))
-                    else:
-                        orig_idx = orig_cursor if orig_cursor < original_pdf.page_count else None
-                        aligned_pairs.append((orig_idx, trans_idx))
-                        orig_cursor += 1
-                if len(aligned_pairs) != translated_pdf.page_count:
-                    raise ValueError("Selected dual-page mapping does not cover every translated page")
             if translation_config.use_alternating_pages_dual:
                 return self.create_alternating_pages_dual_pdf(
                     original_pdf, translated_pdf, translation_config,
@@ -1154,7 +1207,10 @@ class PDFCreater:
         if (
             original_pdf.page_count == translated_pdf.page_count
             and len(pairs) == original_pdf.page_count
-            and all(orig_id is not None for orig_id, _ in pairs)
+            and all(
+                orig_id == idx and trans_id == idx
+                for idx, (orig_id, trans_id) in enumerate(pairs)
+            )
         ):
             # Fast path when page counts match 1:1
             dual = original_pdf
@@ -1598,26 +1654,28 @@ class PDFCreater:
             if translation_config.only_include_translated_page:
                 selected_orig_pages: list[int] = []
                 selected_trans_pages: list[int] = []
+                docs_pages = list(self.docs.page or [])
+                orig_source_pages = self._resolve_original_source_pages(docs_pages)
+                page_owners = self._resolve_continuation_owners(docs_pages, orig_source_pages)
                 docs_have_gaps = any(
-                    getattr(p, "continuation_of_page", None) is None
-                    and p.page_number != idx
-                    for idx, p in enumerate(self.docs.page)
+                    orig_idx is not None and orig_idx != seq_idx
+                    for seq_idx, orig_idx in enumerate(
+                        [o for o in orig_source_pages if o is not None]
+                    )
                 )
-                orig_cursor = 0
-                for page in self.docs.page:
-                    if getattr(page, "continuation_of_page", None) is not None:
-                        src_orig = page.continuation_of_page
-                        if docs_have_gaps or self.translation_config.should_translate_page(src_orig + 1):
+                for page, orig_idx, owner_orig in zip(docs_pages, orig_source_pages, page_owners):
+                    if orig_idx is None:
+                        if owner_orig is not None and (
+                            docs_have_gaps or self.translation_config.should_translate_page(owner_orig + 1)
+                        ):
                             if 0 <= page.page_number < pdf.page_count:
                                 selected_trans_pages.append(page.page_number)
                     else:
-                        orig_idx = page.page_number if docs_have_gaps else orig_cursor
                         if docs_have_gaps or self.translation_config.should_translate_page(orig_idx + 1):
                             if 0 <= orig_idx < pdf.page_count:
                                 selected_orig_pages.append(orig_idx)
                             if 0 <= page.page_number < pdf.page_count:
                                 selected_trans_pages.append(page.page_number)
-                        orig_cursor += 1
                 selected_pages = sorted(set(selected_orig_pages))
                 if selected_trans_pages:
                     pdf.select(sorted(set(selected_trans_pages)))

@@ -3763,6 +3763,16 @@ class Typesetting:
         if not document.page:
             return 0
 
+        # Preserve each original page's immutable 0-based source index before
+        # continuation insertion shifts page_number for translated output.
+        for src_page in document.page:
+            if (
+                getattr(src_page, "continuation_of_page", None) is None
+                and getattr(src_page, "source_page_number", None) is None
+                and getattr(src_page, "page_number", None) is not None
+            ):
+                src_page.source_page_number = src_page.page_number
+
         new_pages: list[il_version_1.Page] = []
         created_continuations = 0
         max_continuations_per_page = 10

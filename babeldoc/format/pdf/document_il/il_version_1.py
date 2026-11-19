@@ -1312,6 +1312,12 @@ class Page:
             "type": "Ignore",
         },
     )
+    source_page_number: int | None = field(
+        default=None,
+        metadata={
+            "type": "Ignore",
+        },
+    )
 
 
 @dataclass(slots=True)

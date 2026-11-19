@@ -1229,7 +1229,15 @@ class ILTranslator:
         # A percent escape in a literal URI is unrelated to a numeric percent.
         text, urls = stash_web_references(text)
 
-        # 1. Normalize percent signs: replace Western % with Arabic ٪
+        # 1. Normalize percent signs: convert restored English "60 per cent" to Arabic ٪
+        # when the block contains Arabic prose, and replace Western % with Arabic ٪.
+        if re.search(r"[\u0600-\u06FF]", text):
+            text = re.sub(
+                r"(?<![A-Za-z0-9_.])([+\-\u2212]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?)\s*(?:per[ \t]+cent|percent)\b",
+                r"\1%",
+                text,
+                flags=re.IGNORECASE,
+            )
         text = text.replace('%', '\u066A')  # U+066A = Arabic percent sign ٪
 
         # 2. Fix stray periods around percent signs (e.g. "8.6 .٪" -> "8.6٪.", ".٪ 8.6" -> "8.6٪.")

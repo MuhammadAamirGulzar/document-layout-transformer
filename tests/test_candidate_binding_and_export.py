@@ -127,3 +127,128 @@ def test_overlapping_table_notes_are_reflowed_instead_of_treated_as_fixed_cells(
     assert not ts._is_table_cell(first, page)
     ts._resolve_rendered_text_collisions(page)
     assert ts._rendered_text_box(second).y2 <= ts._rendered_text_box(first).y - 2.0
+
+
+def test_selected_gap_dual_pdf_pairs_true_source_pages_with_continuations(tmp_path):
+    """Selection 3,14-16 with continuations after 15 and 16 must pair English sides
+    [3, 14, 15, blank, 16, blank] in the saved dual PDF — never pulling source page 17."""
+    source_path = tmp_path / "source.pdf"
+    dual_path = tmp_path / "dual.pdf"
+    with pymupdf.open() as src:
+        for pno in range(1, 19):
+            src.new_page(width=400, height=500).insert_text((30, 50), f"SRC_PAGE_{pno}")
+        src.save(source_path)
+
+    # Simulate sparse selected pages [3, 14, 15, 16] (0-based 2, 13, 14, 15) AFTER
+    # _paginate_overflowing_pages inserted continuations after 15 and 16:
+    # page 16 (source_page_number=15) shifted to page_number=16!
+    docs_pages = [
+        Page(page_number=2, source_page_number=2),
+        Page(page_number=13, source_page_number=13),
+        Page(page_number=14, source_page_number=14),
+        Page(page_number=15, continuation_of_page=14),
+        Page(page_number=16, source_page_number=15),
+        Page(page_number=17, continuation_of_page=16),
+    ]
+    creator = object.__new__(PDFCreater)
+    creator.original_pdf_path = source_path
+    creator.docs = SimpleNamespace(page=docs_pages)
+    cfg = SimpleNamespace(use_alternating_pages_dual=False, dual_translate_first=False)
+
+    # Mirror write_pdf's selection logic using _resolve_original_source_pages
+    orig_resolved = creator._resolve_original_source_pages(docs_pages)
+    selected_pages = sorted({o for o in orig_resolved if o is not None})
+    assert selected_pages == [2, 13, 14, 15]
+
+    trans_labels = [
+        "AR_TRANS_3",
+        "AR_TRANS_14",
+        "AR_TRANS_15",
+        "AR_CONT_15",
+        "AR_TRANS_16",
+        "AR_CONT_16",
+    ]
+    with pymupdf.open() as translated:
+        for lbl in trans_labels:
+            translated.new_page(width=400, height=500).insert_text((30, 50), lbl)
+        with creator._create_dual_pdf(translated, dual_path, cfg, selected_pages) as dual:
+            dual.save(dual_path)
+
+    with pymupdf.open(dual_path) as saved:
+        assert saved.page_count == 6
+        expected = [
+            ("SRC_PAGE_3", "AR_TRANS_3"),
+            ("SRC_PAGE_14", "AR_TRANS_14"),
+            ("SRC_PAGE_15", "AR_TRANS_15"),
+            ("", "AR_CONT_15"),
+            ("SRC_PAGE_16", "AR_TRANS_16"),
+            ("", "AR_CONT_16"),
+        ]
+        for idx, (exp_en, exp_ar) in enumerate(expected):
+            pg = saved[idx]
+            mid_x = pg.rect.width / 2.0
+            left_txt = pg.get_text("text", clip=pymupdf.Rect(0, 0, mid_x, pg.rect.height)).strip()
+            right_txt = pg.get_text("text", clip=pymupdf.Rect(mid_x, 0, pg.rect.width, pg.rect.height)).strip()
+            assert left_txt == exp_en, f"Dual page {idx + 1} left={left_txt!r} expected={exp_en!r}"
+            assert right_txt == exp_ar, f"Dual page {idx + 1} right={right_txt!r} expected={exp_ar!r}"
+        # Confirm source page 17 never leaked into the dual PDF
+        full_text = "\n".join(p.get_text() for p in saved)
+        assert "SRC_PAGE_17" not in full_text
+
+
+def test_mixed_arabic_quantities_keep_unit_sign_and_parentheses_across_wrap():
+    """Verify visible per-line glyph order and proximity in mixed Arabic prose
+    with currencies, percentages, Arabic basis points, minus sign, and accounting
+    parentheses — both unwrapped and across line wraps."""
+    from babeldoc.format.pdf.document_il.midend.typesetting import Typesetting
+
+    def _layout_visual_lines(text: str, width: float) -> list[str]:
+        ts = object.__new__(Typesetting)
+        ts.translation_config = SimpleNamespace(lang_out="ar")
+        ts.font_mapper = SimpleNamespace(base_font=SimpleNamespace(char_lengths=lambda t, s: [6]))
+        units = [TypesettingUnit(char=source_character(ch, 0)) for ch in text]
+        box = Box(x=0, y=0, x2=width, y2=240)
+        placed, _ = ts._layout_typesetting_units(
+            units, box, scale=1.0, line_skip=1.2, paragraph=_make_rendered_cell("x", box, 0, 0, label="plain text")
+        )
+        by_y: dict[float, list[tuple[float, str]]] = {}
+        for u in placed:
+            for ch in u.render()[0]:
+                by_y.setdefault(round(ch.box.y, 1), []).append((ch.box.x, ch.char_unicode))
+        return [
+            "".join(c for _, c in sorted(chars, key=lambda item: item[0]))
+            for _y, chars in sorted(by_y.items(), reverse=True)
+        ]
+
+    mixed = (
+        "قيم المراجعة: EUR 4,560.20 · $8.4M · 14 bn · 0.75٪ · "
+        "32 نقطة أساس · −€82.50 · (€82.50)"
+    )
+    isolated = isolate_ltr_structured_spans(mixed)
+    # Idempotency check
+    assert isolate_ltr_structured_spans(isolated) == isolated
+
+    # 1) Single wide line
+    wide_lines = _layout_visual_lines(isolated, width=1000.0)
+    assert len(wide_lines) == 1
+    wide = wide_lines[0]
+    # In visual LTR order for an RTL Arabic line, "32 نقطة أساس" displays with
+    # Arabic "ساسأ ةطقن" immediately to the left of "32" (no other quantity between them!).
+    assert "ساسأ ةطقن 32" in wide
+    # Minus sign stays attached to the left of €82.50, distinct from balanced (€82.50)
+    assert "−€82.50" in wide
+    assert "(€82.50)" in wide
+    assert "(€82.50 · (€82.50" not in wide
+    assert "$8.4M" in wide
+    assert "EUR 4,560.20" in wide
+    assert "14 bn" in wide
+    assert "0.75٪" in wide
+
+    # 2) Wrapped narrow line: 32 must stay on the SAME line immediately next to نقطة أساس,
+    # and −€82.50 vs (€82.50) must each remain intact without breaking or mirroring parens.
+    wrapped_lines = _layout_visual_lines(isolated, width=220.0)
+    assert len(wrapped_lines) >= 3
+    assert any("ساسأ ةطقن 32" in ln for ln in wrapped_lines), wrapped_lines
+    assert any("−€82.50" in ln for ln in wrapped_lines), wrapped_lines
+    assert any("(€82.50)" in ln for ln in wrapped_lines), wrapped_lines
+    assert any("$8.4M" in ln for ln in wrapped_lines), wrapped_lines

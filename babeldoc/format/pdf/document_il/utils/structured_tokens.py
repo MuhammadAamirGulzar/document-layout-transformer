@@ -81,8 +81,19 @@ QUANTITY_PATTERN = (
     rf"|\d+(?:\.\d+)?[ \t]+(?:bn|mn)"
     rf"|{_QUANTITY_NUMBER}[ \t]+(?:bps|BPS|basis[ \t]+points?|(?:نقطة|نقاط)[ \t]+أساس))(?!\w|\.\d)"
 )
+_PAREN_QUANTITY_PATTERN = (
+    rf"\([ \t]*[+\-−]?(?:{_CURRENCY}[ \t]*[+\-−]?[ \t]*{_QUANTITY_NUMBER}"
+    rf"|{_QUANTITY_NUMBER}[ \t]*{_CURRENCY})[ \t]*\)"
+)
+_SLASH_CODE_PATTERN = (
+    r"\b(?=[A-Za-z0-9./\-]*\d)[A-Z][A-Z0-9.]{0,8}(?:/[A-Za-z0-9.\-]+){1,}\b"
+)
+_STANDARD_CODE_PATTERN = (
+    r"\b[A-Z][A-Za-z]{0,4}\.\d+(?:\.\d+)*(?:-[A-Z][A-Za-z]{0,4}\.\d+(?:\.\d+)*)?\b"
+)
 PERCENT_VALUE_RE = re.compile(
-    r"^([+\-\u2212]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?:[eE][+\-]?\d+)?)\s*([%\u066A])$"
+    r"^([+\-\u2212]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?:[eE][+\-]?\d+)?)\s*([%\u066A]|per[ \t]+cent|percent)$",
+    re.IGNORECASE,
 )
 UNIT_VALUE_RE = re.compile(
     rf"^([+\-\u2212]?(?:\d{{1,3}}(?:,\d{{3}})+|\d+)(?:\.\d+)?)\s*({_MEASUREMENT_UNITS})$"
@@ -119,7 +130,8 @@ STRUCTURED_TOKEN_PATTERN = re.compile(
     r'(?:[.-][0-9]{1,6})*(?!\w|[-\u2010\u2011]\w|\.\d))|'
     # Statistical p-values and R² expressions
     r'(\b[pP]\s*(?:<=|>=|[<>≤≥=])\s*0?\.\d+\b|\bR[²2]\s*=\s*\d+(?:\.\d+)?\b)|'
-    r'(\b[A-Z]{1,6}(?:/[A-Z0-9.\-]+){2,}\b)|'
+    rf'({_SLASH_CODE_PATTERN})|'
+    rf'({_STANDARD_CODE_PATTERN})|'
     r'(\[\s*\d{1,3}(?:\s*[,\u2013\u2014-]\s*\d{1,3})*\s*\])|'
     rf"({AUTHOR_YEAR_CITATION.pattern})|"
     # Parenthetical mixed tokens
@@ -162,7 +174,7 @@ STRUCTURED_TOKEN_PATTERN = re.compile(
     # European (1.234,56), South Asian (1,25,000), magnitude (1.2M), and standard numbers / percentages
     r'((?<![A-Za-z0-9_.])[+\-\u2212]?(?:\d{1,3}(?:\.\d{3})+,\d+|\d{1,2}(?:,\d{2})+,\d{3}(?:\.\d+)?)(?![A-Za-z0-9_])(?!\.\d))|'
     r'((?<![A-Za-z0-9_.])[+\-\u2212]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?[KMBT](?![A-Za-z0-9_]))|'
-    r'((?<![A-Za-z0-9_.])[+\-\u2212]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?:\s*[%\u066A])?(?!\w)(?!\.\d))|'
+    r'((?<![A-Za-z0-9_.])[+\-\u2212]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?:\s*(?:[%\u066A]|(?:[Pp]er[ \t]+[Cc]ent|[Pp]ercent)(?![A-Za-z0-9_])))?(?!\w)(?!\.\d))|'
     r'((?<!\w)\d+(?:\.\d+)?(?!\w|\.\d))'
 )
 
@@ -182,7 +194,8 @@ PASSTHROUGH_ATOM_RE = re.compile(
 )
 
 _BIDI_ISOLATE_TOKEN_RE = re.compile(
-    r"(?:"
+    r"[\u200e\u200f\u2067\u2069]*(?:"
+    rf"{_PAREN_QUANTITY_PATTERN}|"
     rf"{QUANTITY_PATTERN}|"
     r"(?:https?://|www\.)[^\s<>\"\u201d\u2019\u200e\u200f]*[^\s<>\"\u201d\u2019.,;:!?)\]\u200e\u200f]"
     r"|(?<![A-Za-z0-9.])10\.\d{4,9}/[^\s<>\"\u201d\u2019\u200e\u200f]*[^\s<>\"\u201d\u2019.,;:!?)\]\u200e\u200f]"
@@ -194,10 +207,12 @@ _BIDI_ISOLATE_TOKEN_RE = re.compile(
     r"|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
     r"|(?:sha256:)?[0-9a-f]{16,64}|0x[0-9a-fA-F]{4,}"
     r"|[A-Z][A-Z0-9]{1,9}(?:[-\u2010\u2011][A-Z0-9]{1,9})+[-\u2010\u2011][0-9]{2,6}(?:[.-][0-9]{1,6})*"
+    rf"|{_SLASH_CODE_PATTERN}"
+    rf"|(?:ITU-T[ \t]+)?{_STANDARD_CODE_PATTERN}"
     r"|\b\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:?\d{2})?)?\b"
     r"|\[\s*\d{1,3}(?:\s*[,\u2013\u2014-]\s*\d{1,3})*\s*\]"
     rf"|{CHEM_REACTION_RE}|{CHEM_ION_RE}"
-    r")"
+    r")[\u200e\u200f\u2067\u2069]*"
 )
 
 
@@ -257,6 +272,9 @@ def canonicalize_literal_values(text: str, values) -> str:
     for value in set(values):
         pct_match = PERCENT_VALUE_RE.match(value)
         if pct_match:
+            if pct_match.group(2) not in {"%", "\u066A"}:
+                # Preserve localized Arabic percentages instead of rewriting back to English "per cent".
+                continue
             num = re.escape(pct_match.group(1))
             left = r"(?<![A-Za-z0-9_.\u066B\u066C+\-\u2212])(?<!\d,)"
             right = r"(?![A-Za-z_\d])"
@@ -297,7 +315,8 @@ def protected_value_count(text: str, value: str) -> int:
         left = r"(?<![A-Za-z0-9_.\u066B\u066C+\-\u2212])(?<!\d,)"
         right = r"(?![A-Za-z_\d])"
         pct_pattern = re.compile(
-            rf"{left}(?:{num}\s*(?:[%\u066A]|في\s+المائة|بالمائة|بالمئة)|[%\u066A]\s*{num}(?![.,\u066B\u066C]\d)){right}"
+            rf"{left}(?:{num}\s*(?:[%\u066A]|في\s+المائة|بالمائة|بالمئة|per[ \t]+cent|percent)|[%\u066A]\s*{num}(?![.,\u066B\u066C]\d)){right}",
+            re.IGNORECASE,
         )
         return len(pct_pattern.findall(text))
     range_match = re.fullmatch(r"(\d+)\s*([-\u2013\u2014])\s*(\d+)", value)
@@ -513,19 +532,26 @@ def restore_structured_tokens(
 
 
 def isolate_ltr_structured_spans(text: str) -> str:
-    """Wrap LTR technical tokens in LRM marks inside Arabic prose without duplicating marks."""
+    """Wrap LTR technical tokens and Arabic quantity+unit spans in BiDi isolates cleanly."""
     if not text or not re.search(r"[\u0600-\u06FF]", text):
         return text
+
     def wrap(match: re.Match[str]) -> str:
-        token = match.group(0)
-        # Arabic unit labels keep their native direction. Currency and Latin
-        # unit spans are isolated together, including their signs and symbols.
+        token = match.group(0).strip("\u200e\u200f\u2067\u2069")
+        if not token:
+            return match.group(0)
+        # Arabic unit labels (e.g. "25 نقطة أساس") keep their native RTL direction
+        # and stay bound across BiDi runs and line wraps via RLI/PDI isolation.
         if re.search(r"[\u0621-\u064A]", token):
-            return token
-        return f"\u200e{token}\u200e"
+            return f"\u2067{token}\u2069"
+        # Bound each LTR island with RLM+LRM...LRM+RLM so neutral separators
+        # (such as '·') between consecutive LTR tokens cannot merge them into
+        # one reversed run or detach a following number from its Arabic unit.
+        return f"\u200f\u200e{token}\u200e\u200f"
 
     wrapped = _BIDI_ISOLATE_TOKEN_RE.sub(wrap, text)
     wrapped = re.sub(r"\u200e{2,}", "\u200e", wrapped)
+    wrapped = re.sub(r"\u200f{2,}", "\u200f", wrapped)
     return wrapped
 
 
