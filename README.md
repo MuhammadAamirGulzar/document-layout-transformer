@@ -87,3 +87,11 @@ Open your browser at `http://localhost:7860/` to access the translation interfac
 ```powershell
 .venv\Scripts\python -m babeldoc --files my_document.pdf --lang-in en --lang-out ar --openai
 ```
+
+---
+
+## Upstream Attribution & License
+
+This project is an English-to-Arabic (RTL) adaptation of [BabelDOC](https://github.com/funstory-ai/BabelDOC) (created by `awwaawwa` / `funstory.ai`). The core PDF intermediate-language parser, layout analysis, asset packaging, and CLI infrastructure derive from upstream BabelDOC, extended here with Arabic glyph shaping, per-line RTL bidirectional typesetting, protected-content validation, table/footnote layout hardening, and a FastAPI web interface.
+
+This project is licensed under **AGPL-3.0**, the same license as upstream BabelDOC — see [LICENSE](LICENSE). As a derivative work of BabelDOC, it inherits AGPL-3.0 copyleft terms.

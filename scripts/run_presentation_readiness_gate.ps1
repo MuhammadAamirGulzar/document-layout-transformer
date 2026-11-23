@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
-    [switch]$FullSuite
+    [switch]$FullSuite,
+    [string]$AuditRoot
 )
 
 $ErrorActionPreference = 'Stop'
@@ -9,14 +10,25 @@ if (Get-Variable -Name PSNativeCommandUseErrorActionPreference -ErrorAction Sile
 }
 
 $repo = Split-Path -Parent $PSScriptRoot
-$python = Join-Path $repo '.venv\Scripts\python.exe'
+$venvWinPython = Join-Path $repo '.venv\Scripts\python.exe'
+$venvUnixPython = Join-Path $repo '.venv/bin/python'
+$python = if (Test-Path -LiteralPath $venvWinPython) {
+    $venvWinPython
+} elseif (Test-Path -LiteralPath $venvUnixPython) {
+    $venvUnixPython
+} else {
+    throw "Virtual-environment Python is missing under: $(Join-Path $repo '.venv')"
+}
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-$auditRoot = 'D:\transformer\audit'
+$auditRoot = if ($AuditRoot) {
+    $AuditRoot
+} elseif ($env:TRANSDOC_AUDIT_ROOT) {
+    $env:TRANSDOC_AUDIT_ROOT
+} else {
+    Join-Path (Split-Path -Parent $repo) 'audit'
+}
 $log = Join-Path $auditRoot "presentation-readiness-$stamp.txt"
 
-if (-not (Test-Path -LiteralPath $python)) {
-    throw "Virtual-environment Python is missing: $python"
-}
 if (-not (Test-Path -LiteralPath $auditRoot)) {
     New-Item -ItemType Directory -Path $auditRoot | Out-Null
 }
