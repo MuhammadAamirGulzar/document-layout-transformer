@@ -513,3 +513,81 @@ def test_standard_dotted_code_and_written_percentage_recover_arabic_without_weak
     assert "25٪" not in out_bad
     assert engine_bad.incomplete_count == 1
     cache_bad.set.assert_not_called()
+
+
+def test_short_written_percent_clause_recovers_arabic_and_isolates_retained_fallback(
+    monkeypatch,
+):
+    """Phase-1 Iraq p.13 regression:
+    1) Arabic 'في المئة' (without alef) satisfies written English '52 per cent'.
+    2) Short percentage-subject prose ('52 per cent lack sanitation services.')
+       whose placeholder rung echoes English recovers cleanly via literal retry.
+    3) Defense-in-depth: if an English sentence genuinely fails recovery inside
+       a mixed Arabic paragraph, _normalize_arabic_output does not partially
+       rewrite '52 per cent' into '52٪' inside the English sentence, and sentence
+       joining isolates the retained English span so '52' cannot collide with '48٪'."""
+    from types import SimpleNamespace
+    from babeldoc.format.pdf.document_il.midend.il_translator import ILTranslator
+    from babeldoc.format.pdf.document_il.utils.structured_tokens import (
+        protected_value_count,
+    )
+
+    # 1) Both MSA spellings ('في المئة' and 'في المائة') match '52 per cent'
+    assert protected_value_count("52 في المئة تفتقر إلى خدمات الصرف الصحي.", "52 per cent") == 1
+    assert protected_value_count("52 في المائة تفتقر إلى خدمات الصرف الصحي.", "52 per cent") == 1
+    assert protected_value_count("52 تفتقر إلى خدمات الصرف الصحي.", "52 per cent") == 0
+
+    # 2) Placeholder rung echoes English -> completeness check rejects 3-word lowercase
+    #    prose -> bounded literal retry recovers Arabic '52 في المئة ...'
+    short_src = "52 per cent lack sanitation services."
+
+    def short_retry(seg: str) -> str:
+        if "{0}" in seg:
+            return "{0} lack sanitation services."
+        return "52 في المئة تفتقر إلى خدمات الصرف الصحي."
+
+    engine_short, cache_short = _nllb_with_cache(
+        monkeypatch, "{0} lack sanitation services.", short_retry
+    )
+    out_short = engine_short.translate(short_src)
+    assert "52 في المئة" in out_short
+    assert "lack sanitation services" not in out_short
+    assert engine_short.incomplete_count == 0
+    cache_short.set.assert_called_once()
+
+    # 3) Mixed paragraph fallback defense-in-depth via ILTranslator
+    para_src = (
+        "52 per cent lack sanitation services. "
+        "Forty-eight per cent of primary and secondary schools lack basic water services "
+        "and 35 per cent lack sanitation services."
+    )
+
+    class _RetainingStubEngine:
+        supports_sentence_batching = False
+        name = "stub"
+
+        def translate(self, text: str, rate_limit_params=None) -> str:
+            if text.startswith("52 per cent"):
+                return text  # Simulate genuine unrecoverable fallback on sentence 1
+            return "48٪ من المدارس الابتدائية والثانوية تفتقر إلى خدمات المياه الأساسية و 35٪ تفتقر إلى خدمات الصرف الصحي."
+
+    il_tr = object.__new__(ILTranslator)
+    il_tr.translation_config = SimpleNamespace(
+        lang_in="en",
+        lang_out="ar",
+        raise_if_cancelled=lambda: None,
+        progress_monitor=None,
+    )
+    il_tr.translate_engine = _RetainingStubEngine()
+    il_tr.stage_name = "Translate Paragraphs"
+    il_tr.support_llm_translate = False
+
+    joined = il_tr._translate_with_line_preservation(para_src, {})
+    assert "\u200f\u200e52 per cent lack sanitation services.\u200e\u200f" in joined
+    normalized = il_tr._normalize_arabic_output(joined)
+    # Must NOT rewrite '52 per cent' -> '52٪' inside the retained English clause
+    assert "52 per cent lack sanitation services." in normalized
+    assert "52٪ lack sanitation services" not in normalized
+    # Arabic percentages in sentence 2 remain intact
+    assert "48٪" in normalized
+    assert "35٪" in normalized

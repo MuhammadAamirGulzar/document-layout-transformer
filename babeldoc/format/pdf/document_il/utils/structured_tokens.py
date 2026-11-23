@@ -315,7 +315,7 @@ def protected_value_count(text: str, value: str) -> int:
         left = r"(?<![A-Za-z0-9_.\u066B\u066C+\-\u2212])(?<!\d,)"
         right = r"(?![A-Za-z_\d])"
         pct_pattern = re.compile(
-            rf"{left}(?:{num}\s*(?:[%\u066A]|في\s+المائة|بالمائة|بالمئة|per[ \t]+cent|percent)|[%\u066A]\s*{num}(?![.,\u066B\u066C]\d)){right}",
+            rf"{left}(?:{num}\s*(?:[%\u066A]|(?:في\s+ال|بال)ما?ئة|per[ \t]+cent|percent)|[%\u066A]\s*{num}(?![.,\u066B\u066C]\d)){right}",
             re.IGNORECASE,
         )
         return len(pct_pattern.findall(text))
@@ -540,10 +540,17 @@ def isolate_ltr_structured_spans(text: str) -> str:
         token = match.group(0).strip("\u200e\u200f\u2067\u2069")
         if not token:
             return match.group(0)
-        # Arabic unit labels (e.g. "25 نقطة أساس") keep their native RTL direction
-        # and stay bound across BiDi runs and line wraps via RLI/PDI isolation.
+        # Arabic unit labels (e.g. "25 نقطة أساس", "+25 نقطة أساس") keep their native
+        # RTL direction and stay bound across BiDi runs and line wraps via RLI/PDI.
+        # Explicit leading signs on numbers inside an RTL isolate need LRM bounds so
+        # UBA does not flip "+25" into "25+".
         if re.search(r"[\u0621-\u064A]", token):
-            return f"\u2067{token}\u2069"
+            signed_token = re.sub(
+                r"^([+\-\u2212]\d[\d.,\u066B\u066C]*)(?=\s)",
+                "\u200e\\1\u200e",
+                token,
+            )
+            return f"\u2067{signed_token}\u2069"
         # Bound each LTR island with RLM+LRM...LRM+RLM so neutral separators
         # (such as '·') between consecutive LTR tokens cannot merge them into
         # one reversed run or detach a following number from its Arabic unit.

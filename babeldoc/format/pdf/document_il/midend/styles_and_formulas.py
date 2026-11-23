@@ -38,9 +38,22 @@ from babeldoc.format.pdf.document_il.utils.layout_helper import is_same_style
 from babeldoc.format.pdf.document_il.utils.spatial_analyzer import (
     is_element_contained_in_formula,
 )
+from babeldoc.format.pdf.document_il.utils.structured_tokens import (
+    QUANTITY_PATTERN,
+    _PAREN_QUANTITY_PATTERN,
+)
 from babeldoc.format.pdf.document_il.utils.web_references import iter_web_references
 from babeldoc.format.pdf.translation_config import TranslationConfig
 from babeldoc.translator.translator import _ATOMIC_EXPRESSION
+
+_LITERAL_NON_FORMULA_RE = re.compile(
+    rf"{QUANTITY_PATTERN}"
+    rf"|{_PAREN_QUANTITY_PATTERN}"
+    r"|[A-Za-z]:\\(?:[^\s\\/:*?\"<>|]+\\)*[^\s\\/:*?\"<>|]*[^\s\\/:*?\"<>|.,;:!?)\]]"
+    r"|(?<![A-Za-z0-9_])(?:/|\.\.?/)[A-Za-z0-9._\-]+(?:/[A-Za-z0-9._\-]+)+/?"
+    r"|(?<![A-Za-z0-9_])[A-Za-z0-9][A-Za-z0-9._\-]*\.(?:pdf|xlsx?|csv|tsv|json|ya?ml|xml|html?|sql|py|sh|txt|md|docx?|pptx?|png|jpe?g|svg|zip|tar\.gz|log|ini|cfg|env)\b"
+    r"|\b[A-Za-z0-9]+(?:_[A-Za-z0-9]+)+\b"
+)
 
 
 class StylesAndFormulas:
@@ -480,10 +493,15 @@ class StylesAndFormulas:
                 )
                 or (
                     # 如果字符的视觉框和实际框不一致，则认为是公式字符
-                    char.box.x > char.visual_bbox.box.x2
-                    or char.box.x2 < char.visual_bbox.box.x
-                    or char.box.y > char.visual_bbox.box.y2
-                    or char.box.y2 < char.visual_bbox.box.y
+                    # Underscores naturally draw below the baseline in standard text fonts
+                    # and must not be turned into standalone formula boxes (<bN>).
+                    char.char_unicode != "_"
+                    and (
+                        char.box.x > char.visual_bbox.box.x2
+                        or char.box.x2 < char.visual_bbox.box.x
+                        or char.box.y > char.visual_bbox.box.y2
+                        or char.box.y2 < char.visual_bbox.box.y
+                    )
                 )
             )
 
@@ -650,32 +668,6 @@ class StylesAndFormulas:
             if not paragraph.pdf_paragraph_composition:
                 continue
 
-            # URL punctuation (particularly '=' and '_') is literal text. Scan
-            # across source lines before classifying those glyphs as operators.
-            source_parts = []
-            char_ids: list[int | None] = []
-            for composition in paragraph.pdf_paragraph_composition:
-                if composition.pdf_line:
-                    for char in composition.pdf_line.pdf_character:
-                        value = char.char_unicode or " "
-                        source_parts.append(value)
-                        char_ids.extend([id(char)] * len(value))
-                source_parts.append("\n" if composition.pdf_line else "<>")
-                char_ids.extend([None] * len(source_parts[-1]))
-            source_text = "".join(source_parts)
-            web_reference_chars = {
-                char_id
-                for start, end, _ in iter_web_references(source_text)
-                for char_id in char_ids[start:end]
-                if char_id is not None
-            }
-            chemical_expression_chars = {
-                char_id
-                for match in _ATOMIC_EXPRESSION.finditer(source_text)
-                for char_id in char_ids[match.start():match.end()]
-                if char_id is not None
-            }
-
             current_formula_font_ids: set[int]
             if (
                 paragraph.xobj_id
@@ -686,6 +678,49 @@ class StylesAndFormulas:
                 ]
             else:
                 current_formula_font_ids = page_level_formula_font_ids
+
+            # URL, path, filename, identifier, and signed-quantity punctuation
+            # ('=', '_', '/', '−', '+') is literal text. Scan across source lines
+            # before classifying those glyphs as standalone formula operators.
+            source_parts = []
+            char_ids: list[int | None] = []
+            char_by_id: dict[int, PdfCharacter] = {}
+            for composition in paragraph.pdf_paragraph_composition:
+                if composition.pdf_line:
+                    for char in composition.pdf_line.pdf_character:
+                        value = char.char_unicode or " "
+                        source_parts.append(value)
+                        cid = id(char)
+                        char_by_id[cid] = char
+                        char_ids.extend([cid] * len(value))
+                source_parts.append("\n" if composition.pdf_line else "<>")
+                char_ids.extend([None] * len(source_parts[-1]))
+            source_text = "".join(source_parts)
+            web_reference_chars = {
+                char_id
+                for start, end, _ in iter_web_references(source_text)
+                for char_id in char_ids[start:end]
+                if char_id is not None
+            }
+            for match in _LITERAL_NON_FORMULA_RE.finditer(source_text):
+                span_ids = [
+                    cid for cid in char_ids[match.start():match.end()] if cid is not None
+                ]
+                if span_ids and all(
+                    not char_by_id[cid].formula_layout_id
+                    and (
+                        char_by_id[cid].pdf_style is None
+                        or char_by_id[cid].pdf_style.font_id not in current_formula_font_ids
+                    )
+                    for cid in span_ids
+                ):
+                    web_reference_chars.update(span_ids)
+            chemical_expression_chars = {
+                char_id
+                for match in _ATOMIC_EXPRESSION.finditer(source_text)
+                for char_id in char_ids[match.start():match.end()]
+                if char_id is not None
+            }
 
             new_paragraph_compositions = []
             # This flag is carried through all compositions in a paragraph, as in the original implementation.

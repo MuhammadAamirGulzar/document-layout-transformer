@@ -167,7 +167,18 @@ def validate_translation_completeness(
         w for w in re.findall(r"\b[A-Za-z][A-Za-z'\u2019\-]{1,}\b", clean_src)
         if not w.isupper()
     ]
-    if len(src_prose_words) < 4:
+    if len(src_prose_words) < 3:
+        return True, None
+    if len(src_prose_words) == 3:
+        # Exempt 3-word titles/proper nouns, but reject 3-word lowercase prose clauses
+        # (e.g. "52 per cent lack sanitation services.") echoed back with zero Arabic.
+        out_lower_3 = [
+            w for w in re.findall(r"\b[A-Za-z][A-Za-z'\u2019\-]{1,}\b", clean_out)
+            if not w.isupper() and w[0].islower()
+        ]
+        ar_chars_3 = re.findall(rf"[{_ARABIC_LETTER_RANGE}]", clean_out)
+        if all(w[0].islower() for w in src_prose_words) and not ar_chars_3 and len(out_lower_3) >= 3:
+            return False, "excessive_untranslated_source"
         return True, None
 
     if _is_degenerate_translation(src, out):
@@ -743,6 +754,47 @@ class BaseTranslator(ABC):
             if retried_ok:
                 state.retry_outcome = "succeeded"
                 return retried, not getattr(state, "incomplete", False)
+            # If placeholder tags (e.g. "{0} lack sanitation services.") caused the
+            # model to echo English instead of translating, try one bounded literal
+            # retry with non-sensitive values unmasked and exact validation.
+            literal_comp = {
+                tag: value for tag, value in (mapping or {}).items()
+                if not (_is_valid_bic(value) or _IBAN_PATTERN.fullmatch(re.sub(r"\s+", "", value)))
+            }
+            if literal_comp and hasattr(self, "_generate_translation"):
+                retry_text = re.sub(
+                    r"\{\d+\}", lambda m: literal_comp.get(m[0], m[0]), text
+                )
+                remaining = {
+                    tag: value for tag, value in mapping.items() if tag not in literal_comp
+                }
+                was_inc = getattr(state, "incomplete", False)
+                state.incomplete = False
+                try:
+                    cand = _restore_numerals(
+                        self._generate_translation(retry_text), remaining, strict=False
+                    )
+                    cand = self._canonicalize_literal_values(cand, mapping.values())
+                except Exception:
+                    state.incomplete = was_inc
+                else:
+                    cand_inc = getattr(state, "incomplete", False)
+                    cand_ok, _ = validate_translation_completeness(
+                        src_full,
+                        cand,
+                        target_lang=target_lang,
+                        extra_protected=tuple(expected.keys()),
+                    )
+                    if (
+                        not cand_inc
+                        and not self._find_unresolved_placeholders(retry_text, cand, remaining)
+                        and self._retry_target_satisfied(cand)
+                        and cand_ok
+                        and not self._mismatched_protected_values(cand, expected)
+                    ):
+                        state.retry_outcome = "succeeded"
+                        return cand, not was_inc
+                    state.incomplete = was_inc
             state.retry_outcome = "failed"
             partial = self._recover_by_spans(src_full, target_lang)
             if partial is not None:

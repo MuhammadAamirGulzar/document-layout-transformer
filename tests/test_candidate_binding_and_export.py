@@ -252,3 +252,147 @@ def test_mixed_arabic_quantities_keep_unit_sign_and_parentheses_across_wrap():
     assert any("−€82.50" in ln for ln in wrapped_lines), wrapped_lines
     assert any("(€82.50)" in ln for ln in wrapped_lines), wrapped_lines
     assert any("$8.4M" in ln for ln in wrapped_lines), wrapped_lines
+
+    # 3) Signed Arabic basis points ('+25 نقطة أساس') stay bound with '+' on the left of 25
+    signed_bps = "تغيير سعر السياسة: +25 نقطة أساس"
+    iso_bps = isolate_ltr_structured_spans(signed_bps)
+    assert isolate_ltr_structured_spans(iso_bps) == iso_bps
+    bps_lines = _layout_visual_lines(iso_bps, width=500.0)
+    assert len(bps_lines) == 1
+    assert "ساسأ ةطقن +25" in bps_lines[0], bps_lines
+
+
+def test_styles_and_formulas_preserves_signed_currency_and_underscore_paths():
+    """Phase-1 parser regression:
+    1) Leading '−' in '−€45.00' (category Sm) must not become a lone PdfFormula (<b1>).
+    2) Underscores in 'transdoc_report_final-v2.pdf' and hard-wrapped Unix paths
+       (even when visual_bbox sits below baseline) must not become PdfFormula (<bN>).
+    3) Hard-wrapped path lines rejoin without injecting a breaking space.
+    4) Control: genuine formula-font expressions still classify as PdfFormula."""
+    from babeldoc.format.pdf.document_il.il_version_1 import (
+        Page,
+        PdfCharacter,
+        PdfFont,
+        PdfLine,
+        PdfParagraph,
+        PdfParagraphComposition,
+        PdfStyle,
+        VisualBbox,
+    )
+    from babeldoc.format.pdf.document_il.midend.il_translator import ILTranslator
+    from babeldoc.format.pdf.document_il.midend.styles_and_formulas import StylesAndFormulas
+    from babeldoc.format.pdf.document_il.utils.structured_tokens import (
+        is_immutable_technical_text,
+        protect_structured_tokens,
+    )
+
+    def _make_line(text: str, *, font_id: str = "F1", lower_underscore: bool = True) -> PdfLine:
+        chars = []
+        x = 10.0
+        for ch in text:
+            box = Box(x=x, y=100.0, x2=x + 5.0, y2=110.0)
+            # Mimic LiberationSans underscore ink sitting strictly below baseline
+            vbox = (
+                Box(x=x, y=97.0, x2=x + 5.0, y2=98.5)
+                if (lower_underscore and ch == "_")
+                else Box(x=x, y=100.0, x2=x + 5.0, y2=110.0)
+            )
+            chars.append(
+                PdfCharacter(
+                    pdf_character_id=ord(ch),
+                    char_unicode=ch,
+                    box=box,
+                    visual_bbox=VisualBbox(box=vbox),
+                    pdf_style=PdfStyle(font_id=font_id, font_size=9.5),
+                    vertical=False,
+                )
+            )
+            x += 5.0
+        return PdfLine(box=Box(10.0, 100.0, x, 110.0), pdf_character=chars)
+
+    def _make_para(lines: list[PdfLine]) -> PdfParagraph:
+        return PdfParagraph(
+            box=Box(10.0, 90.0, 400.0, 115.0),
+            pdf_paragraph_composition=[PdfParagraphComposition(pdf_line=ln) for ln in lines],
+        )
+
+    p_curr = _make_para([_make_line("0.25% · 25 bps · −€45.00 · (€45.00)")])
+    p_file = _make_para([_make_line("transdoc_report_final-v2.pdf")])
+    p_path = _make_para([
+        _make_line("Q3 file not received: /srv/shared/finance/2026/q3/bra"),
+        _make_line("nch_reports/millbrook_final_v3_REVIEWED.xlsx"),
+    ])
+    p_math = _make_para([_make_line("x_1 + y_2", font_id="F_MATH")])
+
+    page = Page(
+        page_number=0,
+        pdf_font=[
+            PdfFont(font_id="F1", name="LiberationSans"),
+            PdfFont(font_id="F_MATH", name="CMMI10"),
+        ],
+        pdf_paragraph=[p_curr, p_file, p_path, p_math],
+    )
+
+    sf = object.__new__(StylesAndFormulas)
+    sf.translation_config = SimpleNamespace(
+        formular_font_pattern=r"CMMI.*",
+        formular_char_pattern=None,
+    )
+    sf.font_mapper = SimpleNamespace(has_char=lambda _c: True)
+    sf.process_page_formulas(page)
+    sf.process_translatable_formulas(page)
+
+    # 1) No PdfFormula for '−' in '−€45.00'
+    assert not any(c.pdf_formula for c in p_curr.pdf_paragraph_composition)
+    curr_text = "".join(
+        ch.char_unicode
+        for c in p_curr.pdf_paragraph_composition
+        if c.pdf_line
+        for ch in c.pdf_line.pdf_character
+    )
+    assert "−€45.00" in curr_text
+    _, curr_map = protect_structured_tokens(curr_text)
+    assert "−€45.00" in curr_map.values()
+
+    # 2) No PdfFormula for '_' in filename or wrapped path
+    assert not any(c.pdf_formula for c in p_file.pdf_paragraph_composition)
+    file_text = "".join(
+        ch.char_unicode
+        for c in p_file.pdf_paragraph_composition
+        if c.pdf_line
+        for ch in c.pdf_line.pdf_character
+    )
+    assert file_text == "transdoc_report_final-v2.pdf"
+    assert is_immutable_technical_text(file_text)
+    assert not any(c.pdf_formula for c in p_path.pdf_paragraph_composition)
+
+    # 3) Hard-wrapped Unix path rejoins without breaking space (both newline and soft-wrap space)
+    captured: list[str] = []
+    il_tr = object.__new__(ILTranslator)
+    il_tr.translation_config = SimpleNamespace(
+        lang_in="en", lang_out="ar", raise_if_cancelled=lambda: None, progress_monitor=None
+    )
+    il_tr.translate_engine = SimpleNamespace(
+        translate=lambda seg, rate_limit_params=None: (captured.append(seg), seg)[1]
+    )
+    il_tr.stage_name = "Translate Paragraphs"
+    il_tr.support_llm_translate = False
+    expected_path_line = (
+        "Q3 file not received: /srv/shared/finance/2026/q3/branch_reports/millbrook_final_v3_REVIEWED.xlsx"
+    )
+    il_tr._translate_with_line_preservation(
+        "Q3 file not received: /srv/shared/finance/2026/q3/bra\n"
+        "nch_reports/millbrook_final_v3_REVIEWED.xlsx",
+        {},
+    )
+    il_tr._translate_with_line_preservation(
+        "Q3 file not received: /srv/shared/finance/2026/q3/bra "
+        "nch_reports/millbrook_final_v3_REVIEWED.xlsx",
+        {},
+    )
+    assert captured == [expected_path_line, expected_path_line]
+    _, path_map = protect_structured_tokens(captured[0])
+    assert "/srv/shared/finance/2026/q3/branch_reports/millbrook_final_v3_REVIEWED.xlsx" in path_map.values()
+
+    # 4) Control: real formula-font math still produces PdfFormula
+    assert any(c.pdf_formula for c in p_math.pdf_paragraph_composition)

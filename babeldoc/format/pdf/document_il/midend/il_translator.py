@@ -1037,6 +1037,20 @@ class ILTranslator:
         # or spaced leaders: "1. Introduction . . . . . . . . 1306"
         from babeldoc.format.pdf.document_il.utils.layout_semantics import parse_toc_row
 
+        # Rejoin multi-segment file paths or URLs hard-wrapped across narrow cells
+        # (both explicit newline wraps and single-space soft wraps from PDF line extraction,
+        # e.g. "/srv/shared/finance/2026/q3/bra nch_reports/millbrook_final.xlsx").
+        text = re.sub(
+            r"((?:https?://\S+|(?:[A-Za-z]:\\|(?:/|\.\.?/)[A-Za-z0-9._\-]+/)[A-Za-z0-9._\-/\\]+))[ \t]*\r?\n[ \t]*(?=[A-Za-z0-9._\-]+(?:/|_|\.(?:pdf|xlsx?|csv|tsv|json|ya?ml|xml|html?|sql|py|sh|txt|md|docx?|pptx?|png|jpe?g|svg|zip|tar\.gz|log)\b))",
+            r"\1",
+            text,
+        )
+        text = re.sub(
+            r"((?:[A-Za-z]:\\|(?:/|\.\.?/)[A-Za-z0-9._\-]+/)[A-Za-z0-9._\-/\\]+)([ \t]+)(?=[a-z0-9][A-Za-z0-9._\-]{1,}/[A-Za-z0-9._\-]+(?:[._/\-][A-Za-z0-9._\-]+)*)",
+            lambda m: m.group(0) if re.search(r"\.[A-Za-z]{2,5}$", m.group(1)) else m.group(1),
+            text,
+        )
+
         # If text has multiple non-empty lines
         lines = text.split("\n")
         non_empty = [l for l in lines if l.strip()]
@@ -1120,6 +1134,29 @@ class ILTranslator:
                         sentences.extend(clauses if len(clauses) > 1 else [sub])
                     else:
                         sentences.append(sub)
+            def _join_translated_sentences(parts_out: list[str]) -> str:
+                lang_norm = (
+                    (getattr(getattr(self, "translation_config", None), "lang_out", "") or "")
+                    .lower()
+                    .rsplit("-", 1)[-1]
+                )
+                if lang_norm in {"ar", "ara", "arabic"} and any(
+                    re.search(r"[\u0600-\u06FF]", p) for p in parts_out
+                ):
+                    isolated: list[str] = []
+                    for p in parts_out:
+                        if (
+                            p
+                            and not re.search(r"[\u0600-\u06FF]", p)
+                            and len(re.findall(r"[A-Za-z]{2,}", p)) >= 2
+                        ):
+                            clean_p = p.strip("\u200e\u200f")
+                            isolated.append(f"\u200f\u200e{clean_p}\u200e\u200f")
+                        else:
+                            isolated.append(p)
+                    return " ".join(isolated)
+                return " ".join(parts_out)
+
             if len(sentences) > 1 and len(normalized_text) > 120:
                 config = getattr(self, "translation_config", None)
                 cancel_fn = getattr(config, "raise_if_cancelled", None)
@@ -1148,7 +1185,7 @@ class ILTranslator:
                     pm = getattr(config, "progress_monitor", None)
                     if pm is not None and hasattr(pm, "heartbeat"):
                         pm.heartbeat(stage=getattr(self, "stage_name", "Translate Paragraphs"))
-                    return " ".join(translated_sentences)
+                    return _join_translated_sentences(translated_sentences)
 
                 translated_sentences = []
                 pm = getattr(config, "progress_monitor", None)
@@ -1158,7 +1195,7 @@ class ILTranslator:
                     translated_sentences.append(translate_segment(sentence))
                     if pm is not None and hasattr(pm, "heartbeat"):
                         pm.heartbeat(stage=getattr(self, "stage_name", "Translate Paragraphs"))
-                return " ".join(translated_sentences)
+                return _join_translated_sentences(translated_sentences)
 
             return translate_segment(normalized_text)
 
@@ -1230,10 +1267,11 @@ class ILTranslator:
         text, urls = stash_web_references(text)
 
         # 1. Normalize percent signs: convert restored English "60 per cent" to Arabic ٪
-        # when the block contains Arabic prose, and replace Western % with Arabic ٪.
+        # when the block contains Arabic prose (skipping retained English clauses such as
+        # "52 per cent lack sanitation services."), and replace Western % with Arabic ٪.
         if re.search(r"[\u0600-\u06FF]", text):
             text = re.sub(
-                r"(?<![A-Za-z0-9_.])([+\-\u2212]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?)\s*(?:per[ \t]+cent|percent)\b",
+                r"(?<![A-Za-z0-9_.])([+\-\u2212]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?)\s*(?:per[ \t]+cent|percent)\b(?![ \t]+[A-Za-z]{2,})",
                 r"\1%",
                 text,
                 flags=re.IGNORECASE,
