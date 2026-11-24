@@ -5,13 +5,11 @@ import logging
 import re
 import statistics
 import unicodedata
-from functools import cache
+from functools import cache, partial
 
 import pymupdf
 import regex
 from rtree import index
-
-from babeldoc.const import WATERMARK_VERSION
 from babeldoc.format.pdf.document_il import Box
 from babeldoc.format.pdf.document_il import PdfCharacter
 from babeldoc.format.pdf.document_il import PdfCurve
@@ -20,13 +18,28 @@ from babeldoc.format.pdf.document_il import PdfFormula
 from babeldoc.format.pdf.document_il import PdfParagraphComposition
 from babeldoc.format.pdf.document_il import PdfStyle
 from babeldoc.format.pdf.document_il import il_version_1
-from babeldoc.format.pdf.document_il.utils.fontmap import FontMapper
+from babeldoc.format.pdf.document_il.utils.fontmap import FontMapper, is_arabic_codepoint
+from babeldoc.format.pdf.document_il.utils.arabic_shaper import shape_arabic_run
 from babeldoc.format.pdf.document_il.utils.formular_helper import update_formula_data
 from babeldoc.format.pdf.document_il.utils.layout_helper import box_to_tuple
+from babeldoc.format.pdf.document_il.utils.layout_semantics import (
+    assign_page_region_groups,
+    is_standalone_code_text,
+    paragraph_semantic_zone,
+)
+from babeldoc.format.pdf.document_il.utils.semantic_table import (
+    SemanticTable,
+    annotate_page_semantic_tables,
+)
+from babeldoc.format.pdf.document_il.utils.style_helper import GRAY80
 from babeldoc.format.pdf.translation_config import TranslationConfig
 from babeldoc.format.pdf.translation_config import WatermarkOutputMode
+from arabic_reshaper import reshape
+import bidi.algorithm as ba
+
 
 logger = logging.getLogger(__name__)
+
 
 LINE_BREAK_REGEX = regex.compile(
     r"^["
@@ -81,10 +94,12 @@ LINE_BREAK_REGEX = regex.compile(
     r"\uA490-\uA4CF"  # Yi Radicals
     r"'"
     r"-"  # Hyphen
-    r"·"  # Middle Dot (U+00B7) For Català
-    r"ʻ"  # Spacing Modifier Letters U+02BB
-    r"]+$"
+    r"\u00B7"  # Middle Dot
+    r"\u02BB"  # Spacing Modifier Letters
+    r"]+ $"
 )
+
+ARABIC_WORD_SPACING_RATIO = 1.65
 
 
 class TypesettingUnit:
@@ -97,15 +112,17 @@ class TypesettingUnit:
         formular: PdfFormula | None = None,
         unicode: str | None = None,
         font: pymupdf.Font | None = None,
+        arabic_fallback_font: pymupdf.Font | None = None,
         original_font: il_version_1.PdfFont | None = None,
         font_size: float | None = None,
         style: PdfStyle | None = None,
         xobj_id: int | None = None,
         debug_info: bool = False,
+        forced_line_break: bool = False,
     ):
-        assert (char is not None) + (formular is not None) + (
-            unicode is not None
-        ) == 1, "Only one of chars and formular can be not None"
+        assert forced_line_break or (
+            (char is not None) + (formular is not None) + (unicode is not None) == 1
+        ), "Only one of chars and formular can be not None"
         self.char = char
         self.formular = formular
         self.unicode = unicode
@@ -113,6 +130,11 @@ class TypesettingUnit:
         self.y = None
         self.scale = None
         self.debug_info = debug_info
+        # A newline is layout metadata, never a printable glyph.  Keeping it
+        # as an explicit unit lets structured procedures and contact cards
+        # retain their source records all the way to final typesetting.
+        self.forced_line_break = forced_line_break
+        self.arabic_fallback_font = arabic_fallback_font
 
         # Cache variables
         self.box_cache: Box | None = None
@@ -149,7 +171,7 @@ class TypesettingUnit:
             self.font_size = font_size
             self.style = style
             self.xobj_id = xobj_id
-
+    
     def try_resue_cache(self, old_tu: TypesettingUnit):
         if old_tu.is_cjk_char_cache is not None:
             self.is_cjk_char_cache = old_tu.is_cjk_char_cache
@@ -176,6 +198,7 @@ class TypesettingUnit:
                 old_tu.mixed_character_blacklist_cache
             )
 
+
     def try_get_unicode(self) -> str | None:
         if self.char:
             return self.char.char_unicode
@@ -183,6 +206,15 @@ class TypesettingUnit:
             return None
         elif self.unicode:
             return self.unicode
+
+    @property
+    def is_drawn_list_bullet(self) -> bool:
+        return bool(
+            self.formular
+            and self.formular.pdf_curve
+            and len(self.formular.pdf_character) == 1
+            and self.formular.pdf_character[0].char_unicode == "\u2022"
+        )
 
     @property
     def mixed_character_blacklist(self):
@@ -195,11 +227,11 @@ class TypesettingUnit:
         unicode = self.try_get_unicode()
         if unicode:
             return unicode in [
-                "。",
-                "，",
-                "：",
-                "？",
-                "！",
+                "Ãƒâ€šÃ‚Â£",
+                "ÃƒËœÃ…â€™",
+                "ÃƒÂ¯Ã‚Â¼Ã‚Â",
+                "ÃƒÂ¯Ã‚Â¼Ã…Â¡",
+                "ÃƒÂ¯Ã‚Â¼Ã¢â‚¬Â°",
             ]
         return False
 
@@ -237,28 +269,20 @@ class TypesettingUnit:
             return False
         assert len(unicode) == 1, "Unicode must be a single character"
         if unicode in [
-            "（",
-            "）",
-            "【",
-            "】",
-            "《",
-            "》",
-            "〔",
-            "〕",
-            "〈",
-            "〉",
-            "〖",
-            "〗",
-            "「",
-            "」",
-            "『",
-            "』",
-            "、",
-            "。",
-            "：",
-            "？",
-            "！",
-            "，",
+            "ÃƒÂ¯Ã‚Â¼Ã‹â€ ",
+            "ÃƒÂ¯Ã‚Â¼Ã¢â‚¬Â°",
+            "ÃƒËœÃ…â€™",
+            "ÃƒÂ£Ã¢â€šÂ¬Ã¢â‚¬Å¡",
+            "ÃƒÂ£Ã¢â€šÂ¬Ã‚Â",
+            "ÃƒÂ¯Ã‚Â¼Ã¢â‚¬Âº",
+            "ÃƒÂ¯Ã‚Â¼Ã…Â¡",
+            "ÃƒÂ¯Ã‚Â¼Ã…Â¸",
+            "ÃƒÂ¯Ã‚Â¼Ã‚Â",
+            "ÃƒÂ¯Ã‚Â¼Ã¢â‚¬Â°",
+            "ÃƒËœÃ…â€™",
+            "ÃƒÂ¯Ã‚Â¼Ã‚Â",
+            "ÃƒÂ¯Ã‚Â¼Ã…Â¡",
+            "ÃƒÂ¯Ã‚Â¼Ã¢â‚¬Â°",
         ]:
             return True
         if unicode:
@@ -323,55 +347,41 @@ class TypesettingUnit:
 
         if unicode:
             return unicode in [
-                # 英文标点
+                # English punctuation
                 ",",
                 ".",
                 ":",
                 ";",
                 "?",
                 "!",
-                # 中文点号
-                "，",  # 逗号
-                "。",  # 句号
-                "．",  # 全角句号
-                "、",  # 顿号
-                "：",  # 冒号
-                "；",  # 分号
-                "！",  # 叹号
-                "‼",  # 双叹号
-                "？",  # 问号
-                "⁇",  # 双问号
-                # 结束引号
-                "”",  # 右双引号
-                "’",  # 右单引号
-                "」",  # 右直角单引号
-                "』",  # 右直角双引号
-                # 结束括号
-                ")",  # 右圆括号
-                "]",  # 右方括号
-                "}",  # 右花括号
-                "）",  # 右圆括号
-                "〕",  # 右龟甲括号
-                "〉",  # 右单书名号
-                "】",  # 右黑色方头括号
-                "〗",  # 右空白方头括号
-                "］",  # 全角右方括号
-                "｝",  # 全角右花括号
-                # 结束双书名号
-                "》",  # 右双书名号
-                # 连接号
-                "～",  # 全角波浪号
-                "-",  # 连字符减号
-                "–",  # 短破折号 (EN DASH)
-                "—",  # 长破折号 (EM DASH)
-                # 间隔号
-                "·",  # 中间点
-                "・",  # 片假名中间点
-                "‧",  # 连字点
-                # 分隔号
-                "/",  # 斜杠
-                "／",  # 全角斜杠
-                "⁄",  # 分数斜杠
+                # Chinese punctuation
+                "ÃƒËœÃ…â€™",  # Comma
+                "ÃƒÂ£Ã¢â€šÂ¬Ã¢â‚¬Å¡",  # Period
+                "ÃƒÂ¯Ã‚Â¼Ã…Â¡",  # Colon
+                "ÃƒÂ¯Ã‚Â¼Ã¢â‚¬Âº",  # Semicolon
+                "ÃƒÂ¯Ã‚Â¼Ã…Â¸",  # Question mark
+                "ÃƒÂ¯Ã‚Â¼Ã‚Â",  # Exclamation mark
+                "ÃƒÂ£Ã¢â€šÂ¬Ã‚Â",  # Enumeration comma
+                # Closing brackets
+                ")",  # Right parenthesis
+                "]",  # Right square bracket
+                "}",  # Right curly bracket
+                "ÃƒÂ¯Ã‚Â¼Ã¢â‚¬Â°",  # Right parenthesis
+                "ÃƒÂ£Ã¢â€šÂ¬Ã¢â‚¬Ëœ",  # Right square bracket
+                "ÃƒÂ£Ã¢â€šÂ¬Ã¢â‚¬Â¹",  # Right double angle bracket
+                "ÃƒÂ£Ã¢â€šÂ¬Ã‚Â",  # Right single quotation mark
+                "ÃƒÂ£Ã¢â€šÂ¬Ã‚Â",  # Right corner bracket
+                # Connected line symbols
+                "ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“",  # EN DASH
+                "ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â",  # EM DASH
+                # Special punctuation
+                "Ãƒâ€šÃ‚Â·",  # Middle dot
+                "ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦",  # Ellipsis
+                "Ãƒâ€šÃ‚Â°",  # Degree symbol
+                # Slash
+                "/",  # Slash
+                "ÃƒÂ¯Ã‚Â¼Ã‚Â",  # Fullwidth solidus
+                "ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â°",  # Per mille sign
             ]
         return False
 
@@ -391,29 +401,36 @@ class TypesettingUnit:
         if not unicode:
             return False
         return unicode in [
-            # 开始引号
-            "“",  # 左双引号
-            "‘",  # 左单引号
-            "「",  # 左直角单引号
-            "『",  # 左直角双引号
-            # 开始括号
-            "(",  # 左圆括号
-            "[",  # 左方括号
-            "{",  # 左花括号
-            "（",  # 左圆括号
-            "〔",  # 左龟甲括号
-            "〈",  # 左单书名号
-            "《",  # 左双书名号
-            # 开始单双书名号
-            "〖",  # 左空白方头括号
-            "〘",  # 左黑色方头括号
-            "〚",  # 左单书名号
+            # Opening brackets
+            """,  # Left double quotation mark
+            "'",  # Left single quotation mark
+            "ÃƒÂ£Ã¢â€šÂ¬Ã… ",  # Left double angle bracket
+            "ÃƒÂ£Ã¢â€šÂ¬Ã…Â½",  # Left single quotation mark
+            # Opening brackets
+            "(",  # Left parenthesis
+            "[",  # Left square bracket
+            "{",  # Left curly bracket
+            "ÃƒÂ¯Ã‚Â¼Ã‹â€ ",  # Left parenthesis
+            "ÃƒÂ£Ã¢â€šÂ¬Ã‚Â",  # Left square bracket
+            "ÃƒÂ£Ã¢â€šÂ¬Ã… ",  # Left double angle bracket
+            "ÃƒÂ£Ã¢â€šÂ¬Ã…Â½",  # Left single quotation mark
+            # Cannot appear at end of line - combined with closing brackets
+            """,  # Right double quotation mark
+            "'",  # Right single quotation mark
+            "ÃƒÂ£Ã¢â€šÂ¬Ã¢â‚¬Â¹",  # Right double angle bracket
+            "ÃƒÂ£Ã¢â€šÂ¬Ã‚Â",  # Right single quotation mark
         ]
 
     def passthrough(
         self,
     ) -> tuple[list[PdfCharacter], list[PdfCurve], list[PdfForm]]:
         if self.char:
+            if (
+                self.char.char_unicode
+                and len(self.char.char_unicode) == 1
+                and unicodedata.category(self.char.char_unicode) == "Cf"
+            ):
+                return [], [], []
             return [self.char], [], []
         elif self.formular:
             return (
@@ -438,25 +455,57 @@ class TypesettingUnit:
 
     def calculate_box(self):
         if self.char:
-            box = copy.deepcopy(self.char.box)
+            # Some legacy producers omit the logical character box while
+            # retaining a visual box.  Prefer whichever geometry exists and
+            # keep a zero-area fallback so one malformed glyph cannot abort
+            # the complete document.
+            source_box = self.char.box
+            if source_box is None and self.char.visual_bbox:
+                source_box = self.char.visual_bbox.box
+            box = copy.deepcopy(source_box)
+            if box is None:
+                return Box(0, 0, 0, 0)
             if self.char.visual_bbox and self.char.visual_bbox.box:
                 box.y = self.char.visual_bbox.box.y
                 box.y2 = self.char.visual_bbox.box.y2
-                # return self.char.visual_bbox.box
 
             return box
         elif self.formular:
-            return self.formular.box
-            # if self.formular.x_offset <= 0.5:
-            #     return self.formular.box
-            # formular_box = copy.copy(self.formular.box)
-            # formular_box.x2 += self.formular.x_advance
-            # return formular_box
+            if self.formular.box is not None:
+                return self.formular.box
+            # Broken formula annotations are common in generated forms and
+            # contact cards.  Recover their bounds from the actual painted
+            # children instead of dereferencing a missing formula box.
+            child_boxes = []
+            for char in self.formular.pdf_character or []:
+                child_box = char.box
+                if child_box is None and char.visual_bbox:
+                    child_box = char.visual_bbox.box
+                if child_box is not None:
+                    child_boxes.append(child_box)
+            for graphic in [
+                *(self.formular.pdf_curve or []),
+                *(self.formular.pdf_form or []),
+            ]:
+                if graphic.box is not None:
+                    child_boxes.append(graphic.box)
+            if child_boxes:
+                return Box(
+                    min(box.x for box in child_boxes),
+                    min(box.y for box in child_boxes),
+                    max(box.x2 for box in child_boxes),
+                    max(box.y2 for box in child_boxes),
+                )
+            return Box(0, 0, 0, 0)
         elif self.unicode:
-            char_width = self.font.char_lengths(self.unicode, self.font_size)[0]
+            if len(self.unicode) == 1 and unicodedata.category(self.unicode) == "Cf":
+                char_width = 0.0
+            else:
+                char_width = self.font.char_lengths(self.unicode, self.font_size)[0]
             if self.x is None or self.y is None or self.scale is None:
                 return Box(0, 0, char_width, self.font_size)
             return Box(self.x, self.y, self.x + char_width, self.y + self.font_size)
+        return Box(0, 0, 0, 0)
 
     @property
     def box(self):
@@ -493,18 +542,18 @@ class TypesettingUnit:
         y: float,
         scale: float,
     ) -> TypesettingUnit:
-        """重定位并缩放排版单元
+        """Relocate and scale the typesetting unit
 
         Args:
-            x: 新的 x 坐标
-            y: 新的 y 坐标
-            scale: 缩放因子
+            x: New x position
+            y: New y position
+            scale: Scale factor
 
         Returns:
-            新的排版单元
+            New relocated and scaled typesetting unit
         """
         if self.char:
-            # 创建新的字符对象
+            # Create new character object
             new_char = PdfCharacter(
                 pdf_character_id=self.char.pdf_character_id,
                 char_unicode=self.char.char_unicode,
@@ -530,20 +579,20 @@ class TypesettingUnit:
             return new_tu
 
         elif self.formular:
-            # 创建新的公式对象，保持内部字符的相对位置
+            # Create new formula object and recursively relocate child characters
             new_chars = []
             min_x = self.formular.box.x
             min_y = self.formular.box.y
 
             for char in self.formular.pdf_character:
-                # 计算相对位置
+                # Calculate relative position
                 rel_x = char.box.x - min_x
                 rel_y = char.box.y - min_y
 
                 visual_rel_x = char.visual_bbox.box.x - min_x
                 visual_rel_y = char.visual_bbox.box.y - min_y
 
-                # 创建新的字符对象
+                # Create new character object
                 new_char = PdfCharacter(
                     pdf_character_id=char.pdf_character_id,
                     char_unicode=char.char_unicode,
@@ -638,10 +687,11 @@ class TypesettingUnit:
             return new_tu
 
         elif self.unicode:
-            # 对于 Unicode 字符，我们存储新的位置信息
+            # For Unicode, store position info and create new TypesettingUnit
             new_unit = TypesettingUnit(
                 unicode=self.unicode,
                 font=self.font,
+                arabic_fallback_font=self.arabic_fallback_font,
                 original_font=self.original_font,
                 font_size=self.font_size * scale,
                 style=self.style,
@@ -767,14 +817,21 @@ class TypesettingUnit:
     def render(
         self,
     ) -> tuple[list[PdfCharacter], list[PdfCurve], list[PdfForm]]:
-        """渲染排版单元为 PdfCharacter 列表
+        """Render the typesetting unit to PdfCharacter list
 
         Returns:
-            PdfCharacter 列表
+            PdfCharacter list
         """
         if self.can_passthrough:
             return self.passthrough()
         elif self.unicode:
+            # Format control characters (Unicode category Cf: LRM, RLM, ALM,
+            # ZWJ, ZWNJ, Word Joiner, LRI/RLI/FSI/PDI, LRE/RLE/PDF/LRO/RLO)
+            # must remain present through shaping, tokenization, and BiDi
+            # ordering, but must NEVER be emitted as painted glyphs in the PDF
+            # (fonts such as NotoSerif map U+200E/U+200F to visible hook glyphs).
+            if len(self.unicode) == 1 and unicodedata.category(self.unicode) == "Cf":
+                return [], [], []
             assert self.x is not None, (
                 "x position must be set, should be set by `relocate`"
             )
@@ -786,19 +843,53 @@ class TypesettingUnit:
             )
             x = self.x
             y = self.y
-            # if self.original_font and self.font and hasattr(self.original_font, "descent") and hasattr(self.font, "descent_fontmap"):
-            #     original_descent = self.original_font.descent
-            #     new_descent = self.font.descent_fontmap
-            #     y -= (original_descent - new_descent) * self.font_size / 1000
 
-            # 计算字符宽度
+            # Calculate character width
             char_width = self.width
 
+            # A generated target character must never be emitted as glyph 0.
+            # A .notdef glyph corrupts both the visual PDF and its text layer;
+            # the resolver must choose a valid font before this point.
+            ch_code = ord(self.unicode) if self.unicode else 0
+            if 0xE000 <= ch_code <= 0xF8FF:
+                # PUA codepoints are defined by the source font, not Unicode.
+                # Never emit one into the Arabic target font: map it to the
+                # portable standard bullet even when a source font happened to
+                # advertise a glyph for the PUA codepoint.
+                self.unicode = '•'
+                ch_code = 0x2022
+
+            glyph_id = self.font.has_glyph(ch_code) if self.font is not None else 0
+            if (glyph_id == 0 or glyph_id is None) and self.arabic_fallback_font is not None:
+                fallback_glyph_id = self.arabic_fallback_font.has_glyph(ch_code)
+                if fallback_glyph_id:
+                    logger.warning(
+                        "Recovered target glyph %r (U+%04X) from %s using Arabic fallback %s",
+                        self.unicode,
+                        ch_code,
+                        self.font_id,
+                        self.arabic_fallback_font.font_id,
+                    )
+                    self.font = self.arabic_fallback_font
+                    self.font_id = self.arabic_fallback_font.font_id
+                    glyph_id = fallback_glyph_id
+
+            if self.font is None:
+                logger.error("Target glyph resolver returned no font for %r (U+%04X)", self.unicode, ch_code)
+                raise RuntimeError(
+                    f"No target font for '{self.unicode}' (U+{ch_code:04X}); refusing .notdef output"
+                )
+            elif glyph_id == 0 or glyph_id is None:
+                logger.error("Target font %s lacks %r (U+%04X)", self.font_id, self.unicode, ch_code)
+                raise RuntimeError(
+                    f"Font '{self.font_id}' lacks '{self.unicode}' (U+{ch_code:04X}); refusing .notdef output"
+                )
+
             new_char = PdfCharacter(
-                pdf_character_id=self.font.has_glyph(ord(self.unicode)),
+                pdf_character_id=glyph_id,
                 char_unicode=self.unicode,
                 box=Box(
-                    x=x,  # 使用存储的位置
+                    x=x,  # Use stored x position
                     y=y,
                     x2=x + char_width,
                     y2=y + self.font_size,
@@ -828,9 +919,11 @@ class Typesetting:
         self.font_mapper = FontMapper(translation_config)
         self.translation_config = translation_config
         self.lang_code = self.translation_config.lang_out.upper()
+        # Ensure detailed_logger attribute exists to avoid attribute access errors
+        self.detailed_logger = None
         self.is_cjk = (
             # Why zh-CN/zh-HK/zh-TW here but not zh-Hans and so on?
-            # See https://funstory-ai.github.io/BabelDOC/supported_languages/
+            
             ("ZH" in self.lang_code)  # C
             or ("JA" in self.lang_code)
             or ("JP" in self.lang_code)  # J
@@ -839,15 +932,321 @@ class Typesetting:
             or ("HK" in self.lang_code)
             or ("TW" in self.lang_code)
         )
+        # Arabic needs extra line spacing due to diacritical marks (harakat) above/below letters
+        self.is_arabic = (
+            ("AR" in self.lang_code)
+            or ("ARABIC" in self.lang_code)
+            or ("ARA" in self.lang_code)
+        )
+        # A page is traversed twice (preprocessing and rendering). Table geometry
+        # must be mirrored exactly once, before scale computation.
+        self._rtl_mirrored_table_pages: set[int] = set()
+        # ``Page`` is a slots dataclass, so per-page idempotency state belongs
+        # on the typesetter rather than being attached to the IL object.
+        self._vertical_collision_resolved_pages: set[int] = set()
+        self._rendered_collision_resolved_pages: set[int] = set()
+        self._heading_clearance_resolved_pages: set[int] = set()
+        self._inline_highlights_anchored_pages: set[int] = set()
+        self._translated_code_band_keys: set[tuple[int, int]] = set()
+        self._glyph_substitutions: dict[tuple[str, str, str], int] = {}
+        self._unsupported_glyph_count: int = 0
+        self._skipped_format_chars: dict[str, int] = {}
+        self._footnote_zone_stabilized_pages: set[int] = set()
+        self._semantic_table_audited_pages: set[int] = set()
+        self._semantic_tables_by_page: dict[int, list[SemanticTable]] = {}
+        self._layout_issues: list[dict[str, object]] = []
+        self._reported_layout_issue_keys: set[tuple[object, ...]] = set()
+        self._in_typesetting_document: bool = False
+
+    def _is_centered_display_text(self, paragraph, page) -> bool:
+        """Recognize large centered titles even when labeled as plain text."""
+        if not self.is_arabic or not page.cropbox or not page.cropbox.box:
+            return False
+        box = paragraph.box
+        style = paragraph.pdf_style
+        label = (paragraph.layout_label or "").lower()
+        if (
+            not box or not style or (style.font_size or 0) < 20
+            or paragraph.vertical or label not in {"title", "heading", "section_heading", "plain text"}
+        ):
+            return False
+        crop = page.cropbox.box
+        width = crop.x2 - crop.x
+        # Use the source text's own box, rather than assuming every large heading is centered.
+        return (
+            0 < box.x2 - box.x < width * 0.85
+            and abs((box.x + box.x2) - (crop.x + crop.x2)) <= width * 0.03
+            and not self._is_inside_table_or_figure_region(box, page)
+        )
+
+    def _arabic_publication_font_size(
+        self,
+        paragraph: il_version_1.PdfParagraph,
+        source_size: float,
+        *,
+        centered_display: bool = False,
+    ) -> float:
+        """Return a stable, readable Arabic type scale for translated text.
+
+        Source PDFs often use several nearly-identical Latin sizes (and, on
+        presentation PDFs, individual words can inherit very large or very
+        small sizes).  Mirroring that noise into Arabic is the main reason a
+        translated page looks uneven.  Arabic publication typography instead
+        uses a small role-based scale: one body size, a modest heading step,
+        and intentionally smaller table/note text.  Layout still expands a
+        box before it reduces this size, so this normalisation cannot trade
+        visual consistency for clipped text.
+        """
+        if not self.is_arabic:
+            return source_size
+
+        label = (paragraph.layout_label or "").lower()
+        if centered_display:
+            return min(source_size, paragraph.pdf_style.font_size)
+
+        if (
+            "fallback_line" in label
+            or "abandon" in label
+            or (
+                any(marker in label for marker in ("figure", "chart", "axis", "diagram"))
+                and "caption" not in label
+            )
+        ):
+            if 0 < source_size <= 9.5:
+                return round(min(9.5, source_size * 1.05), 2)
+
+        # Preserve the source hierarchy, but keep it narrow and predictable.
+        if any(marker in label for marker in ("title", "heading", "section")):
+            target_size = 14.0
+        elif any(marker in label for marker in ("caption", "footnote", "table_footnote")):
+            target_size = 9.5
+        elif "table" in label:
+            target_size = 9.5
+        else:
+            target_size = 11.5
+
+        # Noto Kurrent's Arabic has a smaller optical footprint than common
+        # Latin source fonts.  This is the final rendered target size, not a
+        # multiplier of a noisy source style, so every body paragraph matches.
+        return target_size
+
+    @staticmethod
+    def _contact_frame_bounds(
+        paragraph: il_version_1.PdfParagraph, page: il_version_1.Page
+    ) -> tuple[float, float] | None:
+        """Find the inside edges of a drawn frame enclosing a contact row."""
+        row = paragraph.box
+        if row is None or "contact_card" not in (paragraph.layout_label or "").lower():
+            return None
+
+        tolerance = 2.0
+        edges = [
+            curve.box for curve in page.pdf_curve
+            if curve.box is not None and curve.xobj_id == paragraph.xobj_id
+        ]
+        sides = [
+            edge for edge in edges
+            if edge.x2 - edge.x <= tolerance
+            and edge.y <= row.y + tolerance
+            and edge.y2 >= row.y2 - tolerance
+            and edge.y2 - edge.y > 2 * tolerance
+        ]
+        rules = [
+            edge for edge in edges
+            if edge.y2 - edge.y <= tolerance and edge.x2 - edge.x > 2 * tolerance
+        ]
+        frames = []
+        for left in sides:
+            if left.x2 > row.x + tolerance:
+                continue
+            for right in sides:
+                if right.x < row.x2 - tolerance or right.x - left.x2 <= 8:
+                    continue
+                if abs(left.y - right.y) > tolerance or abs(left.y2 - right.y2) > tolerance:
+                    continue
+                if all(
+                    any(
+                        abs(rule.x - left.x2) <= tolerance
+                        and abs(rule.x2 - right.x) <= tolerance
+                        and abs((rule.y + rule.y2) / 2 - height) <= tolerance
+                        for rule in rules
+                    )
+                    for height in (left.y, left.y2)
+                ):
+                    frames.append((left.x2, right.x))
+        return min(frames, key=lambda bounds: bounds[1] - bounds[0], default=None)
+
+    def _find_enclosing_region_box(
+        self, paragraph: il_version_1.PdfParagraph, page: il_version_1.Page
+    ) -> Box | None:
+        """Find the tightest drawn box/card enclosing this paragraph (code, form, badge, callout, receipt)."""
+        pbox = getattr(paragraph, "box", None)
+        if pbox is None or not page.cropbox or not page.cropbox.box:
+            return None
+        page_box = page.cropbox.box
+        page_w = max(1.0, page_box.x2 - page_box.x)
+        page_h = max(1.0, page_box.y2 - page_box.y)
+        pw = max(0.5, pbox.x2 - pbox.x)
+        ph = max(0.5, pbox.y2 - pbox.y)
+        cx = (pbox.x + pbox.x2) * 0.5
+        cy = (pbox.y + pbox.y2) * 0.5
+        tol = 1.5
+        candidates: list[Box] = []
+
+        def _consider(box: Box | None) -> None:
+            if box is None:
+                return
+            bw = box.x2 - box.x
+            bh = box.y2 - box.y
+            if bw < max(8.0, pw * 0.72) or bh < max(8.0, ph * 0.72):
+                return
+            # Exclude full-page border frames / backgrounds so normal body prose can still mirror.
+            if bw > page_w * 0.85 and bh > page_h * 0.85:
+                return
+            if bw > page_w * 0.88:
+                return
+            if (box.x - tol) <= cx <= (box.x2 + tol) and (box.y - tol) <= cy <= (box.y2 + tol):
+                candidates.append(box)
+
+        for rect in getattr(page, "pdf_rectangle", None) or []:
+            rx = getattr(rect, "xobj_id", None)
+            if rx is not None and paragraph.xobj_id is not None and rx != paragraph.xobj_id:
+                continue
+            _consider(getattr(rect, "box", None))
+
+        for curve in getattr(page, "pdf_curve", None) or []:
+            cxobj = getattr(curve, "xobj_id", None)
+            if cxobj is not None and paragraph.xobj_id is not None and cxobj != paragraph.xobj_id:
+                continue
+            cbox = getattr(curve, "box", None)
+            if cbox is not None and (cbox.x2 - cbox.x) > 3.0 and (cbox.y2 - cbox.y) > 3.0:
+                _consider(cbox)
+
+        if not candidates:
+            return None
+        return min(candidates, key=lambda b: (b.x2 - b.x) * (b.y2 - b.y))
+
+    def _expand_structured_text_boxes(self, page: il_version_1.Page) -> None:
+        """Provide full-width lanes for structured records and short headings.
+
+        Structured blocks are identified from their content, not from a
+        document-specific page number.  Their English labels are frequently
+        painted in narrow fragments even though the surrounding section is a
+        full-width instruction area.  Expanding only these labelled records
+        prevents Arabic labels from shrinking and gives wrapped descriptions
+        a stable alignment while leaving tables and diagrams untouched.
+        """
+        if not page.cropbox or not page.cropbox.box:
+            return
+        page_box = page.cropbox.box
+        page_width = page_box.x2 - page_box.x
+        content_left = page_box.x + page_width * 0.055
+        content_right = page_box.x2 - page_width * 0.055
+        self._anchor_text_next_to_illustrations(page)
+        for paragraph in page.pdf_paragraph or []:
+            if not paragraph.box:
+                continue
+            label = (paragraph.layout_label or "").lower()
+            is_structured = any(
+                marker in label for marker in ("procedure_step", "contact_card")
+            )
+            is_narrow_heading = (
+                "heading" in label
+                and paragraph.box.x2 - paragraph.box.x < page_width * 0.60
+            )
+            if not (is_structured or is_narrow_heading):
+                continue
+            if (paragraph.pipeline_trace or {}).get("anchored_to_illustration"):
+                continue
+            if "fallback_line" in label or self._is_inside_table_or_figure_region(paragraph.box, page):
+                continue
+            if self._is_fixed_table_paragraph(paragraph) and "table" in label:
+                continue
+            if self._is_arabic_output() and (frame := self._contact_frame_bounds(paragraph, page)):
+                paragraph.box = Box(frame[0] + 4, paragraph.box.y, frame[1] - 4, paragraph.box.y2)
+                continue
+            if (enclosing := self._find_enclosing_region_box(paragraph, page)) is not None:
+                pad = 1.5 if (enclosing.x2 - enclosing.x) < 40.0 else 3.0
+                paragraph.box = Box(
+                    max(paragraph.box.x, enclosing.x + pad),
+                    paragraph.box.y,
+                    min(paragraph.box.x2, enclosing.x2 - pad),
+                    paragraph.box.y2,
+                )
+                continue
+            # Do not expand laterally across column lanes, images/barcodes, or side-by-side cards.
+            cand_left = min(paragraph.box.x, content_left)
+            cand_right = max(paragraph.box.x2, content_right)
+            col_lane = (paragraph.pipeline_trace or {}).get("column_lane")
+            if isinstance(col_lane, (list, tuple)) and len(col_lane) == 2:
+                cand_left = max(cand_left, float(col_lane[0]))
+                cand_right = min(cand_right, float(col_lane[1]))
+            for form in getattr(page, "pdf_form", None) or []:
+                fbox = getattr(form, "box", None)
+                if fbox and min(fbox.y2, paragraph.box.y2) - max(fbox.y, paragraph.box.y) > 2.0:
+                    if fbox.x2 <= paragraph.box.x + 2.0:
+                        cand_left = max(cand_left, fbox.x2 + 4.0)
+                    elif fbox.x >= paragraph.box.x2 - 2.0:
+                        cand_right = min(cand_right, fbox.x - 4.0)
+            for other in page.pdf_paragraph or []:
+                if other is paragraph or not other.box:
+                    continue
+                if min(other.box.y2, paragraph.box.y2) - max(other.box.y, paragraph.box.y) > 2.0:
+                    if other.box.x2 <= paragraph.box.x + 2.0:
+                        cand_left = max(cand_left, other.box.x2 + 4.0)
+                    elif other.box.x >= paragraph.box.x2 - 2.0:
+                        cand_right = min(cand_right, other.box.x - 4.0)
+            paragraph.box = Box(
+                cand_left,
+                paragraph.box.y,
+                max(cand_left + 10.0, cand_right),
+                paragraph.box.y2,
+            )
+
+    def _reserve_formula_lane(self, page: il_version_1.Page) -> None:
+        """Keep Arabic prose out of a left-side equation/value lane.
+
+        Technical PDFs often paint calculations in a narrow LTR strip while
+        the explanatory text occupies the remaining RTL column.  Treating the
+        strip as ordinary text makes later reflow cross an implicit gutter.
+        This derives the gutter from isolated numeric/formula records instead
+        of relying on a page number or hard-coded coordinates.
+        """
+        if not self._is_arabic_output() or not page.cropbox or not page.cropbox.box:
+            return
+        page_box = page.cropbox.box
+        width = page_box.x2 - page_box.x
+        candidates = []
+        for paragraph in page.pdf_paragraph or []:
+            if not paragraph.box or self._is_paragraph_inside_table(paragraph, page):
+                continue
+            text = (paragraph.unicode or "").strip()
+            label = (paragraph.layout_label or "").lower()
+            is_ltr_value = bool(re.fullmatch(r"[A-Za-z0-9\s./=+\-()]+", text)) and any(c.isdigit() for c in text)
+            if ("formula" in label or is_ltr_value) and paragraph.box.x2 <= page_box.x + width * 0.48:
+                candidates.append(paragraph.box.x2)
+        if len(candidates) < 2:
+            return
+        lane_right = max(candidates) + width * 0.035
+        for paragraph in page.pdf_paragraph or []:
+            if not paragraph.box or self._is_paragraph_inside_table(paragraph, page):
+                continue
+            text = (paragraph.unicode or "").strip()
+            label = (paragraph.layout_label or "").lower()
+            is_formula = "formula" in label or (bool(re.fullmatch(r"[A-Za-z0-9\s./=+\-()]+", text)) and any(c.isdigit() for c in text))
+            if not is_formula and paragraph.box.x < lane_right:
+                paragraph.box.x = min(lane_right, paragraph.box.x2 - width * 0.12)
 
     def preprocess_document(self, document: il_version_1.Document, pbar):
-        """预处理文档，获取每个段落的最优缩放因子，不执行实际排版"""
+        """Preprocess document - calculate optimal scale for each paragraph and cache the result"""
         all_scales: list[float] = []
         all_paragraphs: list[il_version_1.PdfParagraph] = []
+        centered_display_ids: set[int] = set()
 
         for page in document.page:
             pbar.advance()
-            # 准备字体信息（复制自 render_page 的逻辑）
+            self._mirror_table_grids_for_rtl(page)
+            # Build font dictionary for current page rendering logic
             fonts: dict[
                 str | int,
                 il_version_1.PdfFont | dict[str, il_version_1.PdfFont],
@@ -866,35 +1265,61 @@ class Typesetting:
                         ):
                             fonts[xobj.xobj_id][font.font_id] = font
 
-            # 处理每个段落
+            # Finalize table geometry before measuring text. Adjusting cell
+            # heights after text placement creates the jagged/overlapping rows
+            # seen in the Qatar IBAN sample.
+            self._ensure_semantic_table_models(page)
+            self._synchronize_table_row_heights(page)
+            # Balance table row widths before optimal scale calculation
+            self._balance_table_row_widths(page, fonts)
+            self._reserve_formula_lane(page)
+            # Labels such as ``Step 11`` are often extracted into a box only
+            # wide enough for the short English source.  Give every structured
+            # record the full text lane before Arabic measurement; otherwise
+            # the label is needlessly reduced to a microscopic scale.
+            self._expand_structured_text_boxes(page)
+            # A malformed source frequently gives a section label and its
+            # following body text intersecting fallback boxes.  Reserve the
+            # label's own vertical lane before either paragraph is measured;
+            # otherwise body expansion begins inside the label and the two
+            # Arabic runs are committed on the same baseline.
+            self._reserve_heading_clearance_from_tables(page)
+            self._stabilize_footnote_zone(page)
+            self._resolve_vertical_paragraph_collisions(page)
+
+            # Preprocess each paragraph
             for paragraph in page.pdf_paragraph:
                 all_paragraphs.append(paragraph)
+                if self._is_centered_display_text(paragraph, page):
+                    centered_display_ids.add(id(paragraph))
                 unit_count = 0
                 try:
-                    typesetting_units = self.create_typesetting_units(paragraph, fonts)
+                    typesetting_units = self._deduplicate_artificial_header_units(
+                        paragraph, page, self.create_typesetting_units(paragraph, fonts, page=page)
+                    )
                     unit_count = len(typesetting_units)
                     for unit in typesetting_units:
                         if unit.formular:
                             unit_count += len(unit.formular.pdf_character) - 1
 
-                    # 如果所有单元都可以直接传递，则 scale = 1.0
+                    # Get optimal scale value (if all can passthrough, scale = 1.0)
                     if all(unit.can_passthrough for unit in typesetting_units):
                         paragraph.optimal_scale = 1.0
                     else:
-                        # 获取最优缩放因子
+                        # Get optimal scale factor
                         optimal_scale = self._get_optimal_scale(
                             paragraph, page, typesetting_units
                         )
                         paragraph.optimal_scale = optimal_scale
                 except Exception as e:
-                    # 如果预处理出错，默认使用 1.0 缩放因子
-                    logger.warning(f"预处理段落时出错：{e}")
+                    # If preprocessing paragraph fails, default scale is 1.0
+                    logger.warning(f"Preprocessing paragraph failed: {e}")
                     paragraph.optimal_scale = 1.0
 
                 if paragraph.optimal_scale is not None:
                     all_scales.extend([paragraph.optimal_scale] * unit_count)
 
-        # 获取缩放因子的众数
+        # Get optimal scale factor, estimate the mode of the distribution as starting point for scale selection
         if all_scales:
             try:
                 modes = statistics.multimode(all_scales)
@@ -904,17 +1329,336 @@ class Typesetting:
                     "Could not find a mode for paragraph scales. Falling back to median."
                 )
                 mode_scale = statistics.median(all_scales)
-            # 将所有大于众数的值修改为众数
+            # Too many times using a smaller scale will affect readability, so use the mode as the upper limit
+            # Do NOT clamp titles, headers, captions, or table content to body text mode_scale
             for paragraph in all_paragraphs:
-                if (
-                    paragraph.optimal_scale is not None
-                    and paragraph.optimal_scale > mode_scale
-                ):
-                    paragraph.optimal_scale = mode_scale
+                layout_label = (paragraph.layout_label or "").lower()
+                is_hierarchy_exempt = any(
+                    marker in layout_label
+                    for marker in ["title", "heading", "caption", "table", "footnote", "fallback_line"]
+                )
+                if not is_hierarchy_exempt and id(paragraph) not in centered_display_ids:
+                    if (
+                        paragraph.optimal_scale is not None
+                        and paragraph.optimal_scale > mode_scale
+                    ):
+                        paragraph.optimal_scale = mode_scale
         else:
             logger.error(
                 "document_scales is empty, there seems no paragraph in this PDF"
             )
+
+    def shape_arabic_text(self, text: str) -> str:
+        """Shape Arabic text for proper glyph joining (ligatures, contextual forms).
+
+        IMPORTANT: This function only applies arabic_reshaper for character joining.
+        It does NOT apply bidi get_display() reordering, because the PDF layout engine
+        handles character positioning via explicit (x,y) coordinates.
+
+        Args:
+            text: Input text to shape
+
+        Returns:
+            Shaped text if language is Arabic, original text otherwise
+        """
+        if not text:
+            return text
+
+        # Robust Arabic output detection
+        lang_out = (self.translation_config.lang_out or "").lower()
+        is_arabic = False
+        if lang_out in ("en-ar", "ar", "ara", "arabic"):
+            is_arabic = True
+        elif "-ar" in lang_out or "->ar" in lang_out or "/ar" in lang_out:
+            is_arabic = True
+
+        if is_arabic:
+            logger.debug("Shaping Arabic text (reshape only, no bidi reorder)")
+            try:
+                if not re.search(r'[\uFB50-\uFDFF\uFE70-\uFEFF]', text):
+                    from arabic_reshaper import ArabicReshaper
+                    configuration = {
+                        'delete_harakat': False,
+                        'support_ligatures': True,
+                        'RIAL SIGN': True,
+                        'ARABIC COMMA': True,
+                        'ARABIC SEMICOLON': True,
+                        'ARABIC QUESTION MARK': True,
+                        'ZWNJ': True,
+                    }
+                    reshaper = ArabicReshaper(configuration=configuration)
+                    if "\u200d" in text:
+                        # ZWJ (U+200D) requests contextual Arabic joining without
+                        # rendering a visible tatweel. Substitute U+0640 during
+                        # reshape so adjacent letters take initial/medial/final
+                        # forms, then restore the original U+200D vs U+0640 sequence.
+                        joiner_seq = iter([ch for ch in text if ch in ("\u0640", "\u200d")])
+                        reshaped_tmp = reshaper.reshape(text.replace("\u200d", "\u0640"))
+                        reshaped_text = "".join(
+                            next(joiner_seq, "\u200d") if ch == "\u0640" else ch
+                            for ch in reshaped_tmp
+                        )
+                    else:
+                        reshaped_text = reshaper.reshape(text)
+                    # DO NOT call get_display() - PDF layout engine handles positioning
+                    return reshaped_text
+                else:
+                    return text
+            except Exception as e:
+                logger.warning(f"Failed to shape Arabic text: {e}")
+                return text
+
+        return text
+
+    _SCIENTIFIC_MULTIPLICATION_OPERATORS = frozenset({
+        "\u00d7",  # × MULTIPLICATION SIGN
+        "\u22c5",  # ⋅ DOT OPERATOR
+        "\u2217",  # ∗ ASTERISK OPERATOR
+        "\u2297",  # ⊗ CIRCLED TIMES
+        "\u2a2f",  # ⨯ VECTOR OR CROSS PRODUCT
+    })
+    _SCIENTIFIC_PROTECTED_OPERATORS = _SCIENTIFIC_MULTIPLICATION_OPERATORS | frozenset({
+        "\u2212",  # − MINUS SIGN
+        "\u00f7",  # ÷ DIVISION SIGN
+        "\u00b1",  # ± PLUS-MINUS SIGN
+        "\u2264",  # ≤ LESS-THAN OR EQUAL TO
+        "\u2265",  # ≥ GREATER-THAN OR EQUAL TO
+        "\u2260",  # ≠ NOT EQUAL TO
+        "\u2248",  # ≈ ALMOST EQUAL TO
+        "\u221e",  # ∞ INFINITY
+        "\u00b7",  # · MIDDLE DOT
+    })
+    _CROSS_GLYPHS = frozenset({
+        "\u2715",  # ✕ MULTIPLICATION X
+        "\u2716",  # ✖ HEAVY MULTIPLICATION X
+        "\u2717",  # ✗ BALLOT X
+        "\u2718",  # ✘ HEAVY BALLOT X
+        "\u274c",  # ❌ CROSS MARK
+        "\u2612",  # ☒ BALLOT BOX WITH X
+        "x",
+        "X",
+    })
+    _SYMBOL_GLYPH_FALLBACKS = {
+        "\u2610": "\u25a1",  # ☐ -> □
+        "\u25fb": "\u25a1",  # ◻ -> □
+        "\u25fd": "\u25a1",  # ◽ -> □
+        "\u25af": "\u25a1",  # ▯ -> □
+        "\u2b1c": "\u25a1",  # ⬜ -> □
+        "\u2b1b": "\u25a0",  # ⬛ -> ■
+        "\u2611": "\u2713",  # ☑ -> ✓
+        "\u2714": "\u2713",  # ✔ -> ✓
+        "\u2705": "\u2713",  # ✅ -> ✓
+        "\u2612": "\u22a0",  # ☒ -> ⊠
+        "\u2715": "\u00d7",  # ✕ -> ×
+        "\u2716": "\u00d7",  # ✖ -> ×
+        "\u2717": "\u00d7",  # ✗ -> ×
+        "\u2718": "\u00d7",  # ✘ -> ×
+        "\u274c": "\u00d7",  # ❌ -> ×
+        "\u25b8": "\u2023",  # ▸ -> ‣
+        "\u25b9": "\u2023",  # ▹ -> ‣
+        "\u22c5": "\u2219",  # ⋅ -> ∙ (dot multiplication operator)
+        "\u2217": "*",       # ∗ -> * (asterisk operator)
+        "\u2a2f": "\u00d7",  # ⨯ -> × (vector cross product)
+    }
+
+    @staticmethod
+    def _is_variation_selector(codepoint: int) -> bool:
+        """Return True for Unicode variation selectors that never render standalone."""
+        return (
+            0xFE00 <= codepoint <= 0xFE0F
+            or 0xE0100 <= codepoint <= 0xE01EF
+            or 0x180B <= codepoint <= 0x180D
+            or codepoint == 0x180F
+        )
+
+    @classmethod
+    def _is_forbidden_operator_substitution(cls, source: str, target: str) -> bool:
+        """Never downgrade scientific/mathematical operators into cross/ballot glyphs."""
+        return (
+            source in cls._SCIENTIFIC_PROTECTED_OPERATORS
+            and target in cls._CROSS_GLYPHS
+        )
+
+    def _record_glyph_substitution(
+        self,
+        source: str,
+        replacement: str,
+        reason: str,
+        paragraph=None,
+    ) -> None:
+        key = (source, replacement, reason)
+        first_seen = key not in self._glyph_substitutions
+        self._glyph_substitutions[key] = self._glyph_substitutions.get(key, 0) + 1
+        if reason == "unsupported_replacement":
+            self._unsupported_glyph_count += 1
+        if first_seen:
+            para_id = getattr(paragraph, "debug_id", None) or "<unknown>"
+            log_fn = logger.warning if reason == "unsupported_replacement" else logger.info
+            log_fn(
+                "Glyph substitution [%s]: %r (U+%04X) -> %r (U+%04X) in paragraph %s",
+                reason,
+                source,
+                ord(source),
+                replacement,
+                ord(replacement),
+                para_id,
+            )
+
+    def get_glyph_substitution_summary(self) -> dict[str, object]:
+        total = sum(self._glyph_substitutions.values())
+        by_reason: dict[str, int] = {}
+        entries = []
+        for (src, dst, reason), count in sorted(
+            self._glyph_substitutions.items(),
+            key=lambda item: (-item[1], ord(item[0][0]), item[0][2]),
+        ):
+            by_reason[reason] = by_reason.get(reason, 0) + count
+            entries.append(
+                {
+                    "source": src,
+                    "source_codepoint": f"U+{ord(src):04X}",
+                    "replacement": dst,
+                    "replacement_codepoint": f"U+{ord(dst):04X}",
+                    "reason": reason,
+                    "count": count,
+                }
+            )
+        return {
+            "total_substitutions": total,
+            "unsupported_replacement_count": self._unsupported_glyph_count,
+            "by_reason": by_reason,
+            "substitutions": entries,
+        }
+
+    def _log_and_report_glyph_substitutions(self) -> None:
+        summary = self.get_glyph_substitution_summary()
+        total = int(summary["total_substitutions"])
+        if total > 0:
+            log_fn = logger.warning if self._unsupported_glyph_count > 0 else logger.info
+            log_fn(
+                "Typesetting glyph substitution summary: total=%d unsupported_replacements=%d by_reason=%s",
+                total,
+                self._unsupported_glyph_count,
+                summary["by_reason"],
+            )
+        shared_ctx = getattr(self.translation_config, "shared_context_cross_split_part", None)
+        ledger = getattr(shared_ctx, "content_ledger", None)
+        if ledger is not None and hasattr(ledger, "record_glyph_substitutions"):
+            ledger.record_glyph_substitutions(summary)
+
+    def _preflight_arabic_run(self, text: str, font: pymupdf.Font) -> None:
+        """Validate contextual shaping against the actual embedded target font.
+
+        HarfBuzz produces glyphs in visual order, while this engine performs
+        visual ordering only after line breaking.  The glyph plan is therefore
+        used as a validation/diagnostic pass here, not emitted directly.
+        """
+        if not self.is_arabic or not text or not getattr(font, "font_path", None):
+            return
+        # Mixed paragraphs combine Arabic runs with Latin labels and symbols
+        # (such as checkbox glyphs or stars) that resolve_unicode maps to other
+        # target fonts later.  Only validate Arabic codepoints against the
+        # Arabic face while keeping word-boundary spaces for contextual shaping.
+        preflight_text = "".join(
+            char if is_arabic_codepoint(ord(char)) else " "
+            for char in text
+            if unicodedata.category(char) not in {"Cc", "Cf"}
+        )
+        if not preflight_text.strip():
+            return
+        try:
+            shaped = shape_arabic_run(preflight_text, font.font_path)
+        except OSError as error:
+            logger.warning("HarfBuzz font preflight skipped for %s: %s", font.font_id, error)
+            return
+        if shaped is None:
+            return
+        if shaped.has_missing_glyphs:
+            raise RuntimeError(
+                f"HarfBuzz found missing glyphs in Arabic run for target font {font.font_id}: {text!r}"
+            )
+        logger.debug(
+            "HarfBuzz shaped Arabic run: font=%s glyphs=%d clusters=%d",
+            font.font_id,
+            len(shaped.glyphs),
+            len({glyph.cluster for glyph in shaped.glyphs}),
+        )
+
+    def _commit_layout_to_paragraph(
+        self,
+        paragraph: il_version_1.PdfParagraph,
+        page: il_version_1.Page,
+        typeset_units: list[TypesettingUnit],
+        scale: float,
+    ):
+        """Helper to write laid-out units into paragraph composition, curves, and forms."""
+        paragraph.scale = scale
+        paragraph.pdf_paragraph_composition = []
+        code_line_boxes: dict[int, list[Box]] = {}
+        for unit in typeset_units:
+            if unit.is_drawn_list_bullet:
+                # The paragraph can still move during margin and collision
+                # handling. Keep the bullet curve owned by its text.
+                paragraph.pdf_paragraph_composition.append(
+                    PdfParagraphComposition(pdf_formula=unit.formular)
+                )
+                continue
+            if getattr(unit, "presentation_role", None) == "procedure_code" and unit.box:
+                code_line_boxes.setdefault(getattr(unit, "line_id", -1), []).append(unit.box)
+            chars, curves, forms = unit.render()
+            for char in chars:
+                paragraph.pdf_paragraph_composition.append(
+                    PdfParagraphComposition(pdf_character=char),
+                )
+            for curve in curves:
+                page.pdf_curve.append(curve)
+            for form in forms:
+                page.pdf_form.append(form)
+
+        # Code/result rows are semantic content, not decorative leftovers.
+        # Draw a controlled neutral band behind the final Arabic glyph bounds
+        # so samples, IBANs and MOD-97 results read as one LTR unit.
+        for line_id, boxes in code_line_boxes.items():
+            key = (id(paragraph), line_id)
+            if key in self._translated_code_band_keys:
+                continue
+            self._translated_code_band_keys.add(key)
+            x1 = max(paragraph.box.x, min(box.x for box in boxes) - 5.0)
+            x2 = min(paragraph.box.x2, max(box.x2 for box in boxes) + 5.0)
+            y1 = min(box.y for box in boxes) - 2.0
+            y2 = max(box.y2 for box in boxes) + 2.0
+            if x2 > x1 and y2 > y1:
+                page.pdf_rectangle.append(
+                    il_version_1.PdfRectangle(
+                        box=Box(x1, y1, x2, y2),
+                        graphic_state=GRAY80,
+                        fill_background=True,
+                        # This sentinel is deliberately rendered in normal
+                        # production output by PDFCreator, unlike debug boxes.
+                        debug_info="translated_code_band",
+                        xobj_id=paragraph.xobj_id,
+                        render_order=15,
+                    )
+                )
+
+    @staticmethod
+    def _shift_laid_out_units_vertically(
+        units: list[TypesettingUnit], delta: float
+    ) -> list[TypesettingUnit]:
+        """Move a completed candidate layout without changing its scale."""
+        if delta <= 0.0:
+            return units
+        shifted: list[TypesettingUnit] = []
+        for unit in units:
+            if not unit.box:
+                shifted.append(unit)
+                continue
+            relocated = unit.relocate(unit.box.x, unit.box.y + delta, 1.0)
+            for attribute in ("line_id", "presentation_role"):
+                if hasattr(unit, attribute):
+                    setattr(relocated, attribute, getattr(unit, attribute))
+            shifted.append(relocated)
+        return shifted
 
     def _find_optimal_scale_and_layout(
         self,
@@ -925,33 +1669,147 @@ class Typesetting:
         use_english_line_break: bool = True,
         apply_layout: bool = False,
     ) -> tuple[float, list[TypesettingUnit] | None]:
-        """查找最优缩放因子并可选择性地执行布局
+        """Find the optimal scale factor and apply layout if needed
 
         Args:
-            paragraph: 段落对象
-            page: 页面对象
-            typesetting_units: 排版单元列表
-            initial_scale: 初始缩放因子
-            use_english_line_break: 是否使用英文换行规则
-            apply_layout: 是否应用布局到 paragraph（True 时执行实际排版）
+            paragraph: Paragraph object
+            page: Page object
+            typesetting_units: List of typesetting units
+            initial_scale: Starting scale factor
+            use_english_line_break: Whether to use English line breaking rules
+            apply_layout: Whether to apply layout and update the paragraph
 
         Returns:
-            tuple[float, list[TypesettingUnit] | None]: (最终缩放因子，排版后的单元列表或 None)
+            tuple[float, list[TypesettingUnit]]: (optimal scale factor, laid out typesetting units)
         """
         if not paragraph.box:
             return initial_scale, None
 
         box = paragraph.box
         scale = initial_scale
-        line_skip = 1.50 if self.is_cjk else 1.3
-        min_scale = 0.1
-        expand_space_flag = 0
+        layout_units = partial(
+            self._layout_typesetting_units,
+            centered_display=self._is_centered_display_text(paragraph, page),
+        )
+        # Arabic needs extra line spacing (1.5) due to diacritical marks above/below letters
+        # CJK also needs 1.5 due to character height
+        # Other languages use 1.3
+        if self.is_cjk:
+            line_skip = 1.50
+        elif self.is_arabic:
+            line_skip = 1.50  # Arabic needs extra space for diacritical marks (harakat)
+        else:
+            line_skip = 1.3
+
+        # Role-based minimum scale floors and relief floors to preserve typographic hierarchy
+        layout_label = (paragraph.layout_label or "").lower()
+        is_figure_or_fallback = (
+            "fallback_line" in layout_label
+            or self._is_inside_table_or_figure_region(box, page, figures_only=True)
+        )
+        if is_figure_or_fallback:
+            line_skip = 1.25
+            min_scale = 0.60
+            relief_floor = 0.52
+        elif "title" in layout_label or "heading" in layout_label:
+            min_scale = 0.90  # Headings normal floor
+            relief_floor = 0.82  # Relief floor if expansion is blocked
+        elif "contact_card" in layout_label:
+            # A contact rectangle is a structured field block, not a footnote.
+            # It must remain readable even when its source box is oversized.
+            min_scale = 0.86
+            relief_floor = 0.76
+        elif "procedure_step" in layout_label:
+            # Keep a numbered instruction and its protected formula legible.
+            min_scale = 0.80
+            relief_floor = 0.70
+        elif "caption" in layout_label:
+            min_scale = 0.82
+            relief_floor = 0.75  # Relief floor if expansion is blocked
+        elif "table_footnote" in layout_label or "footnote" in layout_label:
+            min_scale = 0.75
+            relief_floor = 0.70
+        elif "table" in layout_label:
+            min_scale = 0.65
+            box_w = (box.x2 - box.x) if box is not None else 200.0
+            relief_floor = 0.45 if ("table_cell" in layout_label and box_w < 160.0) else 0.52
+        else:
+            # Text is expanded/reflowed before reaching this relief floor.
+            # A readable body should never become a microscopic last resort.
+            min_scale = 0.82
+            relief_floor = 0.76
+
+        best_typeset_units = None
+        best_scale = scale
         final_typeset_units = None
 
-        while scale >= min_scale:
+        # Compute safe inter-paragraph separation margin based on unit font height
+        unit_heights = [u.height for u in typesetting_units if u.height]
+        try:
+            unit_h = statistics.median(unit_heights) if unit_heights else 10.0
+        except Exception:
+            unit_h = 10.0
+        safety_margin = max(8.0, unit_h * 0.85)
+
+        # Try initial layout at current scale
+        try:
+            typeset_units, all_units_fit = layout_units(
+                typesetting_units,
+                box,
+                scale,
+                line_skip,
+                paragraph,
+                use_english_line_break,
+            )
+            if typeset_units:
+                best_typeset_units = typeset_units
+                best_scale = scale
+
+            if all_units_fit:
+                if apply_layout:
+                    self._commit_layout_to_paragraph(paragraph, page, typeset_units, scale)
+                    final_typeset_units = typeset_units
+                return scale, final_typeset_units
+        except Exception:
+            pass
+
+        # 1. On overflow, attempt box expansion via get_max_bottom_space FIRST,
+        # before any scale reduction — this preserves full-size type for titles/captions when free space exists below.
+        if not is_figure_or_fallback:
             try:
-                # 尝试布局排版单元
-                typeset_units, all_units_fit = self._layout_typesetting_units(
+                min_avail_y = self.get_max_bottom_space(box, page, paragraph=paragraph) + safety_margin
+                if min_avail_y < box.y:
+                    expanded_box = Box(x=box.x, y=min_avail_y, x2=box.x2, y2=box.y2)
+                    box = expanded_box
+                    if apply_layout:
+                        paragraph.box = expanded_box
+                    typeset_units, all_units_fit = layout_units(
+                        typesetting_units,
+                        box,
+                        scale,
+                        line_skip,
+                        paragraph,
+                        use_english_line_break,
+                    )
+                    if typeset_units:
+                        best_typeset_units = typeset_units
+                        best_scale = scale
+                    if all_units_fit:
+                        if apply_layout:
+                            self._commit_layout_to_paragraph(paragraph, page, typeset_units, scale)
+                            final_typeset_units = typeset_units
+                        return scale, final_typeset_units
+            except Exception as e:
+                logger.debug(f"Error expanding bottom space: {e}")
+
+        # 2. Only if expansion is blocked, fall into progressive scale reduction down to relief floor
+        while scale > relief_floor:
+            scale -= 0.05
+            if scale < relief_floor:
+                scale = relief_floor
+
+            try:
+                typeset_units, all_units_fit = layout_units(
                     typesetting_units,
                     box,
                     scale,
@@ -959,89 +1817,49 @@ class Typesetting:
                     paragraph,
                     use_english_line_break,
                 )
+                if typeset_units:
+                    best_typeset_units = typeset_units
+                    best_scale = scale
 
-                # 如果所有单元都放得下
                 if all_units_fit:
                     if apply_layout:
-                        # 实际应用排版结果
-                        paragraph.scale = scale
-                        paragraph.pdf_paragraph_composition = []
-                        for unit in typeset_units:
-                            chars, curves, forms = unit.render()
-                            for char in chars:
-                                paragraph.pdf_paragraph_composition.append(
-                                    PdfParagraphComposition(pdf_character=char),
-                                )
-                            for curve in curves:
-                                page.pdf_curve.append(curve)
-                            for form in forms:
-                                page.pdf_form.append(form)
+                        self._commit_layout_to_paragraph(paragraph, page, typeset_units, scale)
                         final_typeset_units = typeset_units
                     return scale, final_typeset_units
+
+                # Re-check bottom space expansion at this reduced scale
+                if not is_figure_or_fallback:
+                    min_avail_y = self.get_max_bottom_space(box, page, paragraph=paragraph) + safety_margin
+                    if min_avail_y < box.y:
+                        expanded_box = Box(x=box.x, y=min_avail_y, x2=box.x2, y2=box.y2)
+                        box = expanded_box
+                        if apply_layout:
+                            paragraph.box = expanded_box
+                        typeset_units, all_units_fit = layout_units(
+                            typesetting_units,
+                            box,
+                            scale,
+                            line_skip,
+                            paragraph,
+                            use_english_line_break,
+                        )
+                        if typeset_units:
+                            best_typeset_units = typeset_units
+                            best_scale = scale
+                        if all_units_fit:
+                            if apply_layout:
+                                self._commit_layout_to_paragraph(paragraph, page, typeset_units, scale)
+                                final_typeset_units = typeset_units
+                            return scale, final_typeset_units
             except Exception:
-                # 如果布局检查出错，继续尝试下一个缩放因子
                 pass
 
-            # 添加与原 retypeset 一致的逻辑检查
-            if not hasattr(paragraph, "debug_id") or not paragraph.debug_id:
-                return scale, final_typeset_units
+            if scale <= relief_floor:
+                break
 
-            # 减小缩放因子
-            if scale > 0.6:
-                scale -= 0.05
-            else:
-                scale -= 0.1
-
-            if scale < 0.7:
-                space_expanded = False  # 标记是否成功扩展了空间
-
-                if expand_space_flag == 0:
-                    # 尝试向下扩展
-                    try:
-                        min_y = self.get_max_bottom_space(box, page) + 2
-                        if min_y < box.y:
-                            expanded_box = Box(x=box.x, y=min_y, x2=box.x2, y2=box.y2)
-                            box = expanded_box
-                            if apply_layout:
-                                # 更新段落的边界框
-                                paragraph.box = expanded_box
-                            space_expanded = True
-                    except Exception:
-                        pass
-                    expand_space_flag = 1
-
-                    # 只有成功扩展空间时才 continue，否则继续减小 scale
-                    if space_expanded:
-                        continue
-
-                elif expand_space_flag == 1:
-                    # 尝试向右扩展
-                    try:
-                        max_x = self.get_max_right_space(box, page) - 5
-                        if max_x > box.x2:
-                            expanded_box = Box(x=box.x, y=box.y, x2=max_x, y2=box.y2)
-                            box = expanded_box
-                            if apply_layout:
-                                # 更新段落的边界框
-                                paragraph.box = expanded_box
-                            space_expanded = True
-                    except Exception:
-                        pass
-                    expand_space_flag = 2
-
-                    # 只有成功扩展空间时才 continue，否则继续减小 scale
-                    if space_expanded:
-                        continue
-
-                # 只有在扩展尝试阶段 (expand_space_flag < 2) 且扩展失败时才重置 scale
-                # 当 expand_space_flag >= 2 时，说明已经尝试过所有扩展，应该继续正常的 scale 减小
-                if expand_space_flag < 2:
-                    # 如果无法扩展空间，重置 scale 并继续循环
-                    scale = 1.0
-
-        # 如果仍然放不下，尝试去除英文换行限制
+        # Fallback with use_english_line_break=False if initial try used it
         if use_english_line_break:
-            return self._find_optimal_scale_and_layout(
+            res_scale, res_units = self._find_optimal_scale_and_layout(
                 paragraph,
                 page,
                 typesetting_units,
@@ -1049,8 +1867,73 @@ class Typesetting:
                 use_english_line_break=False,
                 apply_layout=apply_layout,
             )
+            if res_units is not None and len(res_units) > 0:
+                return res_scale, res_units
 
-        # 最后返回最小缩放因子
+        # 3. If the loop still can't fit the text, NEVER return None.
+        # Track best_typeset_units across iterations, expand paragraph.box.y to encompass
+        # the best-effort layout, and populate the composition at relief_floor/min_scale.
+        # The paragraph must always be formatted.
+        if best_typeset_units is not None and len(best_typeset_units) > 0:
+            min_unit_y = min((u.box.y for u in best_typeset_units if u.box and u.box.y is not None), default=box.y)
+            safe_bottom = self.get_max_bottom_space(box, page, paragraph=paragraph) + safety_margin
+            if min_unit_y < safe_bottom:
+                # Never lift an unfittable block over its own row or the
+                # preceding footnote in the best-effort fallback.
+                max_unit_y2 = max((u.box.y2 for u in best_typeset_units if u.box), default=box.y2)
+                delta = min(safe_bottom - min_unit_y, max(0.0, box.y2 - max_unit_y2))
+                best_typeset_units = self._shift_laid_out_units_vertically(
+                    best_typeset_units, delta
+                )
+                min_unit_y += delta
+            if min_unit_y < paragraph.box.y:
+                paragraph.box = Box(
+                    x=paragraph.box.x,
+                    y=max(min_unit_y, safe_bottom),
+                    x2=paragraph.box.x2,
+                    y2=paragraph.box.y2,
+                )
+            if apply_layout:
+                self._commit_layout_to_paragraph(paragraph, page, best_typeset_units, best_scale)
+                final_typeset_units = best_typeset_units
+            return best_scale, final_typeset_units
+
+        # Emergency layout at relief_floor with use_english_line_break=False
+        try:
+            typeset_units, _ = layout_units(
+                typesetting_units,
+                box,
+                relief_floor,
+                line_skip,
+                paragraph,
+                use_english_line_break=False,
+            )
+            if typeset_units:
+                unit_boxes = [u.box for u in typeset_units if u.box and u.box.y is not None]
+                min_unit_y = min((b.y for b in unit_boxes), default=box.y)
+                max_unit_y2 = max((b.y2 for b in unit_boxes if b.y2 is not None), default=box.y2)
+                safe_bottom = self.get_max_bottom_space(box, page, paragraph=paragraph) + safety_margin
+                if min_unit_y < safe_bottom and safe_bottom < box.y2:
+                    headroom = max(0.0, box.y2 - max_unit_y2)
+                    delta = min(safe_bottom - min_unit_y, headroom)
+                    if delta > 0.0:
+                        typeset_units = self._shift_laid_out_units_vertically(
+                            typeset_units, delta
+                        )
+                        min_unit_y += delta
+                if min_unit_y < paragraph.box.y:
+                    paragraph.box = Box(
+                        x=paragraph.box.x,
+                        y=max(min_unit_y, safe_bottom),
+                        x2=paragraph.box.x2,
+                        y2=paragraph.box.y2,
+                    )
+                if apply_layout:
+                    self._commit_layout_to_paragraph(paragraph, page, typeset_units, relief_floor)
+                return relief_floor, typeset_units
+        except Exception:
+            pass
+
         return min_scale, final_typeset_units
 
     def _get_optimal_scale(
@@ -1060,7 +1943,7 @@ class Typesetting:
         typesetting_units: list[TypesettingUnit],
         use_english_line_break: bool = True,
     ) -> float:
-        """获取段落的最优缩放因子，不执行实际排版"""
+        """Get optimal scale factor for paragraph, without applying layout"""
         scale, _ = self._find_optimal_scale_and_layout(
             paragraph,
             page,
@@ -1079,11 +1962,11 @@ class Typesetting:
         precomputed_scale: float,
         use_english_line_break: bool = True,
     ):
-        """使用预计算的缩放因子进行排版"""
+        """Use precomputed scale factor to layout typesetting units"""
         if not paragraph.box:
             return
 
-        # 使用通用方法进行排版，传入预计算的缩放因子作为初始值
+        # Using the precomputed scale factor to layout typesetting units
         self._find_optimal_scale_and_layout(
             paragraph,
             page,
@@ -1094,23 +1977,57 @@ class Typesetting:
         )
 
     def typesetting_document(self, document: il_version_1.Document):
-        # 原有的排版逻辑
-        if self.translation_config.progress_monitor:
-            with self.translation_config.progress_monitor.stage_start(
-                self.stage_name,
-                len(document.page) * 2,
-            ) as pbar:
-                # 预处理：获取所有段落的最优缩放因子
-                self.preprocess_document(document, pbar)
+        # Add detailed logging at the start
+        if self.detailed_logger:
+            self.detailed_logger.log_step("Typesetting Started")
+        
+        self._in_typesetting_document = True
+        try:
+            # Batch preprocess document - calculate optimal scale for each paragraph
+            if self.translation_config.progress_monitor:
+                with self.translation_config.progress_monitor.stage_start(
+                    self.stage_name,
+                    len(document.page) * 2,
+                ) as pbar:
+                    # Preprocess - calculate optimal scale factor for each paragraph
+                    self.preprocess_document(document, pbar)
 
-                for page in document.page:
+                    for page_idx, page in enumerate(document.page):
+                        self.translation_config.raise_if_cancelled()
+
+                        # Add detailed logging for each page
+                        if self.detailed_logger:
+                            self.detailed_logger.log_step(
+                                f"Typesetting Page {page_idx + 1}",
+                                f"Paragraphs to typeset: {len(page.pdf_paragraph) if hasattr(page, 'pdf_paragraph') else 0}"
+                            )
+
+                        self.render_page(page)
+                        pbar.advance()
+            else:
+                for page_idx, page in enumerate(document.page):
                     self.translation_config.raise_if_cancelled()
+                    
+                    # Add detailed logging for each page
+                    if self.detailed_logger:
+                        self.detailed_logger.log_step(
+                            f"Typesetting Page {page_idx + 1}",
+                            f"Paragraphs to typeset: {len(page.pdf_paragraph) if hasattr(page, 'pdf_paragraph') else 0}"
+                        )
+                    
                     self.render_page(page)
-                    pbar.advance()
-        else:
-            for page in document.page:
-                self.translation_config.raise_if_cancelled()
-                self.render_page(page)
+
+            self._paginate_overflowing_pages(document)
+            for final_page in document.page:
+                self._report_clipped_content(final_page, record_to_ledger=True)
+            self._record_pagination_metrics(document)
+        finally:
+            self._in_typesetting_document = False
+        
+        self._log_and_report_glyph_substitutions()
+        # Add detailed logging at the end
+        if self.detailed_logger:
+            self.detailed_logger.log_step("Typesetting Complete")
 
     def render_page(self, page: il_version_1.Page):
         fonts: dict[
@@ -1135,7 +2052,7 @@ class Typesetting:
         try:
             para_index = index.Index()
             para_map = {}
-            #
+            
             valid_paras = [
                 p
                 for p in page.pdf_paragraph
@@ -1149,6 +2066,13 @@ class Typesetting:
 
             for i, p_upper in para_map.items():
                 if not (p_upper.box and p_upper.box.y is not None):
+                    continue
+                upper_label = (p_upper.layout_label or "").lower()
+                if (
+                    "fallback_line" in upper_label
+                    or self._is_table_cell(p_upper, page)
+                    or self._is_inside_table_or_figure_region(p_upper.box, page, figures_only=True)
+                ):
                     continue
 
                 # Calculate paragraph height and set required gap accordingly
@@ -1169,11 +2093,13 @@ class Typesetting:
                     if para_id == i:
                         continue
                     p_lower = para_map[para_id]
+                    if self._is_table_cell(p_lower, page):
+                        continue
+                    if not self._shares_reflow_layer(p_upper, p_lower):
+                        continue
                     if not (
-                        p_lower.box
-                        and p_upper.box
-                        and p_lower.box.x2 < p_upper.box.x
-                        or p_lower.box.x > p_upper.box.x2
+                        p_lower.box.x2 <= p_upper.box.x + 0.5
+                        or p_lower.box.x >= p_upper.box.x2 - 0.5
                     ):
                         conflicting_paras.append(p_lower)
 
@@ -1191,9 +2117,2835 @@ class Typesetting:
             logger.warning(
                 f"Failed to adjust paragraph positions on page {page.page_number}: {e}"
             )
-        # 开始实际的渲染过程
+        # A direct render_page() call (used by tests and API retries) may not
+        # have passed through preprocessing, so finalize table geometry here too.
+        assign_page_region_groups(page)
+        self._ensure_semantic_table_models(page)
+        self._synchronize_table_row_heights(page)
+        # Balance table row widths before rendering
+        self._balance_table_row_widths(page, fonts)
+        self._reserve_heading_clearance_from_tables(page)
+        self._stabilize_footnote_zone(page)
+        self._resolve_vertical_paragraph_collisions(page)
+
+        # Mirror decorative header banners (colored rectangles) horizontally for RTL
+        self._mirror_header_decorations(page)
+
+        header_rules = self._find_header_underlines(page)
+
+        # Start typesetting layout rendering
+        source_boxes = {
+            id(paragraph): copy.copy(paragraph.box)
+            for paragraph in page.pdf_paragraph
+            if paragraph.box is not None
+        }
         for paragraph in page.pdf_paragraph:
             self.render_paragraph(paragraph, page, fonts)
+        self._audit_arabic_font_ownership(page)
+        # Enforce known cell/card/column lanes before the generic collision
+        # resolver. Otherwise longer RTL text from neighboring columns can be
+        # mistaken for a vertical collision and pushed onto a blank
+        # continuation page.
+        self._contain_rendered_region_bounds(page)
+        self._contain_bottom_fixed_lanes(page)
+        self._resolve_rendered_text_collisions(page)
+        self._resolve_table_row_and_body_clearance(page)
+        self._audit_table_cells_after_render(page)
+        self._anchor_inline_highlight_curves(page)
+        self._validate_rendered_regions(page)
+        self._avoid_decorative_shape_collisions(page, source_boxes)
+        self._report_clipped_content(
+            page,
+            record_to_ledger=not self._in_typesetting_document,
+        )
+        for paragraph, rules in header_rules:
+            self._align_header_underlines(paragraph, rules, page.cropbox.box)
+
+    def _record_layout_issue(
+        self,
+        *,
+        page_number: int | None,
+        kind: str,
+        detail: str,
+        debug_id: object = None,
+        severity: str = "warning",
+    ) -> None:
+        key = (page_number, kind, debug_id, detail)
+        reported_keys = getattr(self, "_reported_layout_issue_keys", None)
+        if reported_keys is None:
+            reported_keys = set()
+            self._reported_layout_issue_keys = reported_keys
+        if key in reported_keys:
+            return
+        reported_keys.add(key)
+        issue = {
+            "page": page_number,
+            "kind": kind,
+            "detail": detail,
+            "debug_id": debug_id,
+            "severity": severity,
+        }
+        layout_issues = getattr(self, "_layout_issues", None)
+        if layout_issues is None:
+            layout_issues = []
+            self._layout_issues = layout_issues
+        layout_issues.append(issue)
+        shared = getattr(self.translation_config, "shared_context_cross_split_part", None)
+        if shared is not None:
+            shared_issues = getattr(shared, "layout_issues", None)
+            if isinstance(shared_issues, list):
+                shared_issues.append(issue)
+            ledger = getattr(shared, "content_ledger", None)
+            if ledger is not None and hasattr(ledger, "record_layout_issue"):
+                ledger.record_layout_issue(
+                    page=page_number,
+                    kind=kind,
+                    detail=detail,
+                    debug_id=debug_id,
+                    severity=severity,
+                )
+
+    def _report_clipped_content(
+        self,
+        page: il_version_1.Page,
+        *,
+        record_to_ledger: bool = True,
+    ) -> list[str]:
+        """Warn about translated text that is omitted, off-page, or overlapping fixed bottom zones.
+
+        This is a final, read-only audit: it never moves anything.  It makes
+        silent loss visible in both logs and ``quality_report.json`` instead of
+        leaving it to be discovered visually in the finished PDF.
+        """
+        problems: list[str] = []
+        crop = page.cropbox.box if page.cropbox and page.cropbox.box else None
+        zones = self._get_page_vertical_zones(page) if crop is not None else None
+        for paragraph in page.pdf_paragraph or []:
+            label = getattr(paragraph, "debug_id", "?")
+            rendered = self._rendered_text_box(paragraph)
+            text = (paragraph.unicode or "").strip()
+            para_reasons: list[str] = []
+            if rendered is None:
+                if text and not paragraph.vertical:
+                    msg = f"{label}: translated text has no rendered glyphs ({text[:30]!r})"
+                    problems.append(msg)
+                    para_reasons.append("clipped_or_missing")
+                    if record_to_ledger:
+                        self._record_layout_issue(
+                            page_number=page.page_number,
+                            kind="clipped_or_missing",
+                            detail=msg,
+                            debug_id=label,
+                            severity="error",
+                        )
+                continue
+            if crop is None:
+                continue
+            tolerance = 1.0
+            if (
+                rendered.x < crop.x - tolerance
+                or rendered.x2 > crop.x2 + tolerance
+                or rendered.y < crop.y - tolerance
+                or rendered.y2 > crop.y2 + tolerance
+            ):
+                msg = f"{label}: rendered text leaves the page ({text[:30]!r})"
+                problems.append(msg)
+                para_reasons.append("off_page")
+                if record_to_ledger:
+                    self._record_layout_issue(
+                        page_number=page.page_number,
+                        kind="off_page",
+                        detail=msg,
+                        debug_id=label,
+                        severity="error",
+                    )
+            elif (
+                zones is not None
+                and not self._is_fixed_table_paragraph(paragraph)
+                and not self._is_bottom_fixed_paragraph(paragraph, page)
+                and not paragraph.vertical
+                and rendered.y < zones["content_floor"] - 2.0
+                and (paragraph.pipeline_trace or {}).get("page_overflow")
+            ):
+                msg = f"{label}: overflowing body text remains in protected bottom zone ({text[:30]!r})"
+                problems.append(msg)
+                para_reasons.append("page_overflow_unpaginated")
+                if record_to_ledger:
+                    self._record_layout_issue(
+                        page_number=page.page_number,
+                        kind="page_overflow_unpaginated",
+                        detail=msg,
+                        debug_id=label,
+                        severity="warning",
+                    )
+            if para_reasons:
+                trace = self._ensure_pipeline_trace(paragraph)
+                trace["clipped"] = True
+                trace["clip_reasons"] = list(dict.fromkeys([*(trace.get("clip_reasons") or []), *para_reasons]))
+        if problems:
+            logger.warning(
+                "Possible missing or clipped content on page %s: %s",
+                page.page_number, "; ".join(problems[:10]),
+            )
+        return problems
+
+    def _shares_reflow_layer(self, first, second) -> bool:
+        """Arabic reflow keeps independently painted PDF objects in their own lanes."""
+        return not self.is_arabic or max(first.xobj_id or 0, 0) == max(second.xobj_id or 0, 0)
+
+    @staticmethod
+    def _is_fixed_table_paragraph(paragraph: il_version_1.PdfParagraph) -> bool:
+        """Whether a paragraph owns a physical cell in a preserved table grid."""
+        label = (paragraph.layout_label or "").lower()
+        if any(marker in label for marker in ("table_footnote", "table_caption", "table_title")):
+            return False
+        return (
+            "table" in label
+            or bool((paragraph.pipeline_trace or {}).get("table_id"))
+        )
+
+    @staticmethod
+    def _ensure_pipeline_trace(paragraph: il_version_1.PdfParagraph) -> dict:
+        if paragraph.pipeline_trace is None:
+            paragraph.pipeline_trace = {}
+        return paragraph.pipeline_trace
+
+    @staticmethod
+    def _is_footnote_paragraph(paragraph: il_version_1.PdfParagraph) -> bool:
+        """Whether a paragraph belongs to the page's bottom footnote zone."""
+        label = (paragraph.layout_label or "").lower()
+        trace = paragraph.pipeline_trace or {}
+        return "footnote" in label and "table_footnote" not in label and not trace.get("cell_id")
+
+    def _is_top_band_header(
+        self,
+        paragraph: il_version_1.PdfParagraph,
+        page: il_version_1.Page,
+    ) -> bool:
+        label = (paragraph.layout_label or "").lower()
+        crop = page.cropbox.box if page.cropbox and page.cropbox.box else None
+        if any(marker in label for marker in ("header", "page_header")):
+            if crop is None or not paragraph.box:
+                return True
+            mid_y = (crop.y + crop.y2) * 0.5
+            return paragraph.box.y >= mid_y
+        if crop is not None and paragraph.box and self._is_header_or_footer(paragraph, page):
+            height = max(1.0, crop.y2 - crop.y)
+            return paragraph.box.y >= crop.y2 - height * 0.12
+        return False
+
+    def _is_bottom_band_footer(
+        self,
+        paragraph: il_version_1.PdfParagraph,
+        page: il_version_1.Page,
+    ) -> bool:
+        label = (paragraph.layout_label or "").lower()
+        trace = getattr(paragraph, "pipeline_trace", None) or {}
+        crop = page.cropbox.box if page.cropbox and page.cropbox.box else None
+        if any(marker in label for marker in ("footer", "page_footer", "page_number")):
+            if crop is None or not paragraph.box:
+                return True
+            mid_y = (crop.y + crop.y2) * 0.5
+            return paragraph.box.y2 <= mid_y
+        if crop is not None and paragraph.box and label == "abandon":
+            text = re.sub(r"[\u200e\u200f\u202a-\u202e\u2066-\u2069]", "", paragraph.unicode or "").strip()
+            if (
+                paragraph.box.y2 <= crop.y + (crop.y2 - crop.y) * 0.06
+                and re.fullmatch(r"\d+[-/]\d+", text)
+            ):
+                return True
+        if trace.get("page_overflow") or trace.get("region_type") in {"card", "form_pair", "figure", "table"}:
+            return False
+        if crop is not None and paragraph.box and self._is_header_or_footer(paragraph, page):
+            if paragraph.box.y < crop.y - 1.0:
+                return False
+            height = max(1.0, crop.y2 - crop.y)
+            return paragraph.box.y2 <= crop.y + height * 0.12
+        return False
+
+    def _is_bottom_fixed_paragraph(
+        self,
+        paragraph: il_version_1.PdfParagraph,
+        page: il_version_1.Page,
+    ) -> bool:
+        """Footnotes and running bottom footers own fixed lower bands on a page."""
+        return self._is_footnote_paragraph(paragraph) or self._is_bottom_band_footer(paragraph, page)
+
+    @staticmethod
+    def _extract_leading_footnote_marker(text: str | None) -> str | None:
+        raw = (text or "").strip()
+        if not raw:
+            return None
+        sup_map = str.maketrans("⁰¹²³⁴⁵⁶⁷⁸⁹", "0123456789")
+        match = re.match(r"^(?:\[(\d{1,3})\]|\((\d{1,3})\)|(\d{1,3})[.)]?\s+|([⁰¹²³⁴⁵⁶⁷⁸⁹]{1,3}|[*†‡§]))", raw)
+        if not match:
+            return None
+        token = next((g for g in match.groups() if g), None)
+        if not token:
+            return None
+        return token.translate(sup_map)
+
+    def _annotate_footnote_anchors(self, page: il_version_1.Page) -> None:
+        """Link footnote blocks to likely body anchor paragraphs in pipeline_trace."""
+        footnotes = [p for p in page.pdf_paragraph or [] if self._is_footnote_paragraph(p)]
+        if not footnotes:
+            return
+        body_paragraphs = [
+            p for p in page.pdf_paragraph or []
+            if not self._is_footnote_paragraph(p) and (p.unicode or "").strip()
+        ]
+        sup_map = str.maketrans("⁰¹²³⁴⁵⁶⁷⁸⁹", "0123456789")
+        for fn in footnotes:
+            fn_trace = self._ensure_pipeline_trace(fn)
+            fn_trace["zone"] = "footnote"
+            marker = self._extract_leading_footnote_marker(fn.unicode)
+            if not marker:
+                continue
+            fn_trace["footnote_marker"] = marker
+            anchors: list[object] = []
+            for body in body_paragraphs:
+                body_text = (body.unicode or "").translate(sup_map)
+                found = False
+                if marker in {"*", "†", "‡", "§"}:
+                    found = marker in body_text
+                else:
+                    found = bool(
+                        re.search(rf"(?<=\S)\s*(?:\[{re.escape(marker)}\]|\({re.escape(marker)}\)|{re.escape(marker)})\b", body_text)
+                        or any(c in (body.unicode or "") for c in "⁰¹²³⁴⁵⁶⁷⁸⁹" if c.translate(sup_map) == marker)
+                    )
+                if found:
+                    anchors.append(getattr(body, "debug_id", None) or id(body))
+                    b_trace = self._ensure_pipeline_trace(body)
+                    refs = list(b_trace.get("referenced_footnotes") or [])
+                    if marker not in refs:
+                        refs.append(marker)
+                    b_trace["referenced_footnotes"] = refs
+            if anchors:
+                fn_trace["anchor_paragraph_ids"] = anchors
+
+    def _get_page_vertical_zones(self, page: il_version_1.Page) -> dict[str, float]:
+        """Compute generalized body, header, footer, and footnote vertical boundaries."""
+        crop = page.cropbox.box if page.cropbox and page.cropbox.box else Box(0.0, 0.0, 595.0, 842.0)
+        page_height = max(1.0, crop.y2 - crop.y)
+        bottom_margin = max(14.0, min(28.0, page_height * 0.035))
+        top_margin = max(14.0, min(28.0, page_height * 0.035))
+        page_floor = crop.y + bottom_margin
+        page_ceiling = crop.y2 - top_margin
+
+        paragraphs = [p for p in page.pdf_paragraph or [] if p.box is not None]
+        bottom_footers = [p for p in paragraphs if self._is_bottom_band_footer(p, page)]
+        top_headers = [p for p in paragraphs if self._is_top_band_header(p, page)]
+        footnotes = [
+            p for p in paragraphs
+            if self._is_footnote_paragraph(p)
+            and "table_footnote" not in (p.layout_label or "").lower()
+            and p.box.y2 <= crop.y + page_height * 0.42
+        ]
+
+        content_floor = page_floor
+        if bottom_footers:
+            footer_top = max(p.box.y2 for p in bottom_footers if p.box)
+            content_floor = max(page_floor, footer_top + 6.0)
+
+        body_ceiling = page_ceiling
+        if top_headers:
+            header_bottom = min(p.box.y for p in top_headers if p.box)
+            body_ceiling = min(page_ceiling, header_bottom - 6.0)
+
+        body_floor = content_floor
+        has_footnotes = 0.0
+        if footnotes:
+            has_footnotes = 1.0
+            footnote_top = max(p.box.y2 for p in footnotes if p.box)
+            for curve in page.pdf_curve or []:
+                if curve.box is None:
+                    continue
+                is_thin_rule = abs(curve.box.y2 - curve.box.y) <= 2.5 and (curve.box.x2 - curve.box.x) >= 24.0
+                if is_thin_rule and footnote_top <= curve.box.y2 <= footnote_top + 14.0:
+                    footnote_top = max(footnote_top, curve.box.y2)
+            body_floor = max(content_floor, footnote_top + 10.0)
+
+        if body_floor > body_ceiling - 24.0:
+            body_floor = max(crop.y + 4.0, min(body_floor, body_ceiling - 24.0))
+        if content_floor > body_ceiling - 12.0:
+            content_floor = max(crop.y + 4.0, min(content_floor, body_ceiling - 12.0))
+
+        return {
+            "crop_y": crop.y,
+            "crop_y2": crop.y2,
+            "page_floor": page_floor,
+            "content_floor": content_floor,
+            "body_floor": body_floor,
+            "body_ceiling": body_ceiling,
+            "page_ceiling": page_ceiling,
+            "has_footnotes": has_footnotes,
+        }
+
+    def _stabilize_footnote_zone(self, page: il_version_1.Page) -> None:
+        """Keep footnotes above page margins/footers and prevent footnote-footnote overlap."""
+        self._annotate_footnote_anchors(page)
+        page_key = id(page)
+        if page_key in self._footnote_zone_stabilized_pages:
+            return
+        self._footnote_zone_stabilized_pages.add(page_key)
+
+        footnotes = [
+            p for p in page.pdf_paragraph or []
+            if self._is_footnote_paragraph(p)
+            and p.box is not None
+            and all(v is not None for v in (p.box.x, p.box.y, p.box.x2, p.box.y2))
+        ]
+        if not footnotes:
+            return
+
+        zones = self._get_page_vertical_zones(page)
+        content_floor = zones["content_floor"]
+
+        # Process bottom-most footnote first so footnotes never slide off the bottom
+        footnotes_bottom_up = sorted(footnotes, key=lambda p: (p.box.y, p.box.x))
+        min_next_y = content_floor
+        for fn in footnotes_bottom_up:
+            fn_h = max(0.0, fn.box.y2 - fn.box.y)
+            if fn.box.y < min_next_y - 0.01:
+                fn.box = Box(fn.box.x, min_next_y, fn.box.x2, min_next_y + fn_h)
+            min_next_y = max(min_next_y, fn.box.y2 + 3.0)
+
+    @staticmethod
+    def _is_heading_paragraph(paragraph: il_version_1.PdfParagraph) -> bool:
+        label = (paragraph.layout_label or "").lower()
+        return any(marker in label for marker in ("title", "heading", "section", "label"))
+
+    def _reserve_heading_clearance_from_tables(self, page: il_version_1.Page) -> None:
+        """Keep headings outside ruled table grids.
+
+        A table is immutable once its ruled-cell geometry has been recovered.
+        If a source heading slightly intrudes into the grid, move the heading
+        upward before body collision handling rather than moving table cells or
+        permitting the Arabic baseline to touch the top border.
+        """
+        page_key = id(page)
+        if page_key in self._heading_clearance_resolved_pages:
+            return
+
+        headings = [p for p in page.pdf_paragraph or [] if p.box and self._is_heading_paragraph(p)]
+        cells = [
+            p for p in page.pdf_paragraph or []
+            if p.box and self._is_fixed_table_paragraph(p)
+        ]
+        if not headings or not cells:
+            self._heading_clearance_resolved_pages.add(page_key)
+            return
+
+        page_top = page.cropbox.box.y2 if page.cropbox and page.cropbox.box else None
+        for heading in headings:
+            candidates = []
+            for cell in cells:
+                horizontal_overlap = max(
+                    0.0, min(heading.box.x2, cell.box.x2) - max(heading.box.x, cell.box.x)
+                )
+                if horizontal_overlap < min(heading.box.x2 - heading.box.x, cell.box.x2 - cell.box.x) * 0.20:
+                    continue
+                # The top row of a table is below the heading in PDF reading
+                # order (smaller y), or may just touch its lower bound.
+                if cell.box.y2 <= heading.box.y2 + 8.0:
+                    candidates.append(cell.box.y2)
+            if not candidates:
+                continue
+            table_top = max(candidates)
+            required_bottom = table_top + 5.0
+            if heading.box.y >= required_bottom:
+                continue
+            shift_up = required_bottom - heading.box.y
+            if page_top is not None:
+                shift_up = min(shift_up, max(0.0, page_top - heading.box.y2 - 2.0))
+            if shift_up > 0.01:
+                heading.box = Box(
+                    heading.box.x, heading.box.y + shift_up,
+                    heading.box.x2, heading.box.y2 + shift_up,
+                )
+                logger.info(
+                    "Raised heading %s by %.1fpt to clear ruled table on page %s.",
+                    getattr(heading, "debug_id", "?"), shift_up, page.page_number,
+                )
+        self._heading_clearance_resolved_pages.add(page_key)
+
+    def _deduplicate_artificial_header_units(
+        self,
+        paragraph: il_version_1.PdfParagraph,
+        page: il_version_1.Page,
+        units: list[TypesettingUnit],
+    ) -> list[TypesettingUnit]:
+        """Collapse extraction-created doubled glyphs in a running header.
+
+        Some PDFs paint the header text twice.  The source looks acceptable in
+        its original font but the two independent glyph streams become visibly
+        doubled after font substitution.  This deliberately acts only on a
+        header/footer when the majority of ASCII letters are paired; ordinary
+        words such as ``All`` or legitimate double letters are untouched.
+        """
+        printable = [u for u in units if not u.forced_line_break and u.try_get_unicode()]
+        if len(printable) < 6:
+            return units
+        chars = [u.try_get_unicode() or "" for u in printable]
+        raw_text = "".join(chars)
+        # Some legacy PDFs do not label their running header and place it just
+        # outside the generic top-band threshold.  A strongly doubled IBAN
+        # banner is still unambiguously a header, never body prose.
+        compact_probe = re.sub(r'([A-Za-z])\1', r'\1', raw_text)
+        looks_like_iban_banner = bool(re.search(r'IBAN\s*Standards|IBAN.*Ver', compact_probe, re.I))
+        if not self._is_header_or_footer(paragraph, page) and not looks_like_iban_banner:
+            return units
+        # The IBAN banner sometimes duplicates only punctuation and digits
+        # (``Ver.. 22.. 00 --``), which does not meet the paired-letter ratio
+        # below.  Those repeats are never meaningful in this fixed banner.
+        if looks_like_iban_banner:
+            collapsed_banner: list[TypesettingUnit] = []
+            for unit in units:
+                value = unit.try_get_unicode() or ""
+                if (
+                    collapsed_banner
+                    and value
+                    and value == (collapsed_banner[-1].try_get_unicode() or "")
+                    and not value.isalpha()
+                ):
+                    continue
+                collapsed_banner.append(unit)
+            units = collapsed_banner
+            # Broken duplicate streams also leave synthetic spaces around the
+            # decimal point (``Ver. 2. 0``).  Remove only whitespace whose
+            # nearest printable neighbours form digit-dot or dot-digit; normal
+            # word spacing in the banner is preserved.
+            compact_banner: list[TypesettingUnit] = []
+            for unit_index, unit in enumerate(units):
+                value = unit.try_get_unicode() or ""
+                if value.isspace():
+                    previous = next(
+                        (
+                            units[i].try_get_unicode() or ""
+                            for i in range(unit_index - 1, -1, -1)
+                            if (units[i].try_get_unicode() or "").strip()
+                        ),
+                        "",
+                    )
+                    following = next(
+                        (
+                            units[i].try_get_unicode() or ""
+                            for i in range(unit_index + 1, len(units))
+                            if (units[i].try_get_unicode() or "").strip()
+                        ),
+                        "",
+                    )
+                    if (previous.isdigit() and following == ".") or (
+                        previous == "." and following.isdigit()
+                    ):
+                        continue
+                compact_banner.append(unit)
+            units = compact_banner
+            printable = [u for u in units if not u.forced_line_break and u.try_get_unicode()]
+            chars = [u.try_get_unicode() or "" for u in printable]
+        latin_count = sum(char.isascii() and char.isalpha() for char in chars)
+        if not latin_count:
+            return units
+
+        paired = 0
+        index = 0
+        while index < len(chars):
+            end = index + 1
+            while end < len(chars) and chars[end] == chars[index]:
+                end += 1
+            run_length = end - index
+            if chars[index].isascii() and chars[index].isalpha() and run_length >= 2 and run_length % 2 == 0:
+                paired += run_length
+            index = end
+        if paired / latin_count < 0.70:
+            return units
+
+        result: list[TypesettingUnit] = []
+        index = 0
+        while index < len(units):
+            unit = units[index]
+            char = unit.try_get_unicode() or ""
+            if not char or char.isspace():
+                result.append(unit)
+                index += 1
+                continue
+            end = index + 1
+            while end < len(units) and (units[end].try_get_unicode() or "") == char:
+                end += 1
+            run_length = end - index
+            if run_length >= 2 and run_length % 2 == 0:
+                result.extend(units[index:end:2])
+            else:
+                result.extend(units[index:end])
+            index = end
+        logger.info("Collapsed doubled running-header glyph stream for paragraph %s.", getattr(paragraph, "debug_id", "?"))
+        return result
+
+    def _resolve_vertical_paragraph_collisions(self, page: il_version_1.Page) -> None:
+        """Reserve vertical lanes for overlapping non-table text regions.
+
+        PDF extraction boxes are hints, not a reliable reading-order contract.
+        In particular, a numbered heading may overlap the first fallback body
+        line.  Arabic reflow makes the error conspicuous because both runs are
+        right aligned.  Process regions from top to bottom, treating headings
+        and ruled-table cells as fixed obstacles, and move only movable prose
+        below the nearest occupied lane.
+
+        The operation is intentionally idempotent.  ``render_page`` invokes it
+        as a safe direct-call path after ``preprocess_document`` has already
+        applied it during normal translation.
+        """
+        page_key = id(page)
+        if page_key in self._vertical_collision_resolved_pages:
+            return
+
+        self._stabilize_footnote_zone(page)
+        zones = self._get_page_vertical_zones(page)
+
+        valid = [
+            paragraph
+            for paragraph in page.pdf_paragraph or []
+            if paragraph.box
+            and all(value is not None for value in (
+                paragraph.box.x, paragraph.box.y, paragraph.box.x2, paragraph.box.y2
+            ))
+            and not self._is_inside_table_or_figure_region(
+                paragraph.box, page, figures_only=True
+            )
+        ]
+        if len(valid) < 2:
+            self._vertical_collision_resolved_pages.add(page_key)
+            return
+
+        def order_key(paragraph: il_version_1.PdfParagraph) -> tuple[float, int]:
+            # PDF y increases upward, therefore greatest y2 appears first.
+            # A heading wins a same-baseline tie over its body paragraph.
+            return (-paragraph.box.y2, 0 if self._is_heading_paragraph(paragraph) else 1)
+
+        occupied: list[il_version_1.PdfParagraph] = []
+        moved = 0
+        for paragraph in sorted(valid, key=order_key):
+            # Physical table cells, footnotes, bottom footers, and top headers
+            # act as fixed zone obstacles and must never be pushed downward off-page
+            # or drifted out of row alignment before table-wide clearance runs.
+            is_fixed_zone = (
+                self._is_fixed_table_paragraph(paragraph)
+                or self._is_table_cell(paragraph, page)
+                or self._is_bottom_fixed_paragraph(paragraph, page)
+                or self._is_top_band_header(paragraph, page)
+            )
+            if not is_fixed_zone:
+                required_shift = 0.0
+                for blocker in occupied:
+                    if not blocker.box or not self._shares_reflow_layer(paragraph, blocker):
+                        continue
+                    horizontal_overlap = max(
+                        0.0,
+                        min(paragraph.box.x2, blocker.box.x2) - max(paragraph.box.x, blocker.box.x),
+                    )
+                    min_width = max(1.0, min(
+                        paragraph.box.x2 - paragraph.box.x,
+                        blocker.box.x2 - blocker.box.x,
+                    ))
+                    # Independent columns can share vertical space.  A modest
+                    # overlap threshold still catches a narrow section number
+                    # placed beside a wide body box.
+                    if horizontal_overlap < min_width * 0.25:
+                        continue
+                    gap = 5.0 if (
+                        self._is_heading_paragraph(paragraph)
+                        or self._is_heading_paragraph(blocker)
+                    ) else 3.0
+                    allowed_top = blocker.box.y - gap
+                    if paragraph.box.y2 > allowed_top:
+                        required_shift = max(required_shift, paragraph.box.y2 - allowed_top)
+
+                if required_shift > 0.01:
+                    paragraph.box = Box(
+                        paragraph.box.x,
+                        paragraph.box.y - required_shift,
+                        paragraph.box.x2,
+                        paragraph.box.y2 - required_shift,
+                    )
+                    trace = self._ensure_pipeline_trace(paragraph)
+                    trace["collision_shifted"] = True
+                    moved += 1
+                    logger.info(
+                        "Reserved vertical lane for paragraph %s on page %s (shift %.1fpt).",
+                        getattr(paragraph, "debug_id", "?"), page.page_number, required_shift,
+                    )
+                if paragraph.box.y < zones["body_floor"] - 1.0:
+                    trace = self._ensure_pipeline_trace(paragraph)
+                    trace["page_overflow"] = True
+                    trace["body_floor"] = zones["body_floor"]
+            occupied.append(paragraph)
+
+        self._vertical_collision_resolved_pages.add(page_key)
+        if moved:
+            logger.info("Resolved %d overlapping paragraph lane(s) on page %s.", moved, page.page_number)
+
+    @staticmethod
+    def _rendered_text_box(paragraph: il_version_1.PdfParagraph) -> Box | None:
+        """Return the real glyph bounds, independent of the source paragraph box."""
+        boxes: list[Box] = []
+        for composition in paragraph.pdf_paragraph_composition or []:
+            if composition.pdf_character and composition.pdf_character.box:
+                boxes.append(composition.pdf_character.box)
+            elif composition.pdf_formula:
+                if composition.pdf_formula.box:
+                    boxes.append(composition.pdf_formula.box)
+                for char in composition.pdf_formula.pdf_character or []:
+                    if char.box:
+                        boxes.append(char.box)
+                for curve in composition.pdf_formula.pdf_curve or []:
+                    if curve.box:
+                        boxes.append(curve.box)
+                for form in composition.pdf_formula.pdf_form or []:
+                    if form.box:
+                        boxes.append(form.box)
+            elif composition.pdf_line:
+                if composition.pdf_line.box:
+                    boxes.append(composition.pdf_line.box)
+                for char in composition.pdf_line.pdf_character or []:
+                    if char.box:
+                        boxes.append(char.box)
+            elif composition.pdf_same_style_characters:
+                if composition.pdf_same_style_characters.box:
+                    boxes.append(composition.pdf_same_style_characters.box)
+                for char in composition.pdf_same_style_characters.pdf_character or []:
+                    if char.box:
+                        boxes.append(char.box)
+        if not boxes:
+            return None
+        return Box(
+            min(box.x for box in boxes), min(box.y for box in boxes),
+            max(box.x2 for box in boxes), max(box.y2 for box in boxes),
+        )
+
+    @staticmethod
+    def _translate_rendered_curve(curve: PdfCurve, dx: float = 0.0, dy: float = 0.0) -> None:
+        if curve.box:
+            curve.box.x += dx
+            curve.box.x2 += dx
+            curve.box.y += dy
+            curve.box.y2 += dy
+        transform = list(curve.relocation_transform or [1, 0, 0, 1, 0, 0])
+        transform[4] += dx
+        transform[5] += dy
+        curve.relocation_transform = transform
+
+    @staticmethod
+    def _translate_rendered_form(form: PdfForm, dx: float = 0.0, dy: float = 0.0) -> None:
+        if form.box:
+            form.box.x += dx
+            form.box.x2 += dx
+            form.box.y += dy
+            form.box.y2 += dy
+        transform = list(form.relocation_transform or [1, 0, 0, 1, 0, 0])
+        transform[4] += dx
+        transform[5] += dy
+        form.relocation_transform = transform
+
+    @staticmethod
+    def _translate_rendered_paragraph(
+        paragraph: il_version_1.PdfParagraph,
+        dx: float = 0.0,
+        dy: float = 0.0,
+    ) -> None:
+        """Translate a rendered paragraph and all child glyphs/curves cleanly."""
+        shifted_box_ids: set[int] = set()
+
+        def shift_box(box: Box | None) -> None:
+            if box and id(box) not in shifted_box_ids:
+                shifted_box_ids.add(id(box))
+                box.x += dx
+                box.x2 += dx
+                box.y += dy
+                box.y2 += dy
+
+        shift_box(paragraph.box)
+        for composition in paragraph.pdf_paragraph_composition or []:
+            if composition.pdf_character:
+                char = composition.pdf_character
+                shift_box(char.box)
+                if char.visual_bbox:
+                    shift_box(char.visual_bbox.box)
+            elif composition.pdf_formula:
+                formula = composition.pdf_formula
+                shift_box(formula.box)
+                for char in formula.pdf_character or []:
+                    shift_box(char.box)
+                    if char.visual_bbox:
+                        shift_box(char.visual_bbox.box)
+                for curve in formula.pdf_curve or []:
+                    Typesetting._translate_rendered_curve(curve, dx=dx, dy=dy)
+                for form in formula.pdf_form or []:
+                    Typesetting._translate_rendered_form(form, dx=dx, dy=dy)
+            elif composition.pdf_line:
+                shift_box(composition.pdf_line.box)
+                for char in composition.pdf_line.pdf_character or []:
+                    shift_box(char.box)
+                    if char.visual_bbox:
+                        shift_box(char.visual_bbox.box)
+            elif composition.pdf_same_style_characters:
+                shift_box(composition.pdf_same_style_characters.box)
+                for char in composition.pdf_same_style_characters.pdf_character or []:
+                    shift_box(char.box)
+                    if char.visual_bbox:
+                        shift_box(char.visual_bbox.box)
+
+    @staticmethod
+    def _shift_rendered_paragraph_vertically(
+        paragraph: il_version_1.PdfParagraph, shift: float
+    ) -> None:
+        """Move already-rendered glyphs (and formula decorations) down together."""
+        Typesetting._translate_rendered_paragraph(paragraph, dy=-shift)
+
+    def _resolve_rendered_text_collisions(self, page: il_version_1.Page) -> None:
+        """Final export firewall for collisions caused by glyphs escaping source boxes.
+
+        Translation can expand text beyond the extraction box, so a box-only
+        preflight cannot prove visual safety.  Inspect the actual generated
+        glyphs and, for non-table prose, push the lower-priority block below
+        the collision. Separate source rows keep their reading order; heading
+        priority breaks ties when the source boxes already overlap.  Footnotes
+        and running bottom footers are protected lower barriers and are never
+        shifted off-page by encroaching body text.
+        """
+        page_key = id(page)
+        if page_key in self._rendered_collision_resolved_pages:
+            return
+
+        zones = self._get_page_vertical_zones(page)
+        paragraphs = [
+            paragraph for paragraph in page.pdf_paragraph or []
+            if not self._is_fixed_table_paragraph(paragraph)
+            and self._rendered_text_box(paragraph) is not None
+            # Labels inside a chart are anchored to plotted data.  Pushing
+            # them down like body prose would cover bars, lines or ticks.
+            and not (
+                paragraph.box is not None
+                and self._is_inside_table_or_figure_region(
+                    paragraph.box, page, figures_only=True
+                )
+            )
+        ]
+        source_lanes = {
+            id(paragraph): (paragraph.box.y, paragraph.box.y2)
+            for paragraph in paragraphs
+            if paragraph.box is not None
+            and paragraph.box.y is not None
+            and paragraph.box.y2 is not None
+        }
+        moved = 0
+        flagged_overflow_pairs: set[tuple[int, int]] = set()
+        for _ in range(max(1, len(paragraphs))):
+            changed = False
+            rendered = {id(paragraph): self._rendered_text_box(paragraph) for paragraph in paragraphs}
+            for index, first in enumerate(paragraphs):
+                first_box = rendered[id(first)]
+                if first_box is None:
+                    continue
+                for second in paragraphs[index + 1:]:
+                    if not self._shares_reflow_layer(first, second):
+                        continue
+                    second_box = rendered[id(second)]
+                    if second_box is None:
+                        continue
+                    horizontal_overlap = max(
+                        0.0, min(first_box.x2, second_box.x2) - max(first_box.x, second_box.x)
+                    )
+                    vertical_overlap = max(
+                        0.0, min(first_box.y2, second_box.y2) - max(first_box.y, second_box.y)
+                    )
+                    min_width = max(1.0, min(first_box.x2 - first_box.x, second_box.x2 - second_box.x))
+                    if horizontal_overlap < min_width * 0.25 or vertical_overlap <= 0.25:
+                        continue
+                    # Cells within the same coherent table stay synchronized by row in
+                    # _resolve_table_row_and_body_clearance; never drift single columns here.
+                    if self._is_table_cell(first, page) and self._is_table_cell(second, page):
+                        t1 = (first.pipeline_trace or {}).get("table_id")
+                        t2 = (second.pipeline_trace or {}).get("table_id")
+                        if (
+                            t1
+                            and t1 == t2
+                            and not (first.pipeline_trace or {}).get("preserve_irregular_table")
+                            and not (second.pipeline_trace or {}).get("preserve_irregular_table")
+                        ):
+                            continue
+                        l1 = source_lanes.get(id(first))
+                        l2 = source_lanes.get(id(second))
+                        same_src_row = bool(
+                            l1 and l2 and (min(l1[1], l2[1]) - max(l1[0], l2[0])) > 0.30 * max(1.0, min(l1[1] - l1[0], l2[1] - l2[0]))
+                        )
+                        if (t1 == t2 or not (t1 and t2)) and same_src_row:
+                            continue
+
+                    first_fixed_bottom = self._is_bottom_fixed_paragraph(first, page)
+                    second_fixed_bottom = self._is_bottom_fixed_paragraph(second, page)
+                    if first_fixed_bottom != second_fixed_bottom:
+                        # Body text collided with a protected footnote or bottom footer.
+                        # Never push the footnote off the page; flag the body block
+                        # so continuation pagination moves it cleanly.
+                        body_para = second if first_fixed_bottom else first
+                        fixed_para = first if first_fixed_bottom else second
+                        pair_key = (id(body_para), id(fixed_para))
+                        if pair_key not in flagged_overflow_pairs:
+                            flagged_overflow_pairs.add(pair_key)
+                            trace = self._ensure_pipeline_trace(body_para)
+                            trace["page_overflow"] = True
+                            trace["overflow_reason"] = "bottom_zone_collision"
+                        continue
+                    if first_fixed_bottom and second_fixed_bottom:
+                        # Two footnotes overlapped after expansion: push the UPPER one up,
+                        # preserving the bottom margin floor.
+                        if first_box.y2 >= second_box.y2:
+                            upper_fn, lower_fn = first, second
+                        else:
+                            upper_fn, lower_fn = second, first
+                        upper_box = rendered[id(upper_fn)]
+                        lower_box = rendered[id(lower_fn)]
+                        shift_up = max(0.0, (lower_box.y2 + 3.0) - upper_box.y)
+                        if shift_up > 0.01:
+                            self._translate_rendered_paragraph(upper_fn, dy=shift_up)
+                            moved += 1
+                            changed = True
+                            break
+                        continue
+
+                    first_lane = source_lanes.get(id(first))
+                    second_lane = source_lanes.get(id(second))
+                    if first_lane and second_lane and first_lane[0] >= second_lane[1]:
+                        blocker, mover = first, second
+                    elif first_lane and second_lane and second_lane[0] >= first_lane[1]:
+                        blocker, mover = second, first
+                    elif self._is_heading_paragraph(first):
+                        blocker, mover = first, second
+                    elif self._is_heading_paragraph(second):
+                        blocker, mover = second, first
+                    elif first_box.y2 >= second_box.y2:
+                        blocker, mover = first, second
+                    else:
+                        blocker, mover = second, first
+                    blocker_box = rendered[id(blocker)]
+                    mover_box = rendered[id(mover)]
+                    gap = 5.0 if (
+                        self._is_heading_paragraph(blocker) or self._is_heading_paragraph(mover)
+                    ) else 3.0
+                    shift = max(0.0, mover_box.y2 - (blocker_box.y - gap))
+                    if shift <= 0.01:
+                        # The geometric order is inverted, but there is still
+                        # a collision: separate by the measured overlap.
+                        shift = vertical_overlap + gap
+                    self._shift_rendered_paragraph_vertically(mover, shift)
+                    trace = self._ensure_pipeline_trace(mover)
+                    trace["collision_shifted"] = True
+                    new_mover_box = self._rendered_text_box(mover)
+                    if new_mover_box is not None and new_mover_box.y < zones["body_floor"] - 1.0:
+                        trace["page_overflow"] = True
+                        trace["body_floor"] = zones["body_floor"]
+                    moved += 1
+                    changed = True
+                    break
+                if changed:
+                    break
+            if not changed:
+                break
+
+        # Also enforce clearance against fixed/wired tables (which are excluded from mutable pairs).
+        fixed_by_table: dict[str, list[il_version_1.PdfParagraph]] = {}
+        for p in page.pdf_paragraph or []:
+            if p.box is not None and self._is_fixed_table_paragraph(p) and self._rendered_text_box(p) is not None:
+                tid = str((p.pipeline_trace or {}).get("table_id") or f"_fixed_{id(p)}")
+                fixed_by_table.setdefault(tid, []).append(p)
+        if fixed_by_table:
+            for tid, fcells in fixed_by_table.items():
+                frboxes = [b for c in fcells if (b := self._rendered_text_box(c)) is not None]
+                if not frboxes:
+                    continue
+                t_x0 = min(b.x for b in frboxes)
+                t_y0 = min(b.y for b in frboxes)
+                t_x2 = max(b.x2 for b in frboxes)
+                t_y2 = max(b.y2 for b in frboxes)
+                for para in paragraphs:
+                    if self._is_table_cell(para, page) or self._is_bottom_fixed_paragraph(para, page) or self._is_top_band_header(para, page):
+                        continue
+                    pr = self._rendered_text_box(para)
+                    if pr is None:
+                        continue
+                    h_ov = max(0.0, min(pr.x2, t_x2) - max(pr.x, t_x0))
+                    v_ov = max(0.0, min(pr.y2, t_y2) - max(pr.y, t_y0))
+                    min_w = max(1.0, min(pr.x2 - pr.x, t_x2 - t_x0))
+                    if h_ov < min_w * 0.20 or v_ov <= 0.5:
+                        continue
+                    src_y2 = para.box.y2 if para.box and para.box.y2 is not None else pr.y2
+                    if src_y2 <= t_y2 + 2.0:
+                        shift = max(0.0, pr.y2 - (t_y0 - 4.0))
+                        if shift > 0.25:
+                            self._shift_rendered_paragraph_vertically(para, shift)
+                            trace = self._ensure_pipeline_trace(para)
+                            trace["collision_shifted"] = True
+                            moved += 1
+                            after = self._rendered_text_box(para)
+                            if after is not None and after.y < zones["body_floor"] - 1.0:
+                                trace["page_overflow"] = True
+                                trace["body_floor"] = zones["body_floor"]
+                    else:
+                        # Text originally above this table (including form
+                        # labels and payment terms) should clear it upward if
+                        # the original page still has room for the block.
+                        ceiling = zones["body_ceiling"]
+                        enclosing = self._find_enclosing_region_box(para, page)
+                        if enclosing is not None:
+                            ceiling = min(ceiling, enclosing.y2 - 1.5)
+                        for neighbor in page.pdf_paragraph:
+                            if neighbor is para:
+                                continue
+                            nr = self._rendered_text_box(neighbor)
+                            if nr and nr.y >= pr.y2 - 0.5 and self._boxes_overlap_horizontally(pr, nr):
+                                ceiling = min(ceiling, nr.y - 3.0)
+                        shift_up = t_y2 + 4.0 - pr.y
+                        if 0.25 < shift_up <= ceiling - pr.y2:
+                            self._translate_rendered_paragraph(para, dy=shift_up)
+                            trace = self._ensure_pipeline_trace(para)
+                            if trace.get("overflow_reason") == "body_fixed_table_collision":
+                                trace.pop("page_overflow", None)
+                                trace.pop("overflow_reason", None)
+                            trace["table_clearance_adjusted"] = True
+                            moved += 1
+                            continue
+                        trace = self._ensure_pipeline_trace(para)
+                        trace["page_overflow"] = True
+                        trace["overflow_reason"] = "body_fixed_table_collision"
+
+        self._rendered_collision_resolved_pages.add(page_key)
+        if moved:
+            logger.warning(
+                "Resolved %d rendered glyph collision(s) on page %s.", moved, page.page_number
+            )
+
+    def _resolve_table_row_and_body_clearance(self, page: il_version_1.Page) -> None:
+        """Keep expanded non-fixed table rows aligned and prevent tables overlapping body text."""
+        zones = self._get_page_vertical_zones(page)
+        table_cells = [
+            p for p in page.pdf_paragraph or []
+            if p.box is not None and self._is_table_cell(p, page)
+        ]
+        if not table_cells:
+            return
+
+        by_table: dict[str, list[il_version_1.PdfParagraph]] = {}
+        for cell in table_cells:
+            trace = cell.pipeline_trace or {}
+            tid = str(trace.get("table_id") or "_default_table")
+            by_table.setdefault(tid, []).append(cell)
+
+        def _shift_char_vertically(ch: il_version_1.PdfCharacter, down_dy: float) -> None:
+            if ch.box is not None:
+                ch.box.y -= down_dy
+                ch.box.y2 -= down_dy
+            vbox = getattr(getattr(ch, "visual_bbox", None), "box", None)
+            if vbox is not None and vbox is not ch.box:
+                vbox.y -= down_dy
+                vbox.y2 -= down_dy
+
+        page_table_layouts = [
+            ly.box for ly in getattr(page, "page_layout", []) or []
+            if ly.box and (ly.class_name or "").lower() in {"table", "wired_table", "wireless_table"}
+        ]
+        all_page_chars = [
+            ch for ch in getattr(page, "pdf_character", []) or []
+            if ch.box is not None and (ch.char_unicode or "").strip()
+        ]
+
+        table_extents: list[tuple[str, float, float, float, float, float]] = []
+        table_groups: list[tuple[str, list[il_version_1.PdfParagraph], float, float, float, float, float]] = []
+        for tid, cells in by_table.items():
+            def source_box(cell):
+                bounds = (cell.pipeline_trace or {}).get("table_source_box")
+                return Box(*bounds) if bounds is not None else cell.box
+
+            orig_sboxes = [source_box(c) for c in cells if c.box is not None]
+            orig_src_bottom = min((b.y for b in orig_sboxes), default=None)
+            orig_src_top = max((b.y2 for b in orig_sboxes), default=None)
+            tb_x0 = min((b.x for b in orig_sboxes), default=0.0)
+            tb_x2 = max((b.x2 for b in orig_sboxes), default=0.0)
+            tb_y0 = orig_src_bottom if orig_src_bottom is not None else 0.0
+            tb_y2 = orig_src_top if orig_src_top is not None else 0.0
+            for lbox in page_table_layouts:
+                if any(
+                    lbox.x - 2.0 <= (b.x + b.x2) * 0.5 <= lbox.x2 + 2.0
+                    and lbox.y - 2.0 <= (b.y + b.y2) * 0.5 <= lbox.y2 + 2.0
+                    for b in orig_sboxes
+                ):
+                    tb_x0 = min(tb_x0, lbox.x)
+                    tb_x2 = max(tb_x2, lbox.x2)
+                    tb_y0 = min(tb_y0, lbox.y)
+                    tb_y2 = max(tb_y2, lbox.y2)
+
+            table_chars = [
+                ch for ch in all_page_chars
+                if tb_x0 - 2.0 <= (ch.box.x + ch.box.x2) * 0.5 <= tb_x2 + 2.0
+                and tb_y0 - 4.0 <= (ch.box.y + ch.box.y2) * 0.5 <= tb_y2 + 4.0
+            ]
+            if table_chars and orig_src_bottom is not None and orig_src_top is not None:
+                orig_src_bottom = min(orig_src_bottom, min(ch.box.y for ch in table_chars))
+                orig_src_top = max(orig_src_top, max(ch.box.y2 for ch in table_chars))
+
+            is_irregular_preserved = any(
+                (c.pipeline_trace or {}).get("preserve_irregular_table")
+                for c in cells
+            )
+            if not is_irregular_preserved and len(cells) >= 2:
+                row_groups: dict[int, list[il_version_1.PdfParagraph]] = {}
+                unindexed: list[il_version_1.PdfParagraph] = []
+                for c in cells:
+                    sem = (c.pipeline_trace or {}).get("semantic_table") or {}
+                    ridx = sem.get("row_index")
+                    if isinstance(ridx, int):
+                        row_groups.setdefault(ridx, []).append(c)
+                    else:
+                        unindexed.append(c)
+                if unindexed and not row_groups:
+                    for idx, row_list in enumerate(self._cluster_table_cells_into_rows(page)):
+                        in_this = [c for c in row_list if c in cells]
+                        if in_this:
+                            row_groups[idx] = in_this
+                ordered_rows = [row_groups[k] for k in sorted(row_groups)]
+                # Map frozen table characters onto their owning row index so
+                # booktabs numeric columns shift vertically in lockstep with row labels.
+                row_bands_src = [
+                    (
+                        min((source_box(c).y for c in r if c.box), default=0.0),
+                        max((source_box(c).y2 for c in r if c.box), default=0.0),
+                    )
+                    for r in ordered_rows
+                ]
+                row_chars: list[list[il_version_1.PdfCharacter]] = [[] for _ in ordered_rows]
+                if table_chars and row_bands_src:
+                    for ch in table_chars:
+                        cy = (ch.box.y + ch.box.y2) * 0.5
+                        best_r = min(
+                            range(len(row_bands_src)),
+                            key=lambda ri: (
+                                0.0
+                                if row_bands_src[ri][0] - 1.5 <= cy <= row_bands_src[ri][1] + 1.5
+                                else abs((row_bands_src[ri][0] + row_bands_src[ri][1]) * 0.5 - cy)
+                            ),
+                        )
+                        row_chars[best_r].append(ch)
+
+                for r_idx in range(len(ordered_rows)):
+                    cur_row = ordered_rows[r_idx]
+                    # First resolve any intra-slot stacked sub-cells (e.g. rXcY vs rXcY#2)
+                    # inside cur_row so vertically stacked fragments never collide.
+                    if len(cur_row) >= 2:
+                        sorted_cur = sorted(
+                            [c for c in cur_row if c.box is not None],
+                            key=lambda c: (-c.box.y2, c.box.x),
+                        )
+                        for si, upper_c in enumerate(sorted_cur):
+                            ub = self._rendered_text_box(upper_c)
+                            if ub is None:
+                                continue
+                            for lower_c in sorted_cur[si + 1:]:
+                                lb = self._rendered_text_box(lower_c)
+                                if lb is None:
+                                    continue
+                                h_ov_in = max(0.0, min(ub.x2, lb.x2) - max(ub.x, lb.x))
+                                min_w_in = max(1.0, min(ub.x2 - ub.x, lb.x2 - lb.x))
+                                u_col = (upper_c.pipeline_trace or {}).get("col_index")
+                                l_col = (lower_c.pipeline_trace or {}).get("col_index")
+                                same_slot = (u_col is not None and u_col == l_col) or h_ov_in >= min_w_in * 0.30
+                                v_ov_in = max(0.0, min(ub.y2, lb.y2) - max(ub.y, lb.y))
+                                if same_slot and v_ov_in > 0.5:
+                                    sub_shift = max(0.0, lb.y2 - (ub.y - 2.0))
+                                    if sub_shift > 0.25:
+                                        self._shift_rendered_paragraph_vertically(lower_c, sub_shift)
+                                        self._ensure_pipeline_trace(lower_c)["table_row_shifted"] = True
+
+                    upper_boxes = [
+                        b for c in cur_row
+                        if (b := self._rendered_text_box(c)) is not None
+                    ] + [ch.box for ch in row_chars[r_idx] if ch.box is not None]
+                    if not upper_boxes:
+                        continue
+                    upper_bottom = min(b.y for b in upper_boxes)
+                    # Synchronize all cell boxes in cur_row to cover the expanded row height
+                    for c in cur_row:
+                        if c.box is not None and upper_bottom < c.box.y:
+                            c.box.y = upper_bottom - 1.0
+                    if r_idx + 1 >= len(ordered_rows):
+                        continue
+                    lower_boxes = [
+                        b for c in ordered_rows[r_idx + 1]
+                        if (b := self._rendered_text_box(c)) is not None
+                    ] + [ch.box for ch in row_chars[r_idx + 1] if ch.box is not None]
+                    if not lower_boxes:
+                        continue
+                    lower_top = max(b.y2 for b in lower_boxes)
+                    overlap = lower_top - (upper_bottom - 3.0)
+                    if overlap > 0.25:
+                        for tail_idx in range(r_idx + 1, len(ordered_rows)):
+                            for cell in ordered_rows[tail_idx]:
+                                self._shift_rendered_paragraph_vertically(cell, overlap)
+                                tr = self._ensure_pipeline_trace(cell)
+                                tr["table_row_shifted"] = True
+                            for ch in row_chars[tail_idx]:
+                                _shift_char_vertically(ch, overlap)
+                        # Shift horizontal grid rules below upper_bottom downward with the rows
+                        if orig_src_bottom is not None:
+                            for shape in list(getattr(page, "pdf_curve", None) or []) + list(getattr(page, "pdf_rectangle", None) or []):
+                                sb = getattr(shape, "box", None)
+                                if (
+                                    sb is not None
+                                    and sb.x >= tb_x0 - 6.0
+                                    and sb.x2 <= tb_x2 + 6.0
+                                    and (orig_src_bottom - 6.0) <= sb.y <= (lower_top + 4.0)
+                                    and (sb.y2 - sb.y) <= 8.0
+                                ):
+                                    if isinstance(shape, PdfCurve):
+                                        self._translate_rendered_curve(shape, dy=-overlap)
+                                    else:
+                                        sb.y -= overlap
+                                        sb.y2 -= overlap
+
+                # Text boxes are measured again after translation, but table paths
+                # still carry their source coordinates. Place horizontal separators
+                # in the actual row gaps and move the path as well as its audit box.
+                for curve in page.pdf_curve or []:
+                    sb = curve.box
+                    if sb is None or sb.y2 - sb.y > 2.0:
+                        continue
+                    if sb.x < tb_x0 - 6.0 or sb.x2 > tb_x2 + 6.0 or sb.x2 - sb.x < (tb_x2 - tb_x0) * 0.35:
+                        continue
+                    # Undo our existing translation when assigning the source rule
+                    # to a boundary, so repeated calls keep the same row ownership.
+                    shift_y = float(curve.relocation_transform[5]) if curve.relocation_transform else 0.0
+                    original_y = (sb.y + sb.y2) * 0.5 - shift_y
+                    if not tb_y0 - 6.0 <= original_y <= tb_y2 + 6.0:
+                        continue
+                    above = [i for i, (y, y2) in enumerate(row_bands_src) if (y + y2) * 0.5 > original_y]
+                    below = [i for i, (y, y2) in enumerate(row_bands_src) if (y + y2) * 0.5 <= original_y]
+                    upper = max(above) if above else None
+                    lower = min(below) if below else None
+
+                    def rendered_row_boxes(index):
+                        return [b for c in ordered_rows[index] if (b := self._rendered_text_box(c)) is not None] + [ch.box for ch in row_chars[index]]
+
+                    upper_boxes = rendered_row_boxes(upper) if upper is not None else []
+                    lower_boxes = rendered_row_boxes(lower) if lower is not None else []
+                    high = min((b.y for b in upper_boxes), default=original_y + 1.5) - 1.5
+                    low = max((b.y2 for b in lower_boxes), default=original_y - 1.5) + 1.5
+                    if upper_boxes and lower_boxes:
+                        target_y = (low + high) * 0.5 if low <= high else None
+                    elif upper_boxes:
+                        target_y = min(original_y, high)
+                    elif lower_boxes:
+                        target_y = max(original_y, low)
+                    else:
+                        target_y = None
+                    if target_y is not None:
+                        self._translate_rendered_curve(curve, dy=target_y - (sb.y + sb.y2) * 0.5)
+
+            rboxes = [b for c in cells if (b := self._rendered_text_box(c)) is not None] + [
+                ch.box for ch in table_chars if ch.box is not None
+            ]
+            sboxes = [c.box for c in cells if c.box is not None]
+            if rboxes and sboxes and orig_src_bottom is not None and orig_src_top is not None:
+                tx0 = min(min(b.x for b in rboxes), min(b.x for b in sboxes), tb_x0)
+                r_bottom = min(b.y for b in rboxes)
+                r_bottom = min([r_bottom] + [
+                    c.box.y for c in page.pdf_curve or []
+                    if c.box is not None and c.box.y2 - c.box.y <= 2.0
+                    and c.box.x >= tb_x0 - 6.0 and c.box.x2 <= tb_x2 + 6.0
+                    and c.box.x2 - c.box.x >= (tb_x2 - tb_x0) * 0.35
+                    and c.relocation_transform
+                    and orig_src_bottom - 6.0 <= c.box.y - float(c.relocation_transform[5]) <= orig_src_top + 6.0
+                ])
+                tx2 = max(max(b.x2 for b in rboxes), max(b.x2 for b in sboxes), tb_x2)
+                r_top = max(b.y2 for b in rboxes)
+                table_groups.append((tid, cells, tx0, r_bottom, tx2, orig_src_bottom, r_top, orig_src_top))
+
+        if not table_groups:
+            return
+
+        # Separate stacked tables when an upper table expands vertically into a lower table.
+        table_groups.sort(key=lambda item: -item[7])
+        moved_body = False
+        for i in range(len(table_groups) - 1):
+            _, _, x0_a, bot_a, x2_a, _, _, _ = table_groups[i]
+            for j in range(i + 1, len(table_groups)):
+                tid_b, cells_b, x0_b, bot_b, x2_b, src_bot_b, top_b, src_top_b = table_groups[j]
+                h_ov = max(0.0, min(x2_a, x2_b) - max(x0_a, x0_b))
+                min_w = max(1.0, min(x2_a - x0_a, x2_b - x0_b))
+                if h_ov < min_w * 0.20:
+                    continue
+                if any((c.pipeline_trace or {}).get("anchored_numeric_columns") for c in cells_b):
+                    continue
+                if top_b > bot_a - 5.0:
+                    dy = top_b - (bot_a - 5.0)
+                    if dy > 0.25:
+                        for c in cells_b:
+                            self._shift_rendered_paragraph_vertically(c, dy)
+                            tr = self._ensure_pipeline_trace(c)
+                            tr["table_row_shifted"] = True
+                            cb = self._rendered_text_box(c)
+                            if cb is not None and cb.y < zones["body_floor"] - 1.0:
+                                tr["page_overflow"] = True
+                                tr["body_floor"] = zones["body_floor"]
+                        # Shift table-local drawn grid shapes with the table cells.
+                        for shape in list(getattr(page, "pdf_curve", None) or []) + list(getattr(page, "pdf_rectangle", None) or []):
+                            sb = getattr(shape, "box", None)
+                            if sb and sb.x >= x0_b - 4.0 and sb.x2 <= x2_b + 4.0 and sb.y >= src_bot_b - 4.0 and sb.y2 <= src_top_b + 4.0:
+                                if isinstance(shape, PdfCurve):
+                                    self._translate_rendered_curve(shape, dy=-dy)
+                                else:
+                                    sb.y -= dy
+                                    sb.y2 -= dy
+                        table_groups[j] = (tid_b, cells_b, x0_b, bot_b - dy, x2_b, src_bot_b - dy, top_b - dy, src_top_b - dy)
+                        moved_body = True
+
+        table_extents = [
+            (item[2], item[3], item[4], item[5], item[6], item[7])
+            for item in table_groups
+        ]
+
+        body_paras = [
+            p for p in page.pdf_paragraph or []
+            if not self._is_table_cell(p, page)
+            and not self._is_bottom_fixed_paragraph(p, page)
+            and not self._is_top_band_header(p, page)
+            and p.box is not None
+            and (
+                "caption" in (p.layout_label or "").lower()
+                or not self._is_inside_table_or_figure_region(p.box, page, figures_only=True)
+            )
+        ]
+        body_paras.sort(key=lambda p: -(p.box.y2 if p.box and p.box.y2 is not None else 0.0))
+        for tx0, r_bottom, tx2, src_bottom, r_top, src_top in table_extents:
+            for para in body_paras:
+                p_rbox = self._rendered_text_box(para)
+                if p_rbox is None:
+                    continue
+                h_ov = max(0.0, min(p_rbox.x2, tx2) - max(p_rbox.x, tx0))
+                min_w = max(1.0, min(p_rbox.x2 - p_rbox.x, tx2 - tx0))
+                if h_ov < min_w * 0.20:
+                    continue
+                if para.box.y >= src_top - 4.0:
+                    # Paragraph starts above table: push down if its wrapped tail crosses table top -> flag overflow if needed.
+                    if p_rbox.y < r_top + 3.0 and p_rbox.y2 > r_bottom:
+                        overlap_up = (r_top + 4.0) - p_rbox.y
+                        if overlap_up > 0.25:
+                            # Shift this body paragraph slightly above? Wait: only shift table down when possible without off-page, else mark overflow.
+                            tr = self._ensure_pipeline_trace(para)
+                            tr["page_overflow"] = True
+                            tr["overflow_reason"] = "body_table_top_collision"
+                    continue
+                if para.box.y2 > src_bottom + 4.0:
+                    continue
+                if p_rbox.y2 > r_bottom - 4.0:
+                    dy = p_rbox.y2 - (r_bottom - 4.0)
+                    if dy > 0.25:
+                        self._shift_rendered_paragraph_vertically(para, dy)
+                        tr = self._ensure_pipeline_trace(para)
+                        tr["collision_shifted"] = True
+                        moved_body = True
+                        after_box = self._rendered_text_box(para)
+                        if after_box is not None and after_box.y < zones["body_floor"] - 1.0:
+                            tr["page_overflow"] = True
+                            tr["body_floor"] = zones["body_floor"]
+        if moved_body:
+            self._rendered_collision_resolved_pages.discard(id(page))
+            self._resolve_rendered_text_collisions(page)
+
+    @staticmethod
+    def _composition_item_box(comp: PdfParagraphComposition) -> Box | None:
+        if comp.pdf_character and comp.pdf_character.box:
+            return comp.pdf_character.box
+        if comp.pdf_formula:
+            if comp.pdf_formula.box:
+                return comp.pdf_formula.box
+            boxes = [c.box for c in comp.pdf_formula.pdf_character or [] if c.box]
+            if boxes:
+                return Box(
+                    min(b.x for b in boxes), min(b.y for b in boxes),
+                    max(b.x2 for b in boxes), max(b.y2 for b in boxes),
+                )
+        return None
+
+    def _split_rendered_paragraph_at_y(
+        self,
+        paragraph: il_version_1.PdfParagraph,
+        split_y: float,
+    ) -> il_version_1.PdfParagraph | None:
+        """Split a rendered paragraph at a vertical cutoff by visual glyph lines.
+
+        Returns the lower continuation ``PdfParagraph`` when at least one line
+        stays above ``split_y`` and at least one line falls below it; returns
+        ``None`` if splitting is unnecessary or cannot leave a clean upper line.
+        """
+        compositions = list(paragraph.pdf_paragraph_composition or [])
+        if not compositions:
+            return None
+
+        positioned: list[tuple[PdfParagraphComposition, Box]] = []
+        for comp in compositions:
+            box = self._composition_item_box(comp)
+            if box is not None:
+                positioned.append((comp, box))
+        if not positioned:
+            return None
+
+        heights = sorted(max(1.0, box.y2 - box.y) for _, box in positioned)
+        line_tol = max(2.5, heights[len(heights) // 2] * 0.45)
+
+        lines: list[dict] = []
+        for comp in compositions:
+            cbox = self._composition_item_box(comp)
+            if cbox is None:
+                if lines:
+                    lines[-1]["items"].append(comp)
+                continue
+            mid_y = (cbox.y + cbox.y2) * 0.5
+            if lines and abs(mid_y - lines[-1]["mid_y"]) <= line_tol:
+                line = lines[-1]
+                n = line["count"]
+                line["mid_y"] = (line["mid_y"] * n + mid_y) / (n + 1)
+                line["count"] = n + 1
+                line["y"] = min(line["y"], cbox.y)
+                line["y2"] = max(line["y2"], cbox.y2)
+                line["items"].append(comp)
+            else:
+                lines.append({
+                    "mid_y": mid_y,
+                    "count": 1,
+                    "y": cbox.y,
+                    "y2": cbox.y2,
+                    "items": [comp],
+                })
+
+        if len(lines) < 2:
+            return None
+
+        keep_lines = [line for line in lines if line["y"] >= split_y - 1.0]
+        move_lines = [line for line in lines if line["y"] < split_y - 1.0]
+        if not keep_lines or not move_lines:
+            return None
+
+        keep_comps = [item for line in keep_lines for item in line["items"]]
+        move_comps = [item for line in move_lines for item in line["items"]]
+        paragraph.pdf_paragraph_composition = keep_comps
+        kept_box = self._rendered_text_box(paragraph)
+        if kept_box is not None:
+            paragraph.box = kept_box
+
+        cont_box_items = [self._composition_item_box(c) for c in move_comps]
+        valid_boxes = [b for b in cont_box_items if b is not None]
+        cont_box = (
+            Box(
+                min(b.x for b in valid_boxes), min(b.y for b in valid_boxes),
+                max(b.x2 for b in valid_boxes), max(b.y2 for b in valid_boxes),
+            )
+            if valid_boxes
+            else copy.copy(paragraph.box)
+        )
+        cont_text = "".join(
+            comp.pdf_character.char_unicode
+            for comp in move_comps
+            if comp.pdf_character and comp.pdf_character.char_unicode
+        ).strip()
+        cont_para = il_version_1.PdfParagraph(
+            box=cont_box,
+            pdf_style=copy.copy(paragraph.pdf_style) if paragraph.pdf_style else None,
+            pdf_paragraph_composition=move_comps,
+            xobj_id=paragraph.xobj_id,
+            unicode=cont_text or paragraph.unicode,
+            scale=paragraph.scale,
+            optimal_scale=paragraph.optimal_scale,
+            vertical=paragraph.vertical,
+            first_line_indent=paragraph.first_line_indent,
+            debug_id=(f"{paragraph.debug_id}_cont" if paragraph.debug_id is not None else None),
+            layout_label=paragraph.layout_label,
+            layout_id=paragraph.layout_id,
+            render_order=paragraph.render_order,
+            text_direction=paragraph.text_direction,
+            text_align=paragraph.text_align,
+            pipeline_trace={
+                "split_continuation_of": getattr(paragraph, "debug_id", None),
+            },
+        )
+        p_trace = self._ensure_pipeline_trace(paragraph)
+        p_trace["split_across_page"] = True
+        return cont_para
+
+    @staticmethod
+    def _create_continuation_page(
+        src_page: il_version_1.Page,
+        new_page_number: int,
+    ) -> il_version_1.Page:
+        """Allocate a clean normalized continuation Page inheriting source fonts."""
+        src_crop = src_page.cropbox.box if src_page.cropbox and src_page.cropbox.box else Box(0.0, 0.0, 595.0, 842.0)
+        width = max(1.0, src_crop.x2 - src_crop.x)
+        height = max(1.0, src_crop.y2 - src_crop.y)
+        norm_box = Box(0.0, 0.0, width, height)
+
+        fonts_by_id: dict[str, il_version_1.PdfFont] = {}
+        for f in src_page.pdf_font or []:
+            if f.font_id and f.font_id not in fonts_by_id:
+                fonts_by_id[f.font_id] = copy.copy(f)
+        for xobj in src_page.pdf_xobject or []:
+            for f in xobj.pdf_font or []:
+                if f.font_id and f.font_id not in fonts_by_id:
+                    fonts_by_id[f.font_id] = copy.copy(f)
+
+        return il_version_1.Page(
+            mediabox=il_version_1.Mediabox(box=Box(0.0, 0.0, width, height)),
+            cropbox=il_version_1.Cropbox(box=norm_box),
+            pdf_font=list(fonts_by_id.values()),
+            page_number=new_page_number,
+            unit=src_page.unit,
+            continuation_of_page=src_page.page_number,
+        )
+
+    @staticmethod
+    def _clear_paragraph_xobj_id(paragraph: il_version_1.PdfParagraph) -> None:
+        paragraph.xobj_id = None
+        for comp in paragraph.pdf_paragraph_composition or []:
+            if comp.pdf_character is not None:
+                comp.pdf_character.xobj_id = None
+            if comp.pdf_formula is not None:
+                for ch in comp.pdf_formula.pdf_character or []:
+                    ch.xobj_id = None
+                for curve in comp.pdf_formula.pdf_curve or []:
+                    curve.xobj_id = None
+                for form in comp.pdf_formula.pdf_form or []:
+                    form.xobj_id = None
+            if comp.pdf_line is not None:
+                for ch in comp.pdf_line.pdf_character or []:
+                    ch.xobj_id = None
+            if comp.pdf_same_style_characters is not None:
+                for ch in comp.pdf_same_style_characters.pdf_character or []:
+                    ch.xobj_id = None
+
+    def _record_pagination_metrics(self, document: il_version_1.Document) -> dict[str, int]:
+        """Compute and record pagination quality metrics onto ContentLedger."""
+        sparse_continuation_pages = 0
+        clipped_fragment_count = 0
+        group_pages: dict[str, set[int]] = {}
+
+        for page in document.page or []:
+            crop = page.cropbox.box if page.cropbox and page.cropbox.box else None
+            crop_h = max(1.0, crop.y2 - crop.y) if crop is not None else 842.0
+            paras = list(page.pdf_paragraph or [])
+
+            if getattr(page, "continuation_of_page", None) is not None:
+                total_h = 0.0
+                total_chars = 0
+                painted_area = 0.0
+                for para in paras:
+                    box = self._rendered_text_box(para) or para.box
+                    if box is not None:
+                        total_h += max(0.0, box.y2 - box.y)
+                        painted_area += max(0.0, box.x2 - box.x) * max(0.0, box.y2 - box.y)
+                    total_chars += sum(
+                        len((char.char_unicode or "").strip())
+                        for char in self._iter_paragraph_glyphs(para)
+                    )
+                # A stray line, small icon or copied decoration does not make
+                # a continuation page with one short fragment substantial.
+                crop_area = crop_h * (crop.x2 - crop.x if crop is not None else 595.0)
+                artwork_area = sum(
+                    max(0.0, box.x2 - box.x) * max(0.0, box.y2 - box.y)
+                    for item in [*page.pdf_rectangle, *page.pdf_curve, *page.pdf_form]
+                    if (box := item.box) is not None
+                )
+                has_artwork = artwork_area >= crop_area * 0.02
+                occupied_ratio = min(1.0, (painted_area + artwork_area) / max(1.0, crop_area))
+                min_occ = 0.12 if len(paras) <= 1 else 0.04
+                if len(paras) == 0 or (
+                    not has_artwork
+                    and (
+                        (
+                            total_h < max(36.0, crop_h * 0.06)
+                            and total_chars < 60
+                        )
+                        or occupied_ratio < min_occ
+                    )
+                ):
+                    sparse_continuation_pages += 1
+
+            for para in paras:
+                trace = para.pipeline_trace or {}
+                rendered = self._rendered_text_box(para)
+                text = (para.unicode or "").strip()
+                is_clipped = bool(trace.get("clipped"))
+                if not is_clipped:
+                    if rendered is None and text and not para.vertical:
+                        is_clipped = True
+                    elif rendered is not None and crop is not None and (
+                        rendered.x < crop.x - 1.0
+                        or rendered.x2 > crop.x2 + 1.0
+                        or rendered.y < crop.y - 1.0
+                        or rendered.y2 > crop.y2 + 1.0
+                    ):
+                        is_clipped = True
+                if is_clipped:
+                    clipped_fragment_count += 1
+
+                gid = trace.get("region_group_id")
+                rtype = trace.get("region_type")
+                if gid and rtype in {"card", "form_pair", "figure"}:
+                    group_pages.setdefault(str(gid), set()).add(page.page_number)
+
+        detached_group_count = sum(1 for pages in group_pages.values() if len(pages) > 1)
+        metrics = {
+            "sparse_continuation_pages": sparse_continuation_pages,
+            "clipped_fragment_count": clipped_fragment_count,
+            "detached_group_count": detached_group_count,
+        }
+        shared = getattr(self.translation_config, "shared_context_cross_split_part", None)
+        ledger = getattr(shared, "content_ledger", None) if shared is not None else None
+        if ledger is not None and hasattr(ledger, "record_pagination_metrics"):
+            ledger.record_pagination_metrics(**metrics)
+        return metrics
+
+    @staticmethod
+    def _box_x_overlap_significant(first: Box, second: Box) -> bool:
+        overlap = min(first.x2, second.x2) - max(first.x, second.x)
+        if overlap <= 0.0:
+            return False
+        min_w = max(1.0, min(first.x2 - first.x, second.x2 - second.x))
+        return overlap >= min(8.0, 0.2 * min_w)
+
+    def _collect_region_shapes(
+        self,
+        page: il_version_1.Page,
+        region_box: Box,
+        crop: Box,
+    ) -> tuple[list[il_version_1.PdfRectangle], list[il_version_1.PdfCurve]]:
+        """Collect non-page-wide border/fill shapes belonging to an overflowing region."""
+        page_w = max(1.0, crop.x2 - crop.x)
+        page_h = max(1.0, crop.y2 - crop.y)
+        rects: list[il_version_1.PdfRectangle] = []
+        curves: list[il_version_1.PdfCurve] = []
+        tol = 4.0
+
+        def _matches(box: Box | None) -> bool:
+            if box is None:
+                return False
+            bw = max(0.0, box.x2 - box.x)
+            bh = max(0.0, box.y2 - box.y)
+            if bw > page_w * 0.85 or (bw > page_w * 0.80 and bh > page_h * 0.80):
+                return False
+            return (
+                box.x >= region_box.x - tol
+                and box.x2 <= region_box.x2 + tol
+                and box.y >= region_box.y - tol
+                and box.y2 <= region_box.y2 + tol
+            )
+
+        for rect in list(page.pdf_rectangle or []):
+            if _matches(getattr(rect, "box", None)):
+                rects.append(rect)
+                page.pdf_rectangle.remove(rect)
+        for curve in list(page.pdf_curve or []):
+            if _matches(getattr(curve, "box", None)):
+                curves.append(curve)
+                page.pdf_curve.remove(curve)
+        return rects, curves
+
+    def _paginate_overflowing_pages(self, document: il_version_1.Document) -> int:
+        """Reflow overflowing body prose cleanly onto inserted continuation pages.
+
+        Returns the number of continuation pages created across ``document``.
+        """
+        if not document.page:
+            return 0
+
+        # Preserve each original page's immutable 0-based source index before
+        # continuation insertion shifts page_number for translated output.
+        for src_page in document.page:
+            if (
+                getattr(src_page, "continuation_of_page", None) is None
+                and getattr(src_page, "source_page_number", None) is None
+                and getattr(src_page, "page_number", None) is not None
+            ):
+                src_page.source_page_number = src_page.page_number
+
+        new_pages: list[il_version_1.Page] = []
+        created_continuations = 0
+        max_continuations_per_page = 10
+
+        for src_page in list(document.page):
+            new_pages.append(src_page)
+            crop = src_page.cropbox.box if src_page.cropbox and src_page.cropbox.box else None
+            if crop is None:
+                continue
+
+            if not any((p.pipeline_trace or {}).get("region_group_id") for p in (src_page.pdf_paragraph or [])):
+                assign_page_region_groups(src_page)
+
+            zones = self._get_page_vertical_zones(src_page)
+            body_floor = zones["body_floor"]
+            content_floor = zones["content_floor"]
+            has_footnotes = zones["has_footnotes"] > 0.5
+            crop_h = max(1.0, crop.y2 - crop.y)
+            body_span = max(40.0, zones["body_ceiling"] - body_floor)
+
+            movable: list[tuple[il_version_1.PdfParagraph, Box]] = []
+            for para in src_page.pdf_paragraph or []:
+                para_label = (para.layout_label or "").lower()
+                if (
+                    self._is_fixed_table_paragraph(para)
+                    or self._is_table_cell(para, src_page)
+                    or self._is_bottom_fixed_paragraph(para, src_page)
+                    or self._is_top_band_header(para, src_page)
+                    or "abandon" in para_label
+                    or "footnote" in para_label
+                    or para.vertical
+                    or (para.box is not None and self._is_inside_table_or_figure_region(para.box, src_page, figures_only=True))
+                ):
+                    continue
+                rbox = self._rendered_text_box(para)
+                if rbox is not None:
+                    movable.append((para, rbox))
+
+            movable.sort(key=lambda item: (-item[1].y2, item[1].x))
+
+            group_members_map: dict[str, list[tuple[il_version_1.PdfParagraph, Box]]] = {}
+            for para, rbox in movable:
+                trace = para.pipeline_trace or {}
+                gid = trace.get("region_group_id")
+                if gid and trace.get("region_type") in {"card", "form_pair"}:
+                    group_members_map.setdefault(str(gid), []).append((para, rbox))
+
+            # Queue item: (paragraphs, group_box, attached_rects, attached_curves, is_rigid_group)
+            overflow_queue: list[
+                tuple[
+                    list[il_version_1.PdfParagraph],
+                    Box,
+                    list[il_version_1.PdfRectangle],
+                    list[il_version_1.PdfCurve],
+                    bool,
+                ]
+            ] = []
+            overflow_lanes: list[tuple[float, Box]] = []
+            keep_paragraphs = set(id(p) for p in src_page.pdf_paragraph or [])
+            handled_group_ids: set[str] = set()
+
+            for para, rbox in movable:
+                if id(para) not in keep_paragraphs:
+                    continue
+                trace = para.pipeline_trace or {}
+                gid = trace.get("region_group_id")
+                rtype = trace.get("region_type")
+                violates_offpage = rbox.y < crop.y + 4.0
+                violates_footnote = has_footnotes and rbox.y < body_floor - 1.0
+                violates_content = rbox.y < content_floor - 2.0 and (
+                    bool(trace.get("collision_shifted"))
+                    or bool(trace.get("page_overflow"))
+                    or rbox.y < crop.y + 8.0
+                )
+                follows_moved_stream = any(
+                    rbox.y2 <= cutoff + 0.5
+                    and min(rbox.x2, lane.x2) - max(rbox.x, lane.x)
+                    >= 0.30 * max(1.0, min(rbox.x2 - rbox.x, lane.x2 - lane.x))
+                    for cutoff, lane in overflow_lanes
+                )
+                is_overflowing = (
+                    bool(trace.get("page_overflow"))
+                    or violates_offpage
+                    or violates_footnote
+                    or violates_content
+                    or follows_moved_stream
+                )
+                if not is_overflowing:
+                    continue
+
+                # Cohesive card/form_pair groups: check live drawn enclosures on src_page.
+                # Keep enclosed groups anchored when inside page bounds, or relocate
+                # the entire group + artwork rigidly together when overflowing.
+                if gid and rtype in {"card", "form_pair"} and gid in group_members_map:
+                    if gid in handled_group_ids:
+                        continue
+                    members = group_members_map[str(gid)]
+                    live_enclosing = next(
+                        (
+                            enc
+                            for m_para, _ in members
+                            if (enc := self._find_enclosing_region_box(m_para, src_page)) is not None
+                        ),
+                        None,
+                    )
+                    if live_enclosing is not None:
+                        handled_group_ids.add(str(gid))
+                        group_offpage = any(m_rb.y < crop.y + 4.0 for _, m_rb in members) or (
+                            live_enclosing.y < crop.y + 4.0
+                        )
+                        group_in_footnote = has_footnotes and all(m_rb.y < body_floor - 1.0 for _, m_rb in members)
+                        if not group_offpage and not group_in_footnote:
+                            if violates_footnote or violates_content or trace.get("page_overflow"):
+                                self._record_layout_issue(
+                                    page_number=src_page.page_number,
+                                    kind="contained_region_overflow",
+                                    detail="Text in a drawn region needs more room on the source page.",
+                                    debug_id=para.debug_id,
+                                    severity="warning",
+                                )
+                            continue
+
+                        min_x = min(min(m_rb.x for _, m_rb in members), live_enclosing.x)
+                        min_y = min(min(m_rb.y for _, m_rb in members), live_enclosing.y)
+                        max_x2 = max(max(m_rb.x2 for _, m_rb in members), live_enclosing.x2)
+                        max_y2 = max(max(m_rb.y2 for _, m_rb in members), live_enclosing.y2)
+                        group_box = Box(min_x, min_y, max_x2, max_y2)
+                        group_rects, group_curves = self._collect_region_shapes(src_page, group_box, crop)
+                        for m_para, _ in members:
+                            keep_paragraphs.discard(id(m_para))
+                        overflow_lanes.append((group_box.y2, group_box))
+                        overflow_queue.append(
+                            ([m_para for m_para, _ in members], group_box, group_rects, group_curves, True)
+                        )
+                        continue
+
+                    # Unframed cohesive form_pair / invoice sibling group: keep siblings
+                    # together rather than detaching a single label or field.
+                    handled_group_ids.add(str(gid))
+                    min_x = min(m_rb.x for _, m_rb in members)
+                    min_y = min(m_rb.y for _, m_rb in members)
+                    max_x2 = max(m_rb.x2 for _, m_rb in members)
+                    max_y2 = max(m_rb.y2 for _, m_rb in members)
+                    group_box = Box(min_x, min_y, max_x2, max_y2)
+                    lead_headings = [
+                        (cand_p, cand_rb)
+                        for cand_p, cand_rb in movable
+                        if id(cand_p) in keep_paragraphs
+                        and all(cand_p is not mp for mp, _ in members)
+                        and self._is_heading_paragraph(cand_p)
+                        and not (cand_p.pipeline_trace or {}).get("region_group_id")
+                        and cand_rb.y >= group_box.y2 - 2.0
+                        and (cand_rb.y - group_box.y2) <= 28.0
+                        and self._box_x_overlap_significant(cand_rb, group_box)
+                    ]
+                    if lead_headings:
+                        lead_headings.sort(key=lambda item: (-item[1].y2, item[1].x))
+                        members = [*lead_headings, *members]
+                        group_box = Box(
+                            min(m_rb.x for _, m_rb in members),
+                            min(m_rb.y for _, m_rb in members),
+                            max(m_rb.x2 for _, m_rb in members),
+                            max(m_rb.y2 for _, m_rb in members),
+                        )
+                    for m_para, _ in members:
+                        keep_paragraphs.discard(id(m_para))
+                    overflow_lanes.append((group_box.y2, group_box))
+                    overflow_queue.append(
+                        ([m_para for m_para, _ in members], group_box, [], [], True)
+                    )
+                    continue
+
+                # A local card/diagram region owns its text and artwork. A
+                # generic body overflow flag cannot detach that text alone.
+                enclosing_box = self._find_enclosing_region_box(para, src_page)
+                if enclosing_box is not None and not violates_offpage:
+                    if violates_footnote or violates_content or trace.get("page_overflow"):
+                        self._record_layout_issue(
+                            page_number=src_page.page_number,
+                            kind="contained_region_overflow",
+                            detail="Text in a drawn region needs more room on the source page.",
+                            debug_id=para.debug_id,
+                            severity="warning",
+                        )
+                    continue
+
+                para_height = max(0.0, rbox.y2 - rbox.y)
+                can_split = (
+                    rbox.y2 > body_floor + 16.0
+                    and para_height > body_span * 0.25
+                    and not follows_moved_stream
+                )
+                if can_split:
+                    cont_part = self._split_rendered_paragraph_at_y(para, body_floor)
+                    if cont_part is not None:
+                        cont_rbox = self._rendered_text_box(cont_part) or cont_part.box
+                        if cont_rbox is not None:
+                            overflow_queue.append(([cont_part], cont_rbox, [], [], False))
+                            overflow_lanes.append((body_floor, rbox))
+                            continue
+
+                # Keep-with-next: do not leave an immediately preceding column-aligned
+                # heading or short colon-label stranded at the bottom of the source page.
+                pulled_headings: list[tuple[il_version_1.PdfParagraph, Box]] = []
+                anchor_y2 = rbox.y2
+                anchor_box = rbox
+                for _ in range(2):
+                    candidates = [
+                        (cand_p, cand_rb)
+                        for cand_p, cand_rb in movable
+                        if cand_p is not para
+                        and id(cand_p) in keep_paragraphs
+                        and cand_rb.y >= anchor_y2 - 2.0
+                        and (cand_rb.y - anchor_y2) <= 28.0
+                        and self._box_x_overlap_significant(cand_rb, anchor_box)
+                    ]
+                    if not candidates:
+                        break
+                    closest_p, closest_rb = min(candidates, key=lambda item: item[1].y)
+                    closest_trace = closest_p.pipeline_trace or {}
+                    closest_u = (closest_p.unicode or "").strip()
+                    is_lead_label = self._is_heading_paragraph(closest_p) or (
+                        closest_u.endswith(":") and len(closest_u) <= 60
+                    )
+                    if not is_lead_label or closest_trace.get("region_group_id"):
+                        break
+                    keep_paragraphs.discard(id(closest_p))
+                    pulled_headings.insert(0, (closest_p, closest_rb))
+                    anchor_y2 = closest_rb.y2
+                    anchor_box = closest_rb
+
+                for h_para, h_rbox in pulled_headings:
+                    overflow_queue.append(([h_para], h_rbox, [], [], False))
+
+                if not follows_moved_stream:
+                    overflow_lanes.append((anchor_y2, rbox))
+
+                # Collect matching translated_code_band rectangles anchored to this paragraph
+                attached_rects: list[il_version_1.PdfRectangle] = []
+                for rect in list(src_page.pdf_rectangle or []):
+                    if (
+                        rect.debug_info == "translated_code_band"
+                        and rect.box is not None
+                        and rect.box.y <= rbox.y2 + 4.0
+                        and rect.box.y2 >= rbox.y - 4.0
+                        and rect.box.x >= rbox.x - 12.0
+                        and rect.box.x2 <= rbox.x2 + 12.0
+                    ):
+                        attached_rects.append(rect)
+                        src_page.pdf_rectangle.remove(rect)
+
+                attached_curves: list[il_version_1.PdfCurve] = []
+                if enclosing_box is not None and violates_offpage:
+                    enc_rects, enc_curves = self._collect_region_shapes(src_page, enclosing_box, crop)
+                    attached_rects.extend(enc_rects)
+                    attached_curves.extend(enc_curves)
+
+                keep_paragraphs.discard(id(para))
+                overflow_queue.append(([para], rbox, attached_rects, attached_curves, False))
+
+                # Never move a short label or heading alone while leaving its immediately
+                # following value or body behind in the same column.
+                para_u = (para.unicode or "").strip()
+                if self._is_heading_paragraph(para) or (para_u.endswith(":") and len(para_u) <= 60):
+                    following_deps = [
+                        (dep_p, dep_rb)
+                        for dep_p, dep_rb in movable
+                        if dep_p is not para
+                        and id(dep_p) in keep_paragraphs
+                        and dep_rb.y2 <= rbox.y + 4.0
+                        and (rbox.y - dep_rb.y2) <= 20.0
+                        and self._box_x_overlap_significant(dep_rb, rbox)
+                    ]
+                    if following_deps:
+                        dep_p, dep_rb = max(following_deps, key=lambda item: item[1].y2)
+                        keep_paragraphs.discard(id(dep_p))
+                        overflow_queue.append(([dep_p], dep_rb, [], [], False))
+
+            if not overflow_queue:
+                continue
+
+            has_explicit_overflow = any(
+                (qp.pipeline_trace or {}).get("page_overflow")
+                for group_paras, _, _, _, _ in overflow_queue
+                for qp in group_paras
+            )
+            footnote_barrier_top = None
+            if has_footnotes:
+                fn_tops = [
+                    max(
+                        (rb.y2 if (rb := self._rendered_text_box(p)) is not None else p.box.y2),
+                        p.box.y2 if p.box is not None else 0.0,
+                    )
+                    for p in (src_page.pdf_paragraph or [])
+                    if self._is_footnote_paragraph(p) and (p.box is not None or self._rendered_text_box(p) is not None)
+                ]
+                if fn_tops:
+                    footnote_barrier_top = max(fn_tops)
+            min_clear_floor = max(
+                content_floor + 1.5,
+                (footnote_barrier_top + 2.5) if footnote_barrier_top is not None else content_floor,
+            )
+            total_q_h = sum(max(0.0, gb.y2 - gb.y) for _, gb, _, _, _ in overflow_queue)
+
+            # A translated block near the physical footer can be taller than its
+            # English source while its original column still has ample unused
+            # room above it.  Keep the complete heading/body/form stream on the
+            # source page when an upward translation (including any immediately
+            # preceding movable blocks in the same column lane) clears the floor
+            # without crossing fixed obstacles or footnotes.
+            compactable_boxes = [
+                gb for _, gb, rects, curves, _rigid in overflow_queue
+                if not rects and not curves
+            ]
+            if (
+                compactable_boxes
+                and len(compactable_boxes) == len(overflow_queue)
+                and not has_footnotes
+                and (
+                    len(compactable_boxes) == 1
+                    or all(
+                        self._box_x_overlap_significant(compactable_boxes[0], box)
+                        for box in compactable_boxes[1:]
+                    )
+                )
+            ):
+                stream_box = Box(
+                    min(box.x for box in compactable_boxes),
+                    min(box.y for box in compactable_boxes),
+                    max(box.x2 for box in compactable_boxes),
+                    max(box.y2 for box in compactable_boxes),
+                )
+                target_floor = max(
+                    body_floor if has_footnotes else content_floor,
+                    min_clear_floor,
+                    crop.y + 8.0,
+                )
+                deficit = target_floor - stream_box.y
+                movable_ids = {id(mp) for mp, _ in movable}
+                chain_paras: list[il_version_1.PdfParagraph] = []
+                chain_ids: set[int] = set()
+                current_top = stream_box.y2
+                if stream_box.y >= crop.y and 0.0 < deficit <= crop_h * 0.22:
+                    # Walk upward through movable kept blocks in the same column lane
+                    # that would otherwise block shifting into free space higher up.
+                    kept_in_lane = sorted(
+                        [
+                            (kp, krb)
+                            for kp in (src_page.pdf_paragraph or [])
+                            if id(kp) in keep_paragraphs
+                            and id(kp) in movable_ids
+                            and not (kp.pipeline_trace or {}).get("region_group_id")
+                            and (krb := self._rendered_text_box(kp)) is not None
+                            and krb.y >= stream_box.y2 - 0.5
+                            and self._box_x_overlap_significant(krb, stream_box)
+                        ],
+                        key=lambda item: item[1].y,
+                    )
+                    for kp, krb in kept_in_lane:
+                        if krb.y - current_top - 3.0 >= deficit:
+                            break
+                        chain_paras.append(kp)
+                        chain_ids.add(id(kp))
+                        current_top = max(current_top, krb.y2)
+                        stream_box = Box(
+                            min(stream_box.x, krb.x),
+                            stream_box.y,
+                            max(stream_box.x2, krb.x2),
+                            current_top,
+                        )
+
+                retained_above = [
+                    rb.y
+                    for kept in (src_page.pdf_paragraph or [])
+                    if id(kept) in keep_paragraphs
+                    and id(kept) not in chain_ids
+                    and (rb := self._rendered_text_box(kept)) is not None
+                    and rb.y >= current_top - 0.5
+                    and self._box_x_overlap_significant(rb, stream_box)
+                ]
+                available_ceiling = min(retained_above) if retained_above else zones["body_ceiling"]
+                headroom = available_ceiling - current_top - 3.0
+                if (
+                    stream_box.y >= crop.y
+                    and 0.0 < deficit <= min(headroom, crop_h * 0.22)
+                ):
+                    for cp in chain_paras:
+                        self._translate_rendered_paragraph(cp, dy=deficit)
+                        moved_c = self._rendered_text_box(cp)
+                        if moved_c is not None:
+                            cp.box = moved_c
+                        self._ensure_pipeline_trace(cp)["compacted_on_source_page"] = True
+                    for group_paras, _, _, _, _ in overflow_queue:
+                        for qp in group_paras:
+                            self._translate_rendered_paragraph(qp, dy=deficit)
+                            moved = self._rendered_text_box(qp)
+                            if moved is not None:
+                                qp.box = moved
+                            trace = self._ensure_pipeline_trace(qp)
+                            trace["compacted_on_source_page"] = True
+                            trace.pop("page_overflow", None)
+                    continue
+
+            # First try bounded compaction within same horizontal lane before creating a sparse page.
+            if (
+                not has_explicit_overflow
+                and len(overflow_queue) == 1
+                and len(overflow_queue[0][0]) == 1
+                and not overflow_queue[0][4]
+                and total_q_h <= 28.0
+            ):
+                qp = overflow_queue[0][0][0]
+                qrb = overflow_queue[0][1]
+                target_floor = max(body_floor if has_footnotes else content_floor, min_clear_floor)
+                deficit = target_floor - qrb.y
+                if 0.0 < deficit <= 18.0:
+                    above_bottoms = [
+                        rb.y
+                        for ap in (src_page.pdf_paragraph or [])
+                        if ap is not qp
+                        and (rb := self._rendered_text_box(ap)) is not None
+                        and rb.y >= qrb.y2 - 0.5
+                        and self._box_x_overlap_significant(rb, qrb)
+                    ]
+                    headroom = (
+                        (min(above_bottoms) - qrb.y2 - 3.0)
+                        if above_bottoms
+                        else (zones["body_ceiling"] - qrb.y2)
+                    )
+                    if (
+                        headroom >= deficit
+                        and (qrb.y + deficit) >= min_clear_floor
+                        and (qrb.y + deficit) >= crop.y + 8.0
+                    ):
+                        self._translate_rendered_paragraph(qp, dy=deficit)
+                        moved = self._rendered_text_box(qp)
+                        if moved is not None:
+                            qp.box = moved
+                        continue
+
+            if (
+                not has_explicit_overflow
+                and total_q_h <= 28.0
+                and all(gb.y >= min_clear_floor and gb.y >= crop.y + 8.0 for _, gb, _, _, _ in overflow_queue)
+            ):
+                continue
+
+            src_boxes_before_pagination = {
+                id(p): Box(p.box.x, p.box.y, p.box.x2, p.box.y2)
+                for p in (src_page.pdf_paragraph or [])
+                if p.box is not None
+            }
+            src_page.pdf_paragraph = [
+                p for p in (src_page.pdf_paragraph or []) if id(p) in keep_paragraphs
+            ]
+
+            cont_margin = max(14.0, min(28.0, crop_h * 0.035))
+            cont_ceiling = crop_h - cont_margin
+            cont_floor = cont_margin
+            cont_page = self._create_continuation_page(src_page, len(new_pages))
+            new_pages.append(cont_page)
+            created_continuations += 1
+            cont_count_for_src = 1
+            cursor_y2 = cont_ceiling
+            dx = -crop.x
+
+            idx = 0
+            while idx < len(overflow_queue):
+                group_paras, rbox, attached_rects, attached_curves, is_rigid = overflow_queue[idx]
+                item_h = max(0.0, rbox.y2 - rbox.y)
+
+                if cursor_y2 - item_h < cont_floor - 1.0 and cont_page.pdf_paragraph:
+                    if cont_count_for_src >= max_continuations_per_page:
+                        break
+                    cont_page = self._create_continuation_page(src_page, len(new_pages))
+                    new_pages.append(cont_page)
+                    created_continuations += 1
+                    cont_count_for_src += 1
+                    cursor_y2 = cont_ceiling
+
+                dy = cursor_y2 - rbox.y2
+                placed_top = cursor_y2
+                placed_bottom = cursor_y2 - item_h
+                for para in group_paras:
+                    orig_pbox = src_boxes_before_pagination.get(id(para))
+                    self._translate_rendered_paragraph(para, dx=dx, dy=dy)
+                    self._clear_paragraph_xobj_id(para)
+                    moved_rbox = self._rendered_text_box(para)
+                    if moved_rbox is not None:
+                        para.box = moved_rbox
+                    trace = self._ensure_pipeline_trace(para)
+                    trace["paginated_from_page"] = src_page.page_number
+                    if orig_pbox is not None:
+                        trace["paginated_source_box"] = [orig_pbox.x, orig_pbox.y, orig_pbox.x2, orig_pbox.y2]
+                    if rbox.y < crop.y + 4.0:
+                        trace["paginated_offpage"] = True
+                    if has_footnotes and footnote_barrier_top is not None and rbox.y < footnote_barrier_top - 0.5:
+                        trace["paginated_footnote_overlap"] = True
+                    elif has_footnotes and orig_pbox is not None and footnote_barrier_top is not None and orig_pbox.y < footnote_barrier_top - 0.5:
+                        trace["paginated_footnote_overlap"] = True
+                    trace.pop("page_overflow", None)
+
+                for rect in attached_rects:
+                    if rect.box is not None:
+                        rect.box = Box(
+                            rect.box.x + dx,
+                            rect.box.y + dy,
+                            rect.box.x2 + dx,
+                            rect.box.y2 + dy,
+                        )
+                    rect.xobj_id = None
+                    cont_page.pdf_rectangle.append(rect)
+
+                for curve in attached_curves:
+                    self._translate_rendered_curve(curve, dx=dx, dy=dy)
+                    curve.xobj_id = None
+                    cont_page.pdf_curve.append(curve)
+
+                # If even alone on a fresh continuation page a single non-rigid block still dips
+                # below cont_floor, split its lines iteratively onto the next continuation page.
+                if (
+                    not is_rigid
+                    and len(group_paras) == 1
+                    and (moved_single := self._rendered_text_box(group_paras[0])) is not None
+                    and moved_single.y < cont_floor - 1.0
+                    and cont_count_for_src < max_continuations_per_page
+                ):
+                    extra_tail = self._split_rendered_paragraph_at_y(group_paras[0], cont_floor)
+                    if extra_tail is not None:
+                        tail_box = self._rendered_text_box(extra_tail) or extra_tail.box
+                        if tail_box is not None:
+                            overflow_queue.insert(idx + 1, ([extra_tail], tail_box, [], [], False))
+                            moved_single = self._rendered_text_box(group_paras[0]) or moved_single
+                            placed_bottom = moved_single.y
+                            placed_top = moved_single.y2
+
+                cont_page.pdf_paragraph.extend(group_paras)
+                cursor_y2 -= max(0.0, placed_top - placed_bottom) + 8.0
+                idx += 1
+
+        if created_continuations:
+            shift = 0
+            cont_count = 0
+            src_orig_to_final: dict[int, int] = {}
+            for page in new_pages:
+                orig_src = getattr(page, "continuation_of_page", None)
+                if orig_src is not None:
+                    cont_count += 1
+                    final_src = src_orig_to_final.get(orig_src, orig_src + shift)
+                    page.continuation_of_page = final_src
+                    page.page_number = final_src + cont_count
+                    shift += 1
+                else:
+                    orig_num = page.page_number
+                    final_num = orig_num + shift
+                    src_orig_to_final[orig_num] = final_num
+                    page.page_number = final_num
+                    cont_count = 0
+            document.page[:] = new_pages
+            document.total_pages = len(document.page)
+            merged_back = self._merge_sparse_continuation_pages_back(document)
+            created_continuations = max(0, created_continuations - merged_back)
+            shared = getattr(self.translation_config, "shared_context_cross_split_part", None)
+            if shared is not None and hasattr(shared, "continuation_pages"):
+                shared.continuation_pages = {
+                    p.page_number: p.continuation_of_page
+                    for p in document.page
+                    if p.continuation_of_page is not None
+                }
+            logger.info(
+                "Paginated overflowing translated content onto %d continuation page(s) (total pages=%d).",
+                created_continuations,
+                len(document.page),
+            )
+        self._record_pagination_metrics(document)
+        return created_continuations
+
+    def _merge_sparse_continuation_pages_back(self, document: il_version_1.Document) -> int:
+        """Merge sparse continuation pages back onto their preceding page when collision-free."""
+        pages = list(getattr(document, "page", None) or [])
+        if len(pages) < 2:
+            return 0
+        merged_count = 0
+        idx = 1
+        while idx < len(pages):
+            cont_page = pages[idx]
+            prev_page = pages[idx - 1]
+            cont_src = getattr(cont_page, "continuation_of_page", None)
+            if cont_src is None:
+                idx += 1
+                continue
+            prev_src = getattr(prev_page, "continuation_of_page", None)
+            if cont_src != prev_page.page_number and (prev_src is None or cont_src != prev_src):
+                idx += 1
+                continue
+            # Never merge continuation pages that carry relocated drawn artwork/cards/forms
+            if (
+                (cont_page.pdf_rectangle or [])
+                or (cont_page.pdf_curve or [])
+                or (cont_page.pdf_form or [])
+            ):
+                idx += 1
+                continue
+            c_paras = [
+                p for p in (cont_page.pdf_paragraph or [])
+                if self._rendered_text_box(p) is not None
+            ]
+            if not c_paras or len(c_paras) > 1:
+                idx += 1
+                continue
+            # Verify genuine pagination ownership and never merge rigid/atomic groups, tables, or formulas
+            cannot_merge = False
+            for p in c_paras:
+                tr = p.pipeline_trace or {}
+                pag_from = tr.get("paginated_from_page")
+                if pag_from is not None and pag_from not in {prev_page.page_number, cont_src}:
+                    cannot_merge = True
+                    break
+                if (
+                    tr.get("paginated_offpage")
+                    or tr.get("paginated_footnote_overlap")
+                    or tr.get("overflow_reason") == "bottom_zone_collision"
+                    or tr.get("region_group_id")
+                    or tr.get("region_type") in {"card", "form_pair", "figure", "table"}
+                    or self._is_table_cell(p, cont_page)
+                    or self._is_fixed_table_paragraph(p)
+                    or self._is_bottom_fixed_paragraph(p, cont_page)
+                    or tr.get("region_fallback") == "unresolved_readable_overflow"
+                ):
+                    cannot_merge = True
+                    break
+                if any(getattr(comp, "pdf_formula", None) is not None for comp in (p.pdf_paragraph_composition or [])):
+                    cannot_merge = True
+                    break
+            if cannot_merge:
+                idx += 1
+                continue
+
+            c_boxes = [self._rendered_text_box(p) for p in c_paras]
+            c_boxes = [b for b in c_boxes if b is not None]
+            if not c_boxes:
+                idx += 1
+                continue
+            # Ensure c_paras belong to a single horizontal stream
+            if len(c_boxes) > 1 and not all(
+                self._box_x_overlap_significant(c_boxes[0], b) for b in c_boxes[1:]
+            ):
+                idx += 1
+                continue
+            total_h = max(b.y2 for b in c_boxes) - min(b.y for b in c_boxes)
+            total_chars = sum(len((p.unicode or "").strip()) for p in c_paras)
+            if total_h > 32.0 or total_chars > 90:
+                idx += 1
+                continue
+
+            crop = prev_page.cropbox.box if prev_page.cropbox and prev_page.cropbox.box else None
+            if crop is None:
+                idx += 1
+                continue
+            zones = self._get_page_vertical_zones(prev_page)
+            has_footnotes = zones["has_footnotes"] > 0.5
+            footnote_barrier_top = None
+            if has_footnotes:
+                fn_tops = [
+                    max(
+                        (rb.y2 if (rb := self._rendered_text_box(p)) is not None else p.box.y2),
+                        p.box.y2 if p.box is not None else 0.0,
+                    )
+                    for p in (prev_page.pdf_paragraph or [])
+                    if self._is_footnote_paragraph(p) and (p.box is not None or self._rendered_text_box(p) is not None)
+                ]
+                if fn_tops:
+                    footnote_barrier_top = max(fn_tops)
+            target_floor = max(
+                zones["body_floor"] if has_footnotes else zones["content_floor"],
+                (footnote_barrier_top + 4.0) if footnote_barrier_top is not None else zones["content_floor"],
+                crop.y + 8.0,
+            )
+            c_min_x = min(b.x for b in c_boxes)
+            c_max_x2 = max(b.x2 for b in c_boxes)
+            c_lane = Box(c_min_x, min(b.y for b in c_boxes), c_max_x2, max(b.y2 for b in c_boxes))
+
+            # If prev_page is a multi-column page, do not merge an overflowing column tail back
+            prev_movable_lanes = [
+                rb for p in (prev_page.pdf_paragraph or [])
+                if not self._is_bottom_fixed_paragraph(p, prev_page)
+                and not self._is_top_band_header(p, prev_page)
+                and (rb := self._rendered_text_box(p)) is not None
+            ]
+            if any(not self._box_x_overlap_significant(rb, c_lane) for rb in prev_movable_lanes):
+                idx += 1
+                continue
+
+            # Find lowest existing content in the same horizontal lane on prev_page
+            # Use max(rb.y, p.box.y) so an expanded layout box that had vertical padding
+            # below its rendered glyphs is not overlapped by merged continuation text.
+            lane_bottoms = [
+                min(rb.y, p.box.y if p.box is not None else rb.y)
+                for p in (prev_page.pdf_paragraph or [])
+                if not self._is_bottom_fixed_paragraph(p, prev_page)
+                and not self._is_top_band_header(p, prev_page)
+                and (rb := self._rendered_text_box(p)) is not None
+                and self._box_x_overlap_significant(rb, c_lane)
+            ]
+            available_top = (min(lane_bottoms) - 4.0) if lane_bottoms else zones["body_ceiling"]
+            candidate_bottom = available_top - total_h
+
+            # Verify no collision with any drawn rect/curve or any existing paragraph's
+            # rendered OR reserved layout box on prev_page, and never invert reading order
+            # by hoisting a bottom paragraph above a kept paragraph that originally sat above it.
+            cand_box = Box(c_min_x, candidate_bottom, c_max_x2, available_top)
+            shape_collision = False
+            for p_src in c_paras:
+                psb = (p_src.pipeline_trace or {}).get("paginated_source_box")
+                if isinstance(psb, (list, tuple)) and len(psb) == 4:
+                    orig_y2 = float(psb[3])
+                    # Never hoist a paragraph more than 25% of the page height above its source y2
+                    if available_top - orig_y2 > (crop.y2 - crop.y) * 0.25:
+                        shape_collision = True
+                        break
+            for kp in (prev_page.pdf_paragraph or []):
+                if self._is_bottom_fixed_paragraph(kp, prev_page) or self._is_top_band_header(kp, prev_page):
+                    continue
+                kb = kp.box
+                if kb is not None and (
+                    min(cand_box.x2, kb.x2) - max(cand_box.x, kb.x) > 1.0
+                    and min(cand_box.y2, kb.y2) - max(cand_box.y, kb.y) > 1.0
+                ):
+                    shape_collision = True
+                    break
+            for shape in list(prev_page.pdf_rectangle or []) + list(prev_page.pdf_curve or []):
+                sb = getattr(shape, "box", None)
+                if sb is None:
+                    continue
+                if (sb.x2 - sb.x) > (crop.x2 - crop.x) * 0.85:
+                    continue
+                if (
+                    min(cand_box.x2, sb.x2) - max(cand_box.x, sb.x) > 1.0
+                    and min(cand_box.y2, sb.y2) - max(cand_box.y, sb.y) > 1.0
+                ):
+                    shape_collision = True
+                    break
+
+            if not shape_collision and candidate_bottom >= target_floor:
+                # Place c_paras cleanly into [candidate_bottom, available_top] on prev_page
+                dy = available_top - max(b.y2 for b in c_boxes)
+                for p in c_paras:
+                    self._translate_rendered_paragraph(p, dy=dy)
+                    moved_b = self._rendered_text_box(p)
+                    if moved_b is not None:
+                        p.box = moved_b
+                    tr = self._ensure_pipeline_trace(p)
+                    tr["merged_from_sparse_continuation"] = True
+                    prev_page.pdf_paragraph.append(p)
+                removed_num = cont_page.page_number
+                pages.pop(idx)
+                for later_p in pages[idx:]:
+                    if getattr(later_p, "page_number", None) is not None and later_p.page_number > removed_num:
+                        later_p.page_number -= 1
+                    later_src = getattr(later_p, "continuation_of_page", None)
+                    if later_src is not None and later_src > removed_num:
+                        later_p.continuation_of_page = later_src - 1
+                merged_count += 1
+                continue
+            idx += 1
+
+        if merged_count:
+            document.page[:] = pages
+            document.total_pages = len(document.page)
+            shared = getattr(self.translation_config, "shared_context_cross_split_part", None)
+            if shared is not None and hasattr(shared, "continuation_pages"):
+                shared.continuation_pages = {
+                    p.page_number: p.continuation_of_page
+                    for p in document.page
+                    if p.continuation_of_page is not None
+                }
+        return merged_count
+
+    def _anchor_inline_highlight_curves(self, page: il_version_1.Page) -> None:
+        """Relocate inline background highlight rectangles from LTR source lines to RTL rendered lines.
+
+        Scientific figures and heatmaps (e.g., neuron activation visualizations)
+        often paint colored background rectangles behind specific words on 1-2
+        lines. When those sentences are translated into Arabic and laid out RTL,
+        the rendered lines move and right-align. This method deduplicates
+        stacked highlight curves and maps each contiguous highlight span from
+        its cumulative LTR position along the paragraph's source lines to the
+        corresponding cumulative RTL position along the paragraph's rendered
+        Arabic lines.
+        """
+        if not self._is_arabic_output() or not getattr(page, "pdf_curve", None):
+            return
+        page_key = id(page)
+        if page_key in self._inline_highlights_anchored_pages:
+            return
+        self._inline_highlights_anchored_pages.add(page_key)
+
+        candidate_curves = [
+            curve
+            for curve in page.pdf_curve
+            if curve.box is not None
+            and curve.fill_background
+            and not curve.stroke_path
+            and 0.5 <= (curve.box.x2 - curve.box.x) <= 220.0
+            and 3.0 <= (curve.box.y2 - curve.box.y) <= 18.0
+        ]
+        if not candidate_curves:
+            return
+
+        claimed_curve_ids: set[int] = set()
+        duplicate_curve_ids: set[int] = set()
+
+        for paragraph in page.pdf_paragraph or []:
+            trace = paragraph.pipeline_trace or {}
+            source_lines = list(trace.get("source_line_boxes") or [])
+            label = (paragraph.layout_label or "").lower()
+            in_figure = self._is_inside_table_or_figure_region(
+                paragraph.box, page, figures_only=True
+            )
+            if not in_figure and not any(
+                marker in label
+                for marker in ("fallback_line", "figure", "chart", "axis", "diagram")
+            ):
+                continue
+            if not source_lines:
+                if (
+                    paragraph.box is not None
+                    and 3.0 <= (paragraph.box.y2 - paragraph.box.y) <= 18.0
+                ):
+                    source_lines = [
+                        (paragraph.box.x, paragraph.box.y, paragraph.box.x2, paragraph.box.y2)
+                    ]
+                else:
+                    continue
+
+            # Collect rendered character boxes for this paragraph and cluster into visual lines
+            char_boxes: list[Box] = []
+            for comp in paragraph.pdf_paragraph_composition or []:
+                if comp.pdf_character and comp.pdf_character.box:
+                    if (comp.pdf_character.char_unicode or "").strip():
+                        char_boxes.append(comp.pdf_character.box)
+                elif comp.pdf_formula:
+                    for ch in comp.pdf_formula.pdf_character or []:
+                        if ch.box and (ch.char_unicode or "").strip():
+                            char_boxes.append(ch.box)
+            if not char_boxes:
+                continue
+
+            rendered_clusters: list[list[Box]] = []
+            for cbox in sorted(char_boxes, key=lambda b: (-b.y2, b.x)):
+                placed = False
+                ch_h = max(1.0, cbox.y2 - cbox.y)
+                for cluster in rendered_clusters:
+                    ref_y1 = min(b.y for b in cluster)
+                    ref_y2 = max(b.y2 for b in cluster)
+                    ref_h = max(1.0, ref_y2 - ref_y1)
+                    v_ov = min(cbox.y2, ref_y2) - max(cbox.y, ref_y1)
+                    if v_ov >= 0.35 * min(ch_h, ref_h) or abs(cbox.y - ref_y1) <= 3.0:
+                        cluster.append(cbox)
+                        placed = True
+                        break
+                if not placed:
+                    rendered_clusters.append([cbox])
+
+            rendered_lines: list[tuple[float, float, float, float]] = [
+                (
+                    min(b.x for b in cluster),
+                    min(b.y for b in cluster),
+                    max(b.x2 for b in cluster),
+                    max(b.y2 for b in cluster),
+                )
+                for cluster in rendered_clusters
+            ]
+            rendered_lines.sort(key=lambda r: -r[3])
+            if not rendered_lines:
+                continue
+
+            # Match candidate curves to each source line of this paragraph
+            line_curves: dict[int, list[PdfCurve]] = {i: [] for i in range(len(source_lines))}
+            seen_geom: set[tuple[float, float, float, float]] = set()
+            for curve in candidate_curves:
+                if id(curve) in claimed_curve_ids:
+                    continue
+                if curve.xobj_id != paragraph.xobj_id:
+                    continue
+                cbox = curve.box
+                ch_h = max(1.0, cbox.y2 - cbox.y)
+                best_line_idx = None
+                best_ov = 0.0
+                for idx, (sx1, sy1, sx2, sy2) in enumerate(source_lines):
+                    src_h = max(1.0, sy2 - sy1)
+                    v_ov = min(cbox.y2, sy2) - max(cbox.y, sy1)
+                    h_ov = min(cbox.x2, sx2 + 3.0) - max(cbox.x, sx1 - 3.0)
+                    if v_ov >= 0.45 * min(ch_h, src_h) and h_ov > 0.5:
+                        if v_ov > best_ov:
+                            best_ov = v_ov
+                            best_line_idx = idx
+                if best_line_idx is not None:
+                    claimed_curve_ids.add(id(curve))
+                    geom_key = (
+                        round(cbox.x, 1),
+                        round(cbox.y, 1),
+                        round(cbox.x2, 1),
+                        round(cbox.y2, 1),
+                    )
+                    if geom_key in seen_geom:
+                        duplicate_curve_ids.add(id(curve))
+                    else:
+                        seen_geom.add(geom_key)
+                        line_curves[best_line_idx].append(curve)
+
+            if not any(line_curves.values()):
+                continue
+
+            src_widths = [max(1.0, sx2 - sx1) for (sx1, sy1, sx2, sy2) in source_lines]
+            total_src_w = sum(src_widths)
+            dst_widths = [max(1.0, rx2 - rx1) for (rx1, ry1, rx2, ry2) in rendered_lines]
+            total_dst_w = sum(dst_widths)
+
+            for src_idx, curves_on_line in line_curves.items():
+                if not curves_on_line:
+                    continue
+                sx1, sy1, sx2, sy2 = source_lines[src_idx]
+                curves_on_line.sort(key=lambda c: c.box.x)
+
+                # Group horizontally contiguous character highlight curves into word/phrase spans
+                spans: list[list[PdfCurve]] = []
+                for curve in curves_on_line:
+                    if not spans or (curve.box.x - spans[-1][-1].box.x2) > 3.5:
+                        spans.append([curve])
+                    else:
+                        spans[-1].append(curve)
+
+                cum_src_before = sum(src_widths[:src_idx])
+                for span in spans:
+                    span_x1 = min(c.box.x for c in span)
+                    span_x2 = max(c.box.x2 for c in span)
+                    span_y1 = min(c.box.y for c in span)
+                    span_y2 = max(c.box.y2 for c in span)
+                    span_w = span_x2 - span_x1
+                    span_center_x = 0.5 * (span_x1 + span_x2)
+                    span_center_y = 0.5 * (span_y1 + span_y2)
+
+                    rel_src_x = min(max(0.0, span_center_x - sx1), src_widths[src_idx])
+                    u_center = (cum_src_before + rel_src_x) / total_src_w
+                    target_dist = u_center * total_dst_w
+
+                    # Locate the target rendered line and RTL offset along that line
+                    cum_dst = 0.0
+                    dst_idx = len(rendered_lines) - 1
+                    dist_in_line = dst_widths[-1]
+                    for k, dw in enumerate(dst_widths):
+                        if target_dist <= cum_dst + dw or k == len(dst_widths) - 1:
+                            dst_idx = k
+                            dist_in_line = min(max(0.0, target_dist - cum_dst), dw)
+                            break
+                        cum_dst += dw
+
+                    rx1, ry1, rx2, ry2 = rendered_lines[dst_idx]
+                    target_center_x = rx2 - dist_in_line
+                    if span_w >= (rx2 - rx1):
+                        target_x1 = rx1
+                    else:
+                        target_x1 = max(rx1, min(rx2 - span_w, target_center_x - 0.5 * span_w))
+                    target_center_y = 0.5 * (ry1 + ry2)
+
+                    dx = target_x1 - span_x1
+                    dy = target_center_y - span_center_y
+                    if abs(dx) > 0.1 or abs(dy) > 0.1:
+                        for curve in span:
+                            self._translate_rendered_curve(curve, dx=dx, dy=dy)
+
+        if duplicate_curve_ids:
+            page.pdf_curve = [
+                c for c in page.pdf_curve if id(c) not in duplicate_curve_ids
+            ]
+
+    @staticmethod
+    def _is_arabic_output_character(value: str | None) -> bool:
+        if not value or len(value) != 1:
+            return False
+        codepoint = ord(value)
+        return (
+            0x0600 <= codepoint <= 0x06FF
+            or 0x0750 <= codepoint <= 0x077F
+            or 0x08A0 <= codepoint <= 0x08FF
+            or 0xFB50 <= codepoint <= 0xFDFF
+            or 0xFE70 <= codepoint <= 0xFEFF
+        )
+
+    def _audit_arabic_font_ownership(self, page: il_version_1.Page) -> None:
+        """Repair and verify Arabic glyph ownership immediately before export.
+
+        Some formula and layout branches preserve source ``PdfCharacter``
+        objects. This final IL audit is intentionally independent of those
+        branches: an Arabic glyph can only leave the typesetter in an embedded
+        Arabic target font, never in the Source Han font inherited from English.
+        """
+        if not self.is_arabic:
+            return
+
+        characters = list(page.pdf_character or [])
+        for paragraph in page.pdf_paragraph or []:
+            for composition in paragraph.pdf_paragraph_composition or []:
+                if composition.pdf_character:
+                    characters.append(composition.pdf_character)
+                elif composition.pdf_formula:
+                    characters.extend(composition.pdf_formula.pdf_character or [])
+
+        source_fonts = {
+            font.font_id: font
+            for font in page.pdf_font or []
+            if font.font_id
+        }
+        repaired = 0
+        for char in characters:
+            if not self._is_arabic_output_character(char.char_unicode):
+                continue
+            if not char.pdf_style:
+                raise RuntimeError(
+                    f"Arabic glyph {char.char_unicode!r} has no PDF style on page {page.page_number}"
+                )
+            current_font_id = char.pdf_style.font_id or ""
+            if "gonotokurrent" in current_font_id.lower():
+                continue
+            source_font = source_fonts.get(current_font_id)
+            target_font = (
+                self.font_mapper.map(source_font, char.char_unicode)
+                if source_font is not None
+                else None
+            )
+            if target_font is None:
+                target_font = next(
+                    (
+                        font for font in self.font_mapper.arabic_fonts
+                        if font.has_glyph(ord(char.char_unicode))
+                    ),
+                    None,
+                )
+            if target_font is None:
+                normalized = unicodedata.normalize("NFKC", char.char_unicode)
+                target_font = next(
+                    (
+                        font for font in self.font_mapper.arabic_fonts
+                        if len(normalized) == 1 and font.has_glyph(ord(normalized))
+                    ),
+                    None,
+                )
+                if target_font is not None:
+                    self._record_glyph_substitution(char.char_unicode, normalized, "nfkc")
+                    char.char_unicode = normalized
+            if target_font is None:
+                raise RuntimeError(
+                    f"No Arabic target-font coverage for {char.char_unicode!r} on page {page.page_number}"
+                )
+            style = copy.copy(char.pdf_style)
+            style.font_id = target_font.font_id
+            char.pdf_style = style
+            char.pdf_character_id = target_font.has_glyph(ord(char.char_unicode))
+            repaired += 1
+
+        if repaired:
+            logger.warning(
+                "Repaired %d Arabic glyph(s) that retained a source-font style on page %d",
+                repaired,
+                page.page_number,
+            )
+
+
+    def _find_header_underlines(self, page: il_version_1.Page):
+        """Match short, right-aligned filled rules to a header before text moves."""
+        if not self._is_arabic_output() or not page.cropbox or not page.cropbox.box:
+            return []
+        crop = page.cropbox.box
+        mid_x = (crop.x + crop.x2) / 2
+        top = crop.y2 - (crop.y2 - crop.y) * 0.15
+        thin_rules = [
+            curve for curve in page.pdf_curve
+            if curve.box and curve.box.y >= top and curve.box.x >= mid_x
+            and 0 < curve.box.y2 - curve.box.y <= 1.5
+            and curve.fill_background and not curve.stroke_path
+            # The parser marks original PDF paths with 'a'.
+            and curve.debug_info == "a"
+            and not curve.relocation_transform
+            and [part.op for part in curve.pdf_path] == ["m", "l", "l", "l", "h"]
+        ]
+        matches = []
+        for paragraph in page.pdf_paragraph:
+            box = paragraph.box
+            size = paragraph.pdf_style.font_size if paragraph.pdf_style else None
+            label = (paragraph.layout_label or "").lower()
+            if (
+                not box or not size or box.x < mid_x or box.y2 <= top
+                or label not in {"abandon", "plain text", "heading", "header", "page_header"}
+                or self._is_inside_table_or_figure_region(box, page)
+            ):
+                continue
+            rules = sorted((
+                curve for curve in thin_rules
+                if curve.xobj_id == paragraph.xobj_id and curve.box.x2 - curve.box.x >= size * 2.5
+                and curve.box.x >= box.x - 2 and abs(curve.box.x2 - box.x2) <= 2
+                and box.y2 - size * 4 <= curve.box.y <= box.y2 - size * 0.5
+            ), key=lambda curve: -curve.box.y)
+            if 2 <= len(rules) <= 4 and all(
+                first.box.y - second.box.y >= size * 0.75
+                for first, second in zip(rules, rules[1:])
+            ):
+                matches.append((paragraph, rules))
+
+        # Do not move a rule that could belong to more than one text block.
+        rule_counts = {}
+        for _, rules in matches:
+            for rule in rules:
+                rule_counts[id(rule)] = rule_counts.get(id(rule), 0) + 1
+        return [
+            (paragraph, rules) for paragraph, rules in matches
+            if all(rule_counts[id(rule)] == 1 for rule in rules)
+        ]
+
+    @staticmethod
+    def _align_header_underlines(paragraph, rules, crop):
+        """Move original paths under the final lines when the mapping is unambiguous."""
+        right_by_baseline: dict[float, float] = {}
+        for composition in paragraph.pdf_paragraph_composition:
+            char = composition.pdf_character
+            if char and char.box and (char.char_unicode or "").strip():
+                x2, baseline = char.box.x2, round(char.box.y, 2)
+                right_by_baseline[baseline] = max(right_by_baseline.get(baseline, x2), x2)
+        if len(right_by_baseline) != len(rules):
+            return
+
+        placements = []
+        for rule, (baseline, right) in zip(rules, sorted(right_by_baseline.items(), reverse=True)):
+            box = rule.box
+            dx, dy = right - box.x2, baseline - 1.5 - box.y2
+            moved = Box(box.x + dx, box.y + dy, box.x2 + dx, box.y2 + dy)
+            if not (crop.x <= moved.x < moved.x2 <= crop.x2 and crop.y <= moved.y < moved.y2 <= crop.y2):
+                return
+            placements.append((rule, moved, dx, dy))
+
+        for rule, moved, dx, dy in placements:
+            rule.box = moved
+            # The writer uses pdf_original_path, so moving only the box is insufficient.
+            rule.relocation_transform = [1, 0, 0, 1, dx, dy]
+
+    def _mirror_header_decorations(self, page: il_version_1.Page):
+        """Mirror decorative header vector rectangles horizontally when rendering RTL."""
+        if not self._is_arabic_output():
+            return
+        if not (page.cropbox and page.cropbox.box and hasattr(page, 'pdf_rectangle') and page.pdf_rectangle):
+            return
+
+        page_box = page.cropbox.box
+        page_w = page_box.x2 - page_box.x
+        page_h = page_box.y2 - page_box.y
+        top_threshold = page_box.y + page_h * 0.70  # Top 30% of page
+
+        for rect in page.pdf_rectangle:
+            if not rect.box or getattr(rect, "debug_info", False):
+                continue
+            r_box = rect.box
+            r_h = r_box.y2 - r_box.y
+            r_w = r_box.x2 - r_box.x
+            # Check if this is a header decorative badge/strip:
+            # - In the top 30% of page
+            # - Relatively small height (banner badge/accent, e.g. 4pt - 35pt)
+            # - Does not span the whole page width (< 45% of page width)
+            if r_box.y >= top_threshold and 4.0 <= r_h <= 35.0 and r_w < page_w * 0.45:
+                # Mirror horizontally: x_new = page_box.x2 - (r_box.x2 - page_box.x)
+                new_x = page_box.x2 - (r_box.x2 - page_box.x)
+                new_x2 = page_box.x2 - (r_box.x - page_box.x)
+                r_box.x = new_x
+                r_box.x2 = new_x2
 
     def add_watermark(self, page: il_version_1.Page):
         page_width = page.cropbox.box.x2 - page.cropbox.box.x
@@ -1203,9 +4955,9 @@ class Typesetting:
             font_size=6,
             graphic_state=il_version_1.GraphicState(),
         )
-        text = f"本文档由 funstory.ai 的开源 PDF 翻译库 BabelDOC {WATERMARK_VERSION} (http://yadt.io) 翻译，本仓库正在积极的建设当中，欢迎 star 和关注。"
+        text = f""
         if self.translation_config.debug:
-            text += "\n 当前为 DEBUG 模式，将显示更多辅助信息。请注意，部分框的位置对应原文，但在译文中可能不正确。"
+            text += ""
         page.pdf_paragraph.append(
             il_version_1.PdfParagraph(
                 first_line_indent=False,
@@ -1229,6 +4981,1631 @@ class Typesetting:
             ),
         )
 
+    def _is_arabic_output(self) -> bool:
+        """Check if the output language is Arabic for RTL margin mirroring."""
+        lang_out = (self.translation_config.lang_out or "").lower()
+        if lang_out in ("en-ar", "ar", "ara", "arabic"):
+            return True
+        if "-ar" in lang_out or "->ar" in lang_out or "/ar" in lang_out:
+            return True
+        return False
+
+    def _get_effective_arabic_box(
+        self, 
+        paragraph: il_version_1.PdfParagraph, 
+        page: il_version_1.Page,
+        original_box: Box
+    ) -> Box:
+        """Get the effective bounding box for Arabic text layout.
+        
+        This calculates where the text will actually end up after RTL margin mirroring,
+        and ensures the box stays within page bounds. This prevents text from overflowing
+        the page margins.
+        
+        Args:
+            paragraph: The paragraph being laid out
+            page: The page containing the paragraph
+            original_box: The original bounding box from the English source
+            
+        Returns:
+            A new Box that represents the effective layout area after considering
+            RTL margin mirroring and page bounds
+        """
+        if not page.cropbox or not page.cropbox.box:
+            return original_box
+
+        enclosing = self._find_enclosing_region_box(paragraph, page)
+        if enclosing is not None:
+            pad = 1.0 if (enclosing.x2 - enclosing.x) < 35.0 else 2.0
+            cx0 = enclosing.x + pad
+            cx1 = enclosing.x2 - pad
+            if cx1 > cx0 + 2.0:
+                original_box = Box(
+                    x=max(original_box.x, cx0),
+                    y=original_box.y,
+                    x2=min(original_box.x2, cx1),
+                    y2=original_box.y2,
+                )
+
+        page_box = page.cropbox.box
+        
+        # Get the margin shift that will be applied later
+        shift_x = self._calculate_rtl_margin_shift(paragraph, page)
+        
+        # Calculate where the box will be after margin shifting
+        final_x = original_box.x + shift_x
+        final_x2 = original_box.x2 + shift_x
+        
+        # Get safe page margins (2% from each edge)
+        page_left_margin = page_box.x + (page_box.x2 - page_box.x) * 0.02
+        page_right_margin = page_box.x2 - (page_box.x2 - page_box.x) * 0.02
+        
+        # Check if the shifted box would overflow the right margin
+        if final_x2 > page_right_margin:
+            # Calculate how much we need to shrink the box
+            overflow = final_x2 - page_right_margin
+            # Reduce the box width from the right side
+            new_x2 = original_box.x2 - overflow
+            # Ensure we don't make the box too small
+            min_width = (page_box.x2 - page_box.x) * 0.1  # At least 10% of page width
+            if new_x2 - original_box.x < min_width:
+                new_x2 = original_box.x + min_width
+            
+            return Box(
+                x=original_box.x,
+                y=original_box.y,
+                x2=new_x2,
+                y2=original_box.y2
+            )
+        
+        # Check if the shifted box would overflow the left margin
+        if final_x < page_left_margin:
+            # This shouldn't normally happen with RTL, but handle it
+            overflow = page_left_margin - final_x
+            new_x = original_box.x + overflow
+            
+            return Box(
+                x=new_x,
+                y=original_box.y,
+                x2=original_box.x2,
+                y2=original_box.y2
+            )
+        
+        return original_box
+
+    def _calculate_rtl_margin_shift(self, paragraph: il_version_1.PdfParagraph, page: il_version_1.Page) -> float:
+        """Calculate the X shift needed for RTL margin mirroring.
+        
+        For RTL languages, the left margin should become the right margin and vice versa.
+        This function calculates the shift needed to achieve this.
+        
+        IMPORTANT: When there are sidebars or page decorations, we mirror within the
+        CONTENT AREA (excluding decorations), not the full page width.
+        
+        The shift is clamped to ensure the paragraph stays within page bounds.
+        
+        Args:
+            paragraph: The paragraph to mirror
+            page: The page containing the paragraph
+            
+        Returns:
+            The X shift to apply for margin mirroring
+        """
+        if not paragraph.box or not page.cropbox or not page.cropbox.box:
+            return 0.0
+        
+        box = paragraph.box
+        page_box = page.cropbox.box
+        
+        if self._is_centered_display_text(paragraph, page):
+            return 0.0
+
+        # Framed contact rows and boxed/code/figure containers stay anchored in their region.
+        if self._is_arabic_output() and (
+            self._contact_frame_bounds(paragraph, page)
+            or self._should_skip_margin_mirroring(paragraph, page)
+        ):
+            return 0.0
+
+        # Symmetrical page-level mirroring for running headers, footers, and page numbers
+        if self._is_header_or_footer(paragraph, page):
+            orig_right_margin = page_box.x2 - box.x2
+            new_x = page_box.x + orig_right_margin
+            return self._keep_clear_of_later_images(paragraph, page, new_x - box.x)
+
+        if (paragraph.pipeline_trace or {}).get("column_lane"):
+            return 0.0
+
+        # Detect content area boundaries (accounting for sidebars/decorations)
+        content_left, content_right = self._get_content_area_bounds(page)
+        
+        # Original margins relative to content area
+        original_left_margin = box.x - content_left
+        original_right_margin = content_right - box.x2
+        
+        # For RTL: new_left_margin = original_right_margin
+        # new_box.x = content_left + original_right_margin
+        # shift_x = new_box.x - box.x
+        
+        new_x = content_left + original_right_margin
+        shift_x = new_x - box.x
+        
+        # CLAMP: Ensure the paragraph's right edge doesn't exceed content_right after shifting
+        # new_x2 = box.x2 + shift_x should be <= content_right
+        new_x2 = box.x2 + shift_x
+        if new_x2 > content_right:
+            # Reduce the shift to keep the right edge at content_right
+            overflow = new_x2 - content_right
+            shift_x -= overflow
+        
+        # CLAMP: Ensure the paragraph's left edge doesn't go below content_left
+        # new_x = box.x + shift_x should be >= content_left
+        new_x_clamped = box.x + shift_x
+        if new_x_clamped < content_left:
+            # Increase the shift to keep the left edge at content_left
+            underflow = content_left - new_x_clamped
+            shift_x += underflow
+        
+        return self._keep_clear_of_later_images(paragraph, page, shift_x)
+
+    def _keep_clear_of_later_images(self, paragraph, page, shift_x: float) -> float:
+        """Keep a source lane when mirroring would hide visible text behind an image."""
+        if not shift_x or paragraph.render_order is None or not self._is_arabic_output():
+            return shift_x
+        box = self._rendered_text_box(paragraph) or paragraph.box
+        for form in page.pdf_form:
+            image = form.box
+            if (
+                form.form_type != "image" or not image
+                or form.xobj_id != paragraph.xobj_id or form.render_order is None
+                or form.render_order <= paragraph.render_order
+                or box.y >= image.y2 or box.y2 <= image.y
+            ):
+                continue
+            source_overlaps = box.x < image.x2 and box.x2 > image.x
+            shifted_overlaps = box.x + shift_x < image.x2 and box.x2 + shift_x > image.x
+            if shifted_overlaps and not source_overlaps:
+                return 0.0
+        return shift_x
+
+    def _get_content_area_bounds(self, page: il_version_1.Page) -> tuple[float, float]:
+        """Get the left and right boundaries of the content area, excluding sidebars.
+        
+        Detects large rectangles or figures near page edges that are likely sidebars
+        or decorative elements, and returns the content area bounds.
+        
+        Args:
+            page: The page to analyze
+            
+        Returns:
+            Tuple of (content_left, content_right) x-coordinates
+        """
+        if not page.cropbox or not page.cropbox.box:
+            return (0.0, 612.0)  # Default US Letter width
+        
+        page_box = page.cropbox.box
+        page_left = page_box.x
+        page_right = page_box.x2
+        page_width = page_right - page_left
+        page_height = page_box.y2 - page_box.y
+        
+        # Start with full page as content area
+        content_left = page_left
+        content_right = page_right
+        
+        # Check for sidebar rectangles
+        if hasattr(page, 'pdf_rectangle') and page.pdf_rectangle:
+            for rect in page.pdf_rectangle:
+                if not rect.box:
+                    continue
+                
+                rect_box = rect.box
+                rect_height = rect_box.y2 - rect_box.y
+                rect_width = rect_box.x2 - rect_box.x
+                
+                # Is it a tall rectangle (sidebar-like)? Must be at least 30% of page height
+                is_tall = rect_height > page_height * 0.3
+                
+                # Is it narrow enough to be a sidebar? (less than 25% of page width)
+                is_narrow = rect_width < page_width * 0.25
+                
+                if is_tall and is_narrow:
+                    # Check if it's on the left side
+                    if rect_box.x < page_left + page_width * 0.2:
+                        # Left sidebar - content starts after it
+                        content_left = max(content_left, rect_box.x2)
+                    
+                    # Check if it's on the right side
+                    if rect_box.x2 > page_right - page_width * 0.2:
+                        # Right sidebar - content ends before it
+                        content_right = min(content_right, rect_box.x)
+        
+        # Also check for figures that might be sidebars/decorations
+        if hasattr(page, 'pdf_figure') and page.pdf_figure:
+            for figure in page.pdf_figure:
+                if not figure.box:
+                    continue
+                
+                fig_box = figure.box
+                fig_height = fig_box.y2 - fig_box.y
+                fig_width = fig_box.x2 - fig_box.x
+                
+                # Is it a tall figure (sidebar-like)?
+                is_tall = fig_height > page_height * 0.3
+                
+                # Is it narrow?
+                is_narrow = fig_width < page_width * 0.25
+                
+                if is_tall and is_narrow:
+                    # Check if it's on the left side
+                    if fig_box.x < page_left + page_width * 0.2:
+                        content_left = max(content_left, fig_box.x2)
+                    
+                    # Check if it's on the right side
+                    if fig_box.x2 > page_right - page_width * 0.2:
+                        content_right = min(content_right, fig_box.x)
+        
+        # Also check page layouts for sidebar-type elements
+        if hasattr(page, 'page_layout') and page.page_layout:
+            for layout in page.page_layout:
+                if not layout.box:
+                    continue
+                
+                layout_box = layout.box
+                layout_height = layout_box.y2 - layout_box.y
+                layout_width = layout_box.x2 - layout_box.x
+                
+                # Check if it's a header/footer or sidebar type layout
+                layout_name = (layout.class_name or "").lower()
+                
+                # Skip actual content layouts
+                if layout_name in ['text', 'paragraph', 'title', 'plain text', 'content']:
+                    continue
+                
+                # Is it tall and narrow (sidebar-like)?
+                is_tall = layout_height > page_height * 0.3
+                is_narrow = layout_width < page_width * 0.25
+                
+                if is_tall and is_narrow:
+                    if layout_box.x < page_left + page_width * 0.2:
+                        content_left = max(content_left, layout_box.x2)
+                    if layout_box.x2 > page_right - page_width * 0.2:
+                        content_right = min(content_right, layout_box.x)
+        
+        # Ensure we have valid bounds
+        if content_left >= content_right:
+            # Reset to page bounds if something went wrong
+            content_left = page_left
+            content_right = page_right
+        
+        return (content_left, content_right)
+
+    def _apply_rtl_margin_shift_to_composition(
+        self, 
+        composition: list[PdfParagraphComposition], 
+        shift_x: float,
+        page: il_version_1.Page = None
+    ) -> None:
+        """Apply RTL margin shift to all characters in a composition list.
+        
+        Args:
+            composition: List of paragraph compositions to shift
+            shift_x: The X shift to apply
+            page: Optional page for clamping to page bounds
+        """
+        if shift_x == 0 or not composition:
+            return
+        
+        # Get page bounds for clamping if page is provided
+        clamp_right = None
+        clamp_left = None
+        if page and page.cropbox and page.cropbox.box:
+            page_box = page.cropbox.box
+            page_margin = (page_box.x2 - page_box.x) * 0.02
+            clamp_left = page_box.x + page_margin
+            clamp_right = page_box.x2 - page_margin
+
+        # RIGID BODY CLAMPING: Clamp shift_x as a whole so that all characters
+        # retain their exact relative spacing without stacking or colliding at the margin.
+        effective_shift = shift_x
+        if clamp_right is not None or clamp_left is not None:
+            char_x2_list = []
+            char_x_list = []
+            for comp in composition:
+                if comp.pdf_character and comp.pdf_character.box:
+                    char_x_list.append(comp.pdf_character.box.x)
+                    char_x2_list.append(comp.pdf_character.box.x2)
+                elif comp.pdf_formula and comp.pdf_formula.box:
+                    char_x_list.append(comp.pdf_formula.box.x)
+                    char_x2_list.append(comp.pdf_formula.box.x2)
+
+            if char_x2_list:
+                max_x2 = max(char_x2_list)
+                min_x = min(char_x_list)
+                if clamp_right is not None and (max_x2 + effective_shift) > clamp_right:
+                    effective_shift = clamp_right - max_x2
+                if clamp_left is not None and (min_x + effective_shift) < clamp_left:
+                    effective_shift = clamp_left - min_x
+
+        if effective_shift == 0:
+            return
+
+        for comp in composition:
+            if comp.pdf_character:
+                char = comp.pdf_character
+                if char.box:
+                    char.box.x += effective_shift
+                    char.box.x2 += effective_shift
+                if char.visual_bbox and char.visual_bbox.box:
+                    char.visual_bbox.box.x += effective_shift
+                    char.visual_bbox.box.x2 += effective_shift
+            elif comp.pdf_formula:
+                formula = comp.pdf_formula
+                if formula.box:
+                    formula.box.x += effective_shift
+                    formula.box.x2 += effective_shift
+                for char in formula.pdf_character:
+                    if char.box:
+                        char.box.x += effective_shift
+                        char.box.x2 += effective_shift
+                    if char.visual_bbox and char.visual_bbox.box:
+                        char.visual_bbox.box.x += effective_shift
+                        char.visual_bbox.box.x2 += effective_shift
+                for curve in formula.pdf_curve:
+                    self._translate_rendered_curve(curve, dx=effective_shift)
+                for form in formula.pdf_form:
+                    if form.box:
+                        form.box.x += effective_shift
+                        form.box.x2 += effective_shift
+
+    def _is_header_or_footer(self, paragraph: il_version_1.PdfParagraph, page: il_version_1.Page) -> bool:
+        """Detect if paragraph is a running header, footer, or page number."""
+        if self._is_table_cell(paragraph, page):
+            return False
+        trace = getattr(paragraph, "pipeline_trace", None) or {}
+        if paragraph.layout_label:
+            lbl = paragraph.layout_label.lower()
+            if "table_" in lbl or "footnote" in lbl:
+                return False
+            if any(h in lbl for h in ['header', 'footer', 'page_number', 'page_header', 'page_footer']):
+                return True
+            if any(h in lbl for h in ['heading', 'title', 'caption', 'formula', 'code', 'algorithm', 'list']):
+                return False
+        if trace.get("page_overflow") or trace.get("collision_shifted"):
+            return False
+        if trace.get("region_type") in {"card", "form_pair", "figure", "table"}:
+            return False
+        if paragraph.box and page.cropbox and page.cropbox.box:
+            p_box = page.cropbox.box
+            p_height = p_box.y2 - p_box.y
+            # Overflowing content extending outside the cropbox is never a pinned banner.
+            if paragraph.box.y < p_box.y - 1.0 or paragraph.box.y2 > p_box.y2 + 1.0:
+                return False
+            if max(0.0, paragraph.box.y2 - paragraph.box.y) > 28.0:
+                return False
+            if len((paragraph.unicode or "").strip()) > 140:
+                return False
+            # Top 6% or bottom 6% of page
+            if paragraph.box.y > p_box.y2 - p_height * 0.06 or paragraph.box.y2 < p_box.y + p_height * 0.06:
+                return True
+        return False
+
+    def _should_skip_margin_mirroring(self, paragraph: il_version_1.PdfParagraph, page: il_version_1.Page) -> bool:
+        """Check if a paragraph should NOT have margin mirroring applied."""
+        if self._is_header_or_footer(paragraph, page):
+            return False  # Always mirror running headers, footers, and page numbers!
+        trace = getattr(paragraph, "pipeline_trace", None) or {}
+        if paragraph.layout_label in {"form_row", "figure_caption"}:
+            return True
+        if trace.get("preserved_code") or trace.get("in_figure_region") or trace.get("anchored_to_illustration"):
+            return True
+        if trace.get("region_type") in {"card", "form_pair", "figure", "table"}:
+            return True
+        if paragraph_semantic_zone(paragraph, page) in {"code", "figure"}:
+            return True
+        if is_standalone_code_text(paragraph.unicode, paragraph.layout_label or ""):
+            return True
+        if self._find_enclosing_region_box(paragraph, page) is not None:
+            return True
+        return self._is_paragraph_inside_table(paragraph, page)
+
+    def _is_paragraph_inside_table(self, paragraph: il_version_1.PdfParagraph, page: il_version_1.Page) -> bool:
+        """Check if a paragraph should NOT have margin mirroring applied.
+        
+        This includes:
+        1. Table cell content (should stay in place within table structure)
+        2. Figure content (captions, axis labels, legends, text inside figures)
+        3. Table footnotes
+        4. Content that would overlap with page borders/sidebars after mirroring
+        
+        Uses multiple detection methods:
+        1. Check layout_label for table/figure cell markers
+        2. Check if paragraph is geometrically contained within a table/figure layout region
+        3. Check if mirroring would cause overlap with page decorations
+        
+        Args:
+            paragraph: The paragraph to check
+            page: The page containing the paragraph
+            
+        Returns:
+            True if paragraph should NOT be margin-mirrored
+        """
+        # Method 1: Check layout_label for content that should not be mirrored
+        if paragraph.layout_label:
+            layout_label_lower = paragraph.layout_label.lower()
+            
+            # Table cell and structural content markers
+            table_cell_markers = [
+                'table_cell', 'table_cell_hybrid', 'table_text', 
+                'wired_table_cell', 'wireless_table_cell',
+                'table_footnote', 'table_caption', 'fallback_line'
+            ]
+            
+            # Figure content markers
+            figure_content_markers = [
+                'figure_text', 'figure_text_hybrid',
+                'figure_caption', 'figure_title',
+                'chart_title', 'chart_legend',
+                'axis_label', 'axis_text'
+            ]
+            
+            all_markers = table_cell_markers + figure_content_markers
+            
+            if any(marker in layout_label_lower for marker in all_markers):
+                return True
+        
+        # Method 2: Check if paragraph is geometrically inside a table or figure layout region
+        if paragraph.box:
+            if self._is_inside_table_or_figure_region(paragraph.box, page):
+                return True
+        
+        # Method 3: Check if mirroring would cause overlap with page decorations (sidebars, borders)
+        if paragraph.box and page.cropbox and page.cropbox.box:
+            if self._would_overlap_page_decoration(paragraph, page):
+                return True
+        
+        return False
+
+    def _is_inside_table_or_figure_region(
+        self, para_box: Box, page: il_version_1.Page, *, figures_only: bool = False,
+    ) -> bool:
+        """Check if a paragraph box is geometrically inside a table or figure region.
+        
+        Args:
+            para_box: The paragraph's bounding box
+            page: The page containing the paragraph
+            
+        Returns:
+            True if paragraph is inside a table or figure
+        """
+        # Get layouts from page
+        if not hasattr(page, 'page_layout') or not page.page_layout:
+            return False
+        
+        container_labels = {"figure", "chart", "graph", "diagram", "image"}
+        if not figures_only:
+            container_labels.update(("table", "wired_table", "wireless_table"))
+
+        for layout in page.page_layout:
+            if not layout.box:
+                continue
+                
+            # Check if this is a table or figure layout
+            layout_name = (layout.class_name or "").lower()
+            
+            if layout_name not in container_labels:
+                continue
+            
+            # Check if paragraph is contained within this layout
+            layout_box = layout.box
+            
+            # Calculate overlap
+            overlap_x1 = max(para_box.x, layout_box.x)
+            overlap_y1 = max(para_box.y, layout_box.y)
+            overlap_x2 = min(para_box.x2, layout_box.x2)
+            overlap_y2 = min(para_box.y2, layout_box.y2)
+            
+            if overlap_x1 < overlap_x2 and overlap_y1 < overlap_y2:
+                # There is overlap - calculate how much of paragraph is inside
+                overlap_area = (overlap_x2 - overlap_x1) * (overlap_y2 - overlap_y1)
+                para_area = (para_box.x2 - para_box.x) * (para_box.y2 - para_box.y)
+                
+                if para_area > 0:
+                    containment_ratio = overlap_area / para_area
+                    # If more than 50% of paragraph is inside, consider it contained
+                    if containment_ratio > 0.5:
+                        return True
+        
+        return False
+
+    def _is_table_cell(self, paragraph: il_version_1.PdfParagraph, page: il_version_1.Page) -> bool:
+        """Check if paragraph is a table cell within a grid table."""
+        label = (paragraph.layout_label or "").lower()
+        is_table_text = any(marker in label for marker in ("table_cell", "table_text"))
+        is_caption = any(marker in label for marker in ("table_caption", "table_title", "table_footnote"))
+        if is_caption:
+            return False
+        if not is_caption and (is_table_text or (paragraph.pipeline_trace or {}).get("cell_id")):
+            return True
+        # Check if inside a table layout region
+        if paragraph.box and hasattr(page, 'page_layout') and page.page_layout:
+            for layout in page.page_layout:
+                if layout.box and (layout.class_name or "").lower() in ['table', 'wired_table', 'wireless_table']:
+                    overlap_x1 = max(paragraph.box.x, layout.box.x)
+                    overlap_x2 = min(paragraph.box.x2, layout.box.x2)
+                    overlap_y1 = max(paragraph.box.y, layout.box.y)
+                    overlap_y2 = min(paragraph.box.y2, layout.box.y2)
+                    if overlap_x1 < overlap_x2 and overlap_y1 < overlap_y2:
+                        para_area = (paragraph.box.x2 - paragraph.box.x) * (paragraph.box.y2 - paragraph.box.y)
+                        overlap_area = (overlap_x2 - overlap_x1) * (overlap_y2 - overlap_y1)
+                        if para_area > 0 and (overlap_area / para_area) > 0.5:
+                            return True
+        # Fallback text inside a figure belongs to that drawing's coordinates.
+        return (
+            "fallback_line" in label and not is_caption and paragraph.box is not None
+            and not self._is_inside_table_or_figure_region(paragraph.box, page, figures_only=True)
+        )
+
+    def _cluster_table_cells_into_rows(self, page: il_version_1.Page) -> list[list[il_version_1.PdfParagraph]]:
+        """Cluster table cell paragraphs on a page into rows based on vertical overlap."""
+        table_cells = [
+            p for p in page.pdf_paragraph
+            if p.box and p.box.x is not None and p.box.y is not None
+            and p.box.x2 is not None and p.box.y2 is not None
+            and self._is_table_cell(p, page)
+        ]
+        if not table_cells:
+            return []
+
+        # Sort cells descending by top Y (y2), then by x
+        sorted_cells = sorted(table_cells, key=lambda c: (-c.box.y2, c.box.x))
+
+        rows: list[list[il_version_1.PdfParagraph]] = []
+        for cell in sorted_cells:
+            cell_y = cell.box.y
+            cell_y2 = cell.box.y2
+            cell_h = max(cell_y2 - cell_y, 1.0)
+
+            matched_row = None
+            for row in rows:
+                ref_cell = row[0]
+                ref_y = ref_cell.box.y
+                ref_y2 = ref_cell.box.y2
+                ref_h = max(ref_y2 - ref_y, 1.0)
+
+                v_overlap = min(cell_y2, ref_y2) - max(cell_y, ref_y)
+                # Overlap must be at least 40% of the smaller cell's height
+                if v_overlap > 0.40 * min(cell_h, ref_h):
+                    # Check horizontal overlap with existing cells in the row
+                    # (cells in the same row should be in separate columns)
+                    h_collision = any(
+                        not (cell.box.x2 <= other.box.x + 1.0 or cell.box.x >= other.box.x2 - 1.0)
+                        for other in row
+                    )
+                    if not h_collision:
+                        matched_row = row
+                        break
+
+            if matched_row is not None:
+                matched_row.append(cell)
+            else:
+                rows.append([cell])
+
+        # Sort each row horizontally left-to-right (increasing x)
+        for row in rows:
+            row.sort(key=lambda c: c.box.x)
+
+        return rows
+
+    @staticmethod
+    def _boxes_overlap_horizontally(left: Box, right: Box) -> bool:
+        return left.x < right.x2 and left.x2 > right.x
+
+    def _table_cell_groups(
+        self, page: il_version_1.Page
+    ) -> list[tuple[list[il_version_1.PdfParagraph], Box]]:
+        """Return table-cell groups with stable table bounds.
+
+        Prefer the layout parser's table region when it is available. The
+        fallback groups visually adjacent rows, which keeps independent tables
+        on the same page from being mirrored as one large table.
+        """
+        cells = [
+            p for p in page.pdf_paragraph
+            if p.box and self._is_table_cell(p, page)
+        ]
+        if not cells:
+            return []
+
+        groups: list[tuple[list[il_version_1.PdfParagraph], Box]] = []
+        assigned: set[int] = set()
+        for layout in getattr(page, "page_layout", []) or []:
+            layout_box = getattr(layout, "box", None)
+            if not layout_box or (getattr(layout, "class_name", "") or "").lower() not in {
+                "table", "wired_table", "wireless_table"
+            }:
+                continue
+            members = []
+            for cell in cells:
+                overlap_x = max(0.0, min(cell.box.x2, layout_box.x2) - max(cell.box.x, layout_box.x))
+                overlap_y = max(0.0, min(cell.box.y2, layout_box.y2) - max(cell.box.y, layout_box.y))
+                cell_area = max((cell.box.x2 - cell.box.x) * (cell.box.y2 - cell.box.y), 1.0)
+                if (overlap_x * overlap_y) / cell_area > 0.5:
+                    members.append(cell)
+                    assigned.add(id(cell))
+            if members:
+                groups.append((members, copy.deepcopy(layout_box)))
+
+        remaining_rows = []
+        for row in self._cluster_table_cells_into_rows(page):
+            row = [cell for cell in row if id(cell) not in assigned]
+            if row:
+                remaining_rows.append(row)
+
+        # Link rows only while their vertical gap is small and their horizontal
+        # ranges overlap. This accommodates colspan headers without joining a
+        # later, unrelated table.
+        for row in remaining_rows:
+            row_box = Box(
+                min(cell.box.x for cell in row),
+                min(cell.box.y for cell in row),
+                max(cell.box.x2 for cell in row),
+                max(cell.box.y2 for cell in row),
+            )
+            if groups:
+                members, group_box = groups[-1]
+                vertical_gap = max(0.0, group_box.y - row_box.y2)
+                row_height = max(row_box.y2 - row_box.y, 1.0)
+                group_height = max(group_box.y2 - group_box.y, 1.0)
+                if (
+                    vertical_gap <= max(18.0, min(row_height, group_height) * 1.5)
+                    and self._boxes_overlap_horizontally(group_box, row_box)
+                ):
+                    members.extend(row)
+                    groups[-1] = (
+                        members,
+                        Box(
+                            min(group_box.x, row_box.x),
+                            min(group_box.y, row_box.y),
+                            max(group_box.x2, row_box.x2),
+                            max(group_box.y2, row_box.y2),
+                        ),
+                    )
+                    continue
+            groups.append((list(row), row_box))
+
+        return groups
+
+    @staticmethod
+    def _mirror_box_within_table(box: Box, table_box: Box) -> None:
+        old_x, old_x2 = box.x, box.x2
+        box.x = table_box.x2 - (old_x2 - table_box.x)
+        box.x2 = table_box.x2 - (old_x - table_box.x)
+
+    def _ensure_semantic_table_models(self, page: il_version_1.Page) -> list[SemanticTable]:
+        """Build/verify semantic table metadata (IDs, spans, headers, coherence) once per page."""
+        if not hasattr(self, "_semantic_table_audited_pages"):
+            self._semantic_table_audited_pages = set()
+        if not hasattr(self, "_semantic_tables_by_page"):
+            self._semantic_tables_by_page = {}
+
+        page_key = id(page)
+        if page_key in self._semantic_table_audited_pages:
+            return self._semantic_tables_by_page.get(page_key, [])
+
+        tables = annotate_page_semantic_tables(page)
+        self._semantic_tables_by_page[page_key] = tables
+        self._semantic_table_audited_pages.add(page_key)
+
+        shared = getattr(
+            getattr(self, "translation_config", None),
+            "shared_context_cross_split_part",
+            None,
+        )
+        ledger = getattr(shared, "content_ledger", None) if shared is not None else None
+        if ledger is not None and tables and hasattr(ledger, "record_tables"):
+            ledger.record_tables([t.to_summary_dict() for t in tables])
+
+        for table in tables:
+            if not table.is_coherent:
+                self._record_layout_issue(
+                    page_number=page.page_number,
+                    kind="irregular_table_preserved",
+                    detail=(
+                        f"Table {table.table_id} has irregular geometry "
+                        f"({', '.join(table.validation_issues)}); preserving layout safely"
+                    ),
+                    debug_id=table.table_id,
+                    severity="warning",
+                )
+        return tables
+
+    @staticmethod
+    def _iter_paragraph_glyphs(paragraph: il_version_1.PdfParagraph):
+        for comp in paragraph.pdf_paragraph_composition or []:
+            if comp.pdf_character:
+                yield comp.pdf_character
+            elif comp.pdf_line:
+                yield from comp.pdf_line.pdf_character or []
+            elif comp.pdf_same_style_characters:
+                yield from comp.pdf_same_style_characters.pdf_character or []
+            elif comp.pdf_formula:
+                yield from comp.pdf_formula.pdf_character or []
+
+    def _compact_paragraph_to_box(
+        self,
+        paragraph: il_version_1.PdfParagraph,
+        perm_box: Box,
+        *,
+        min_ratio: float = 0.48,
+        min_font_size: float = 4.5,
+    ) -> bool:
+        """Fit rendered glyphs without making the result effectively unreadable."""
+        rbox = self._rendered_text_box(paragraph)
+        if rbox is None:
+            return True
+        fits_x = rbox.x >= perm_box.x - 1.5 and rbox.x2 <= perm_box.x2 + 1.5
+        fits_y = rbox.y >= perm_box.y - 1.5 and rbox.y2 <= perm_box.y2 + 1.5
+        if fits_x and fits_y:
+            return True
+        avail_w = perm_box.x2 - perm_box.x - 2.0
+        avail_h = perm_box.y2 - perm_box.y - 2.0
+        curr_w = max(1.0, rbox.x2 - rbox.x)
+        curr_h = max(1.0, rbox.y2 - rbox.y)
+        x_ratio = min(1.0, avail_w / curr_w) if not fits_x else 1.0
+        y_ratio = min(1.0, avail_h / curr_h) if not fits_y else 1.0
+        ratio = min(x_ratio, y_ratio)
+        font_sizes = [
+            float(ch.pdf_style.font_size)
+            for ch in self._iter_paragraph_glyphs(paragraph)
+            if ch.pdf_style and ch.pdf_style.font_size and ch.pdf_style.font_size > 0
+        ]
+        readable_ratio = min_ratio
+        if font_sizes and min_font_size > 0:
+            # Do not claim that an impossible region was repaired by reducing
+            # visible text to a microscopic scale. Existing source text below
+            # the floor is preserved at its original size rather than shrunk.
+            readable_ratio = max(
+                readable_ratio,
+                min(1.0, max(min_font_size / size for size in font_sizes)),
+            )
+        if ratio < readable_ratio:
+            return False
+
+        # Vector paths and form transforms need the renderer's native scaling.
+        # A glyph-only fit would separate them from their formulas.
+        if any(
+            comp.pdf_formula and (comp.pdf_formula.pdf_curve or comp.pdf_formula.pdf_form)
+            for comp in paragraph.pdf_paragraph_composition or []
+        ):
+            return False
+
+        rtl_anchor = self._is_arabic_output() and rbox.x < perm_box.x2
+        if rtl_anchor:
+            desired_x2 = min(perm_box.x2 - 1.0, max(perm_box.x + 1.0, rbox.x2))
+            if rbox.x < perm_box.x - 1.5 or rbox.x2 > perm_box.x2 + 1.5:
+                desired_x2 = perm_box.x2 - 1.0
+            anchor_x = desired_x2
+            source_anchor_x = rbox.x2
+        else:
+            desired_x = max(perm_box.x + 1.0, min(rbox.x, perm_box.x2 - 1.0))
+            if rbox.x < perm_box.x - 1.5 or rbox.x2 > perm_box.x2 + 1.5:
+                desired_x = perm_box.x + 1.0
+            anchor_x = desired_x
+            source_anchor_x = rbox.x
+
+        anchor_y2 = min(perm_box.y2 - 1.0, max(perm_box.y + 1.0, rbox.y2))
+        if rbox.y < perm_box.y - 1.5 or rbox.y2 > perm_box.y2 + 1.5:
+            anchor_y2 = perm_box.y2 - 1.0
+        transformed_boxes: set[int] = {id(paragraph.box)}
+
+        def transform(box: Box | None) -> None:
+            if box is None or id(box) in transformed_boxes:
+                return
+            transformed_boxes.add(id(box))
+            box.x = anchor_x + (box.x - source_anchor_x) * ratio
+            box.x2 = anchor_x + (box.x2 - source_anchor_x) * ratio
+            box.y = anchor_y2 + (box.y - rbox.y2) * ratio
+            box.y2 = anchor_y2 + (box.y2 - rbox.y2) * ratio
+
+        for composition in paragraph.pdf_paragraph_composition or []:
+            group = composition.pdf_line or composition.pdf_same_style_characters or composition.pdf_formula
+            if group:
+                transform(group.box)
+        for ch in self._iter_paragraph_glyphs(paragraph):
+            transform(ch.box)
+            if ch.visual_bbox:
+                transform(ch.visual_bbox.box)
+            if ratio < 1.0 and ch.pdf_style and ch.pdf_style.font_size:
+                ch.pdf_style = copy.copy(ch.pdf_style)
+                ch.pdf_style.font_size = round(ch.pdf_style.font_size * ratio, 2)
+            if ch.advance:
+                ch.advance *= ratio
+        fitted = self._rendered_text_box(paragraph)
+        return bool(
+            fitted is None
+            or (
+                fitted.x >= perm_box.x - 1.5
+                and fitted.x2 <= perm_box.x2 + 1.5
+                and fitted.y >= perm_box.y - 1.5
+                and fitted.y2 <= perm_box.y2 + 1.5
+            )
+        )
+
+    def _contain_rendered_region_bounds(self, page: il_version_1.Page) -> None:
+        """Apply known region/column bounds before collision-driven reflow.
+
+        This prevents two independent columns from being mistaken for a
+        vertical collision merely because longer Arabic glyphs crossed the
+        source gutter.
+        """
+        for paragraph in page.pdf_paragraph or []:
+            if paragraph.box is None or self._is_bottom_fixed_paragraph(paragraph, page):
+                continue
+            rendered = self._rendered_text_box(paragraph)
+            if rendered is None:
+                continue
+            trace = paragraph.pipeline_trace or {}
+            label = (paragraph.layout_label or "").lower()
+            permitted: Box | None = None
+            bounds = trace.get("region_bounds")
+            if label == "form_row" or trace.get("anchored_to_illustration") or self._is_table_cell(paragraph, page):
+                permitted = paragraph.box
+            elif isinstance(bounds, (list, tuple)) and len(bounds) == 4:
+                permitted = Box(*(float(value) for value in bounds))
+            elif (enclosing := self._find_enclosing_region_box(paragraph, page)) is not None:
+                permitted = enclosing
+            else:
+                lane = trace.get("column_lane")
+                if isinstance(lane, (list, tuple)) and len(lane) == 2:
+                    permitted = Box(
+                        float(lane[0]),
+                        rendered.y - 2.0,
+                        float(lane[1]),
+                        rendered.y2 + 2.0,
+                    )
+            if permitted is not None:
+                self._compact_paragraph_to_box(
+                    paragraph,
+                    permitted,
+                    min_ratio=0.45 if "table" in label else 0.52,
+                )
+
+    def _contain_bottom_fixed_lanes(self, page: il_version_1.Page) -> None:
+        """Keep page numbers, document codes, and footnotes in source lanes."""
+        fixed = [
+            paragraph
+            for paragraph in page.pdf_paragraph or []
+            if paragraph.box is not None and self._is_bottom_fixed_paragraph(paragraph, page)
+        ]
+        for paragraph in fixed:
+            self._compact_paragraph_to_box(paragraph, paragraph.box, min_ratio=0.52)
+
+        # Fixed footer objects are frequently painted in separate XObjects.
+        # Resolve any residual collision independently of XObject ownership.
+        for fixed_index, first in enumerate(fixed):
+            first_box = self._rendered_text_box(first)
+            if first_box is None:
+                continue
+            for second in fixed[fixed_index + 1:]:
+                second_box = self._rendered_text_box(second)
+                if second_box is None:
+                    continue
+                h_overlap = max(0.0, min(first_box.x2, second_box.x2) - max(first_box.x, second_box.x))
+                v_overlap = max(0.0, min(first_box.y2, second_box.y2) - max(first_box.y, second_box.y))
+                if h_overlap <= 1.0 or v_overlap <= 1.0:
+                    continue
+                upper = first if first.box.y2 >= second.box.y2 else second
+                lower_box = second_box if upper is first else first_box
+                upper_box = first_box if upper is first else second_box
+                dy = max(0.0, lower_box.y2 + 2.0 - upper_box.y)
+                crop_top = page.cropbox.box.y2 if page.cropbox and page.cropbox.box else 842.0
+                if dy > 0 and upper_box.y2 + dy <= crop_top - 2.0:
+                    self._translate_rendered_paragraph(upper, dy=dy)
+
+    @staticmethod
+    def _decorative_shape_boxes(page: il_version_1.Page) -> list[Box]:
+        crop = page.cropbox.box if page.cropbox and page.cropbox.box else Box(0, 0, 595, 842)
+        page_w = max(1.0, crop.x2 - crop.x)
+        page_h = max(1.0, crop.y2 - crop.y)
+        shapes: list[Box] = []
+        for item in (
+            list(getattr(page, "pdf_curve", None) or [])
+            + list(getattr(page, "pdf_rectangle", None) or [])
+            + list(getattr(page, "pdf_form", None) or [])
+        ):
+            box = getattr(item, "box", None)
+            if box is None:
+                continue
+            width = box.x2 - box.x
+            height = box.y2 - box.y
+            if 6.0 <= width <= page_w * 0.22 and 6.0 <= height <= page_h * 0.16:
+                shapes.append(box)
+        return shapes
+
+    def _anchor_text_next_to_illustrations(self, page: il_version_1.Page) -> None:
+        """Keep prose in its source lane when a nearby icon identifies its subject."""
+        if not self._is_arabic_output():
+            return
+        shapes = self._decorative_shape_boxes(page)
+        anchored_boxes: list[Box] = []
+        crop = page.cropbox.box if page.cropbox and page.cropbox.box else Box(0, 0, 595, 842)
+        width = crop.x2 - crop.x
+        for paragraph in page.pdf_paragraph or []:
+            box = paragraph.box
+            if box is None or self._is_table_cell(paragraph, page):
+                continue
+            for shape in shapes:
+                gap = max(box.x - shape.x2, shape.x - box.x2)
+                overlap = min(box.y2, shape.y2) - max(box.y, shape.y)
+                if 0.0 <= gap <= min(32.0, width * 0.06) and overlap >= 3.0:
+                    self._ensure_pipeline_trace(paragraph)["anchored_to_illustration"] = True
+                    anchored_boxes.append(box)
+                    break
+
+        # Icon descriptions can extend well below the icon itself. If the
+        # layout has illustrated columns, keep the aligned continuation text
+        # in those same columns so only parts of an article never change sides.
+        if not anchored_boxes:
+            return
+        midpoint = (crop.x + crop.x2) * 0.5
+        lane_paragraphs = [
+            paragraph for paragraph in page.pdf_paragraph or []
+            if paragraph.box is not None
+            and not self._is_table_cell(paragraph, page)
+            and (paragraph.box.x2 <= midpoint + 4.0 or paragraph.box.x >= midpoint - 4.0)
+        ]
+        has_parallel_lane = any(
+            max(box.x - anchor.x2, anchor.x - box.x2) >= 12.0
+            and min(box.y2, anchor.y2) - max(box.y, anchor.y) >= 3.0
+            and abs(box.x - anchor.x) >= width * 0.22
+            for paragraph in lane_paragraphs
+            for box in (paragraph.box,)
+            for anchor in anchored_boxes
+        )
+        if has_parallel_lane:
+            for paragraph in lane_paragraphs:
+                self._ensure_pipeline_trace(paragraph)["anchored_to_illustration"] = True
+
+    def _avoid_decorative_shape_collisions(
+        self, page: il_version_1.Page, source_boxes: dict[int, Box] | None = None
+    ) -> None:
+        """Keep translated labels from drifting across adjacent vector icons."""
+        crop = page.cropbox.box if page.cropbox and page.cropbox.box else Box(0, 0, 595, 842)
+        shapes = self._decorative_shape_boxes(page)
+
+        for paragraph in page.pdf_paragraph or []:
+            if paragraph.box is None or self._is_table_cell(paragraph, page):
+                continue
+            rendered = self._rendered_text_box(paragraph)
+            if rendered is None:
+                continue
+            source = (source_boxes or {}).get(id(paragraph), paragraph.box)
+            trace = self._ensure_pipeline_trace(paragraph)
+            if trace.get("can_passthrough") or trace.get("preserved_code"):
+                continue
+            if not self._boxes_overlap_horizontally(source, rendered):
+                continue
+            lane = trace.get("column_lane")
+            bounds = trace.get("region_bounds")
+            if trace.get("anchored_to_illustration"):
+                permitted = source
+            elif isinstance(bounds, (list, tuple)) and len(bounds) == 4:
+                permitted = Box(*(float(value) for value in bounds))
+            elif isinstance(lane, (list, tuple)) and len(lane) == 2:
+                permitted = Box(float(lane[0]), crop.y, float(lane[1]), crop.y2)
+            elif (enclosing := self._find_enclosing_region_box(paragraph, page)) is not None:
+                permitted = enclosing
+            else:
+                permitted = crop
+
+            for shape in shapes:
+                src_h = max(0.0, min(source.x2, shape.x2) - max(source.x, shape.x))
+                src_v = max(0.0, min(source.y2, shape.y2) - max(source.y, shape.y))
+                if src_h > 1.0 and src_v > 1.0:
+                    continue  # intentional source overlay/background
+                h_overlap = max(0.0, min(rendered.x2, shape.x2) - max(rendered.x, shape.x))
+                v_overlap = max(0.0, min(rendered.y2, shape.y2) - max(rendered.y, shape.y))
+                if h_overlap <= 1.0 or v_overlap <= 1.0:
+                    continue
+
+                gap = 3.0
+                if (shape.x + shape.x2) * 0.5 <= (source.x + source.x2) * 0.5:
+                    dx = shape.x2 + gap - rendered.x
+                    lane_box = Box(max(permitted.x, shape.x2 + gap), rendered.y - 2, permitted.x2, rendered.y2 + 2)
+                else:
+                    dx = shape.x - gap - rendered.x2
+                    lane_box = Box(permitted.x, rendered.y - 2, min(permitted.x2, shape.x - gap), rendered.y2 + 2)
+                if lane_box.x <= rendered.x + dx and rendered.x2 + dx <= lane_box.x2:
+                    self._translate_rendered_paragraph(paragraph, dx=dx)
+                else:
+                    self._compact_paragraph_to_box(paragraph, lane_box, min_ratio=0.52)
+                rendered = self._rendered_text_box(paragraph) or rendered
+                remaining_h = max(0.0, min(rendered.x2, shape.x2) - max(rendered.x, shape.x))
+                remaining_v = max(0.0, min(rendered.y2, shape.y2) - max(rendered.y, shape.y))
+                if remaining_h <= 1.0 or remaining_v <= 1.0:
+                    trace["shape_collision_resolved"] = True
+
+    def _validate_rendered_regions(self, page: il_version_1.Page) -> list[dict]:
+        """Validate every rendered region against permitted bounds and cross-region collisions."""
+        issues: list[dict] = []
+        paragraphs = [p for p in (getattr(page, "pdf_paragraph", None) or []) if p.box is not None]
+        for para in paragraphs:
+            rbox = self._rendered_text_box(para)
+            if rbox is None:
+                continue
+            trace = para.pipeline_trace or {}
+            lbl = (para.layout_label or "").lower()
+            perm_box: Box | None = None
+            strict_y = True
+
+            rb = trace.get("region_bounds")
+            if lbl == "form_row":
+                perm_box = para.box
+            elif isinstance(rb, (list, tuple)) and len(rb) == 4:
+                perm_box = Box(float(rb[0]), float(rb[1]), float(rb[2]), float(rb[3]))
+            elif (enc := self._find_enclosing_region_box(para, page)) is not None:
+                perm_box = enc
+            elif "fixed" in lbl or trace.get("anchored_numeric_columns"):
+                perm_box = para.box
+            else:
+                cl = trace.get("column_lane")
+                if isinstance(cl, (list, tuple)) and len(cl) == 2 and not trace.get("page_overflow"):
+                    perm_box = Box(float(cl[0]), -1e6, float(cl[1]), 1e6)
+                    strict_y = False
+
+            if perm_box is not None:
+                min_r = 0.45 if "table_cell" in lbl else 0.48
+                if (
+                    rbox.x < perm_box.x - 2.0
+                    or rbox.x2 > perm_box.x2 + 2.0
+                    or (strict_y and (rbox.y < perm_box.y - 2.0 or rbox.y2 > perm_box.y2 + 2.0))
+                ):
+                    self._compact_paragraph_to_box(para, perm_box, min_ratio=min_r)
+                    rbox = self._rendered_text_box(para) or rbox
+                    # If a card/figure label still overflows its inner sub-box even after
+                    # bounded readable compaction, try expanding perm_box into verified free
+                    # space inside the outer card/figure container where no sibling label
+                    # overlaps before reporting an escape.
+                    outer_rb = trace.get("outer_region_bounds")
+                    if (
+                        isinstance(outer_rb, (list, tuple))
+                        and len(outer_rb) == 4
+                        and trace.get("region_type") in {"card", "figure"}
+                        and (
+                            rbox.x < perm_box.x - 2.0
+                            or rbox.x2 > perm_box.x2 + 2.0
+                            or (strict_y and (rbox.y < perm_box.y - 2.0 or rbox.y2 > perm_box.y2 + 2.0))
+                        )
+                    ):
+                        outer_box = Box(
+                            float(outer_rb[0]) + 2.0,
+                            float(outer_rb[1]) + 2.0,
+                            float(outer_rb[2]) - 2.0,
+                            float(outer_rb[3]) - 2.0,
+                        )
+                        cand_x0 = max(outer_box.x, min(perm_box.x, rbox.x))
+                        cand_y0 = max(outer_box.y, min(perm_box.y, rbox.y))
+                        cand_x2 = min(outer_box.x2, max(perm_box.x2, rbox.x2))
+                        cand_y2 = min(outer_box.y2, max(perm_box.y2, rbox.y2))
+                        if (
+                            cand_x2 > cand_x0 + 8.0
+                            and cand_y2 > cand_y0 + 6.0
+                            and (
+                                cand_x0 < perm_box.x - 0.5
+                                or cand_x2 > perm_box.x2 + 0.5
+                                or cand_y0 < perm_box.y - 0.5
+                                or cand_y2 > perm_box.y2 + 0.5
+                            )
+                        ):
+                            cand_box = Box(cand_x0, cand_y0, cand_x2, cand_y2)
+                            sibling_collision = False
+                            for sib in paragraphs:
+                                if sib is para:
+                                    continue
+                                sbox = self._rendered_text_box(sib)
+                                if sbox is None:
+                                    continue
+                                if (
+                                    min(cand_box.x2, sbox.x2) - max(cand_box.x, sbox.x) > 1.5
+                                    and min(cand_box.y2, sbox.y2) - max(cand_box.y, sbox.y) > 1.5
+                                ):
+                                    sibling_collision = True
+                                    break
+                            if not sibling_collision:
+                                perm_box = cand_box
+                                trace["region_bounds"] = [cand_box.x, cand_box.y, cand_box.x2, cand_box.y2]
+                                trace["expanded_into_container_free_space"] = True
+                                self._compact_paragraph_to_box(para, perm_box, min_ratio=min_r)
+                                rbox = self._rendered_text_box(para) or rbox
+                escaped_x = rbox.x < perm_box.x - 2.5 or rbox.x2 > perm_box.x2 + 2.5
+                escaped_y = strict_y and (rbox.y < perm_box.y - 2.5 or rbox.y2 > perm_box.y2 + 2.5)
+                is_table_or_form = (
+                    self._is_table_cell(para, page)
+                    or lbl in {"form_row", "form_field"}
+                    or trace.get("region_type") in {"table", "form_pair"}
+                )
+                if (escaped_x or escaped_y) and is_table_or_form:
+                    # Earlier layout passes already attempted bounded fitting.
+                    # Keep the readable result and expose the unresolved region
+                    # instead of hiding it with a microscopic emergency scale.
+                    self._ensure_pipeline_trace(para)["region_fallback"] = (
+                        "unresolved_readable_overflow"
+                    )
+                if escaped_x or escaped_y:
+                    self._ensure_pipeline_trace(para)["region_escape"] = True
+                    msg = (
+                        f"Region escape in {trace.get('region_group_id') or lbl} "
+                        f"para={getattr(para, 'debug_id', '?')}"
+                    )
+                    self._record_layout_issue(
+                        page_number=page.page_number,
+                        kind="region_escape",
+                        detail=msg,
+                        debug_id=getattr(para, "debug_id", None),
+                        severity="warning",
+                    )
+                    issues.append({"kind": "region_escape", "debug_id": getattr(para, "debug_id", None)})
+
+        # Check cross-region collisions between distinct non-table region groups or column lanes
+        rendered_boxes = [(p, self._rendered_text_box(p)) for p in paragraphs]
+        for idx, (p1, b1) in enumerate(rendered_boxes):
+            if b1 is None:
+                continue
+            t1 = p1.pipeline_trace or {}
+            g1 = t1.get("region_group_id") or (tuple(t1["column_lane"]) if "column_lane" in t1 else None)
+            if not g1 or self._is_table_cell(p1, page):
+                continue
+            for p2, b2 in rendered_boxes[idx + 1:]:
+                if b2 is None or self._is_table_cell(p2, page):
+                    continue
+                t2 = p2.pipeline_trace or {}
+                g2 = t2.get("region_group_id") or (tuple(t2["column_lane"]) if "column_lane" in t2 else None)
+                if not g2 or g1 == g2:
+                    continue
+                if not self._shares_reflow_layer(p1, p2):
+                    continue
+                h_ov = max(0.0, min(b1.x2, b2.x2) - max(b1.x, b2.x))
+                v_ov = max(0.0, min(b1.y2, b2.y2) - max(b1.y, b2.y))
+                if h_ov > 3.0 and v_ov > 3.0:
+                    msg = f"Cross-region collision between {g1} and {g2}"
+                    self._record_layout_issue(
+                        page_number=page.page_number,
+                        kind="region_collision",
+                        detail=msg,
+                        debug_id=getattr(p1, "debug_id", None),
+                        severity="warning",
+                    )
+                    issues.append({"kind": "region_collision", "debug_id": getattr(p1, "debug_id", None)})
+        return issues
+
+    def _audit_table_cells_after_render(self, page: il_version_1.Page) -> None:
+        """Audit rendered table cells for cross-cell collisions or fixed-cell boundary escape."""
+        table_cells = [
+            p for p in page.pdf_paragraph or []
+            if p.box is not None and self._is_table_cell(p, page)
+        ]
+        if not table_cells:
+            return
+
+        rendered_map = {
+            id(p): self._rendered_text_box(p) for p in table_cells
+        }
+
+        # 1. Check fixed/wired cells against their own physical slot boundaries;
+        # compact horizontally overflowing single-cell glyphs safely down to a bounded floor first.
+        for cell in table_cells:
+            trace = cell.pipeline_trace or {}
+            if trace.get("preserve_irregular_table"):
+                continue
+            rbox = rendered_map.get(id(cell))
+            if rbox is None or cell.box is None:
+                continue
+            is_fixed_slot = "fixed" in (cell.layout_label or "").lower()
+            is_anchored_booktabs = bool(trace.get("anchored_numeric_columns")) and not is_fixed_slot
+            # For anchored unruled booktabs cells, allow vertical row growth (already synchronized
+            # across the row by _resolve_table_row_and_body_clearance) while guarding horizontal gutters.
+            overflow_detected = (
+                is_fixed_slot and (
+                    rbox.x < cell.box.x - 1.5
+                    or rbox.x2 > cell.box.x2 + 1.5
+                    or rbox.y < cell.box.y - 1.5
+                    or rbox.y2 > cell.box.y2 + 1.5
+                )
+            ) or (
+                is_anchored_booktabs and (
+                    rbox.x < cell.box.x - 1.5
+                    or rbox.x2 > cell.box.x2 + 1.5
+                )
+            )
+            if overflow_detected:
+                p_trace = self._ensure_pipeline_trace(cell)
+                p_trace["table_cell_overflow_detected"] = True
+                repaired = False
+                if self._compact_paragraph_to_box(cell, cell.box, min_ratio=0.45):
+                    repaired_box = self._rendered_text_box(cell)
+                    if repaired_box is not None and (
+                        repaired_box.x >= cell.box.x - 1.5
+                        and repaired_box.x2 <= cell.box.x2 + 1.5
+                        and repaired_box.y >= cell.box.y - 1.5
+                        and repaired_box.y2 <= cell.box.y2 + 1.5
+                    ):
+                        repaired = True
+                        p_trace["table_cell_overflow_resolved"] = True
+                        rendered_map[id(cell)] = repaired_box
+                if repaired:
+                    continue
+                p_trace["region_fallback"] = "unresolved_readable_overflow"
+                p_trace["table_cell_overflow"] = True
+                self._record_layout_issue(
+                    page_number=page.page_number,
+                    kind="table_cell_overflow",
+                    detail=(
+                        f"Table cell {trace.get('cell_id') or getattr(cell, 'debug_id', '?')} "
+                        f"rendered glyphs exceed fixed cell bounds"
+                    ),
+                    debug_id=getattr(cell, "debug_id", None),
+                    severity="warning",
+                )
+
+        # 2. Check rendered overlap between sibling cells in the same table
+        by_table: dict[str, list[il_version_1.PdfParagraph]] = {}
+        for cell in table_cells:
+            trace = cell.pipeline_trace or {}
+            if trace.get("preserve_irregular_table"):
+                continue
+            tid = str(trace.get("table_id") or "_default_table")
+            by_table.setdefault(tid, []).append(cell)
+
+        reported_pairs: set[tuple[int, int]] = set()
+        for tid, group in by_table.items():
+            # A cell can stay inside its expanded audit box and still cross a
+            # printed rule. Check the actual separators, not just sibling boxes.
+            for cell in group:
+                rb = rendered_map.get(id(cell))
+                if rb is None:
+                    continue
+                for curve in page.pdf_curve or []:
+                    sb = curve.box
+                    if sb is None or sb.y2 - sb.y > 2.0:
+                        continue
+                    if curve.xobj_id is not None and cell.xobj_id is not None and curve.xobj_id != cell.xobj_id:
+                        continue
+                    group_width = max(c.box.x2 for c in group) - min(c.box.x for c in group)
+                    if sb.x2 - sb.x < group_width * 0.35:
+                        continue
+                    overlap_x = min(rb.x2, sb.x2) - max(rb.x, sb.x)
+                    if overlap_x > 3.0 and rb.y + 1.0 < (sb.y + sb.y2) * 0.5 < rb.y2 - 1.0:
+                        self._ensure_pipeline_trace(cell)["table_cell_overflow"] = True
+                        self._record_layout_issue(
+                            page_number=page.page_number,
+                            kind="table_cell_overflow",
+                            detail=f"Table cell {getattr(cell, 'debug_id', '?')} crosses a horizontal table rule in {tid}",
+                            debug_id=getattr(cell, "debug_id", None),
+                            severity="warning",
+                        )
+                        break
+            for idx, first in enumerate(group):
+                r1 = rendered_map.get(id(first))
+                if r1 is None:
+                    continue
+                for second in group[idx + 1:]:
+                    if not self._shares_reflow_layer(first, second):
+                        continue
+                    r2 = rendered_map.get(id(second))
+                    if r2 is None:
+                        continue
+                    h_ov = max(0.0, min(r1.x2, r2.x2) - max(r1.x, r2.x))
+                    v_ov = max(0.0, min(r1.y2, r2.y2) - max(r1.y, r2.y))
+                    if h_ov > 1.5 and v_ov > 1.5:
+                        pair = (min(id(first), id(second)), max(id(first), id(second)))
+                        if pair in reported_pairs:
+                            continue
+                        reported_pairs.add(pair)
+                        for p in (first, second):
+                            self._ensure_pipeline_trace(p)["table_cell_collision"] = True
+                        self._record_layout_issue(
+                            page_number=page.page_number,
+                            kind="table_cell_collision",
+                            detail=(
+                                f"Rendered glyphs collide between table cells "
+                                f"{getattr(first, 'debug_id', '?')} and {getattr(second, 'debug_id', '?')} "
+                                f"in {tid}"
+                            ),
+                            debug_id=tid,
+                            severity="warning",
+                        )
+
+    def _mirror_table_grids_for_rtl(self, page: il_version_1.Page) -> None:
+        """Mirror cell geometry and table-local vector geometry for Arabic RTL.
+
+        Per-cell right alignment cannot reverse an LTR table. This pass reflects
+        every cell about its table bounds before layout, preserving column widths
+        and moving merged headers with their child columns.
+        """
+        if not self._is_arabic_output() or id(page) in self._rtl_mirrored_table_pages:
+            return
+
+        self._ensure_semantic_table_models(page)
+        table_groups = self._table_cell_groups(page)
+        if not table_groups:
+            self._rtl_mirrored_table_pages.add(id(page))
+            return
+
+        for cells, table_box in table_groups:
+            # ParagraphFinder reconstructed these cells from the ruled grid.
+            # Their physical slots must stay aligned with the grid retained in
+            # the page base operations; only text inside each slot becomes RTL.
+            if cells and any(
+                "fixed_rtl" in (cell.layout_label or "").lower()
+                for cell in cells
+            ):
+                continue
+            # Irregular / low-confidence tables keep original geometry safely.
+            if cells and any(
+                (cell.pipeline_trace or {}).get("preserve_irregular_table")
+                or (cell.pipeline_trace or {}).get("anchored_numeric_columns")
+                for cell in cells
+            ):
+                continue
+            for cell in cells:
+                # Move source glyphs with their owning slot. Some cells
+                # (notably fixed values) bypass typesetting and retain their
+                # existing glyph coordinates at export.
+                dx = table_box.x + table_box.x2 - cell.box.x2 - cell.box.x
+                self._translate_rendered_paragraph(cell, dx=dx)
+
+            # Tables may be represented by colored cell rectangles or by vector
+            # rules. Mirror only elements wholly contained in this table, leaving
+            # page decorations and charts untouched.
+            for rect in getattr(page, "pdf_rectangle", []) or []:
+                if rect.box and (
+                    rect.box.x >= table_box.x - 0.5
+                    and rect.box.x2 <= table_box.x2 + 0.5
+                    and rect.box.y >= table_box.y - 0.5
+                    and rect.box.y2 <= table_box.y2 + 0.5
+                ):
+                    self._mirror_box_within_table(rect.box, table_box)
+
+            for curve in getattr(page, "pdf_curve", []) or []:
+                if not curve.box or not (
+                    curve.box.x >= table_box.x - 0.5
+                    and curve.box.x2 <= table_box.x2 + 0.5
+                    and curve.box.y >= table_box.y - 0.5
+                    and curve.box.y2 <= table_box.y2 + 0.5
+                ):
+                    continue
+                self._mirror_box_within_table(curve.box, table_box)
+                for path in curve.pdf_path:
+                    if path.x is not None:
+                        path.x = table_box.x + table_box.x2 - path.x
+
+        self._rtl_mirrored_table_pages.add(id(page))
+
+    @staticmethod
+    def _has_vertical_divider_between(
+        left: il_version_1.PdfParagraph,
+        right: il_version_1.PdfParagraph,
+        page: il_version_1.Page,
+    ) -> bool:
+        """Return True if a drawn vertical rule separates adjacent table cells."""
+        if not left.box or not right.box:
+            return False
+        mid_x0 = min(left.box.x2, right.box.x) - 2.0
+        mid_x1 = max(left.box.x2, right.box.x) + 2.0
+        row_y0 = min(left.box.y, right.box.y)
+        row_y1 = max(left.box.y2, right.box.y2)
+        for curve in getattr(page, "pdf_curve", None) or []:
+            cb = getattr(curve, "box", None)
+            if cb and (cb.x2 - cb.x) <= 3.0 and (cb.y2 - cb.y) >= 8.0:
+                if mid_x0 <= (cb.x + cb.x2) * 0.5 <= mid_x1:
+                    if min(cb.y2, row_y1) - max(cb.y, row_y0) >= 0.4 * (row_y1 - row_y0):
+                        return True
+        return False
+
+    def _balance_table_row_widths(self, page: il_version_1.Page, fonts: dict):
+        """Redistribute unused horizontal space from sibling columns in the same row to overflowing cells."""
+        for cell in page.pdf_paragraph or []:
+            trace = cell.pipeline_trace or {}
+            right_edge = trace.get("anchored_column_right")
+            left_edge = trace.get("anchored_column_left")
+            if cell.box is not None and right_edge is not None:
+                cell.box.x2 = max(cell.box.x2, right_edge)
+            if cell.box is not None and left_edge is not None:
+                cell.box.x = min(cell.box.x, left_edge)
+        page_chars = [
+            ch for ch in getattr(page, "pdf_character", []) or []
+            if ch.box is not None and (ch.char_unicode or "").strip()
+        ]
+        rows = self._cluster_table_cells_into_rows(page)
+        for row in rows:
+            if any(
+                "fixed_rtl" in (cell.layout_label or "").lower()
+                or (cell.pipeline_trace or {}).get("preserve_irregular_table")
+                for cell in row
+            ):
+                continue
+            row_ys = [c.box.y for c in row if c.box] + [c.box.y2 for c in row if c.box]
+            row_xs = [c.box.x for c in row if c.box] + [c.box.x2 for c in row if c.box]
+            if any((cell.pipeline_trace or {}).get("anchored_numeric_columns") for cell in row):
+                # Do not horizontally shift cells on rows containing frozen numeric glyphs;
+                # header/non-numeric rows without frozen glyphs may share empty gutter slack.
+                if not row_ys or not row_xs:
+                    continue
+                r_y0, r_y2 = min(row_ys) - 1.5, max(row_ys) + 1.5
+                r_x0, r_x2 = min(row_xs) - 4.0, max(row_xs) + 4.0
+                has_row_chars = any(
+                    r_x0 <= (ch.box.x + ch.box.x2) * 0.5 <= r_x2
+                    and r_y0 <= (ch.box.y + ch.box.y2) * 0.5 <= r_y2
+                    for ch in page_chars
+                )
+                if has_row_chars or not all((c.pipeline_trace or {}).get("is_header") for c in row):
+                    continue
+            if len(row) < 2:
+                continue
+
+            # Check each adjacent pair of cells (left cell, right cell)
+            for i in range(len(row) - 1):
+                cell_left = row[i]
+                cell_right = row[i + 1]
+                trace_left = cell_left.pipeline_trace or {}
+                trace_right = cell_right.pipeline_trace or {}
+                if (
+                    trace_left.get("table_id")
+                    and trace_right.get("table_id")
+                    and trace_left.get("table_id") != trace_right.get("table_id")
+                ):
+                    continue
+                if trace_left.get("col_span", 1) > 1 or trace_right.get("col_span", 1) > 1:
+                    continue
+                if self._has_vertical_divider_between(cell_left, cell_right, page):
+                    continue
+
+                units_left = self.create_typesetting_units(cell_left, fonts)
+                units_right = self.create_typesetting_units(cell_right, fonts)
+
+                w_left = cell_left.box.x2 - cell_left.box.x
+                w_right = cell_right.box.x2 - cell_right.box.x
+
+                req_left = sum(u.width for u in units_left)
+                req_right = sum(u.width for u in units_right)
+
+                right_sem = trace_right.get("semantic_table") or {}
+                left_sem = trace_left.get("semantic_table") or {}
+                right_protected = bool(right_sem.get("protected_value"))
+                left_protected = bool(left_sem.get("protected_value"))
+
+                right_is_passthrough = all(u.can_passthrough for u in units_right)
+                left_is_passthrough = all(u.can_passthrough for u in units_left)
+
+                # Case 1: Left cell overflows, and Right cell has surplus
+                if req_left > w_left and (
+                    (not right_protected and right_is_passthrough)
+                    or req_right + 15.0 < w_right
+                ):
+                    surplus_right = w_right - (req_right + 12.0)
+                    deficit_left = req_left - w_left + 6.0
+                    if surplus_right > 2.0:
+                        shift = min(deficit_left, surplus_right * 0.85)
+                        cell_left.box.x2 += shift
+                        cell_right.box.x += shift
+
+                # Case 2: Right cell overflows, and Left cell has surplus
+                elif req_right > w_right and (
+                    (not left_protected and left_is_passthrough)
+                    or req_left + 15.0 < w_left
+                ):
+                    surplus_left = w_left - (req_left + 12.0)
+                    deficit_right = req_right - w_right + 6.0
+                    if surplus_left > 2.0:
+                        shift = min(deficit_right, surplus_left * 0.85)
+                        cell_left.box.x2 -= shift
+                        cell_right.box.x -= shift
+
+    def _synchronize_table_row_heights(self, page: il_version_1.Page):
+        """Synchronize row height across single-row cells so rows align without clipping row_span cells."""
+        rows = self._cluster_table_cells_into_rows(page)
+        for row in rows:
+            if any(
+                "fixed_rtl" in (cell.layout_label or "").lower()
+                or (cell.pipeline_trace or {}).get("preserve_irregular_table")
+                or (cell.pipeline_trace or {}).get("anchored_numeric_columns")
+                for cell in row
+            ):
+                continue
+            sync_cells = [
+                c for c in row
+                if ((c.pipeline_trace or {}).get("row_span", 1) == 1)
+            ]
+            if len(sync_cells) < 2:
+                continue
+
+            row_min_y = min(c.box.y for c in sync_cells if c.box and c.box.y is not None)
+            row_max_y2 = max(c.box.y2 for c in sync_cells if c.box and c.box.y2 is not None)
+
+            for cell in sync_cells:
+                cell.box.y = row_min_y
+                cell.box.y2 = row_max_y2
+
+    def _would_overlap_page_decoration(self, paragraph: il_version_1.PdfParagraph, page: il_version_1.Page) -> bool:
+        """Check if margin mirroring would cause the paragraph to overlap with page decorations.
+        
+        Page decorations include sidebars, borders, colored regions, etc.
+        We detect these by checking if there are rectangles/figures near the page edges
+        that the mirrored paragraph would overlap with.
+        
+        Args:
+            paragraph: The paragraph to check
+            page: The page containing the paragraph
+            
+        Returns:
+            True if mirroring would cause overlap with decorations
+        """
+        if not paragraph.box or not page.cropbox or not page.cropbox.box:
+            return False
+        
+        para_box = paragraph.box
+        page_box = page.cropbox.box
+        
+        # Calculate where the paragraph would be after mirroring
+        shift_x = page_box.x + page_box.x2 - para_box.x2 - para_box.x
+        
+        new_x = para_box.x + shift_x
+        new_x2 = para_box.x2 + shift_x
+        
+        # Check if the new position is outside the safe content area
+        # Allow some margin (5% of page width) for borders/sidebars
+        page_width = page_box.x2 - page_box.x
+        safe_margin = page_width * 0.05
+        
+        # If the mirrored position would be too close to or beyond page edges, skip mirroring
+        if new_x < page_box.x + safe_margin or new_x2 > page_box.x2 - safe_margin:
+            # Additional check: see if there are rectangles (potential decorations) in the target area
+            if hasattr(page, 'pdf_rectangle') and page.pdf_rectangle:
+                for rect in page.pdf_rectangle:
+                    if not rect.box:
+                        continue
+                    
+                    rect_box = rect.box
+                    
+                    # Check if this rectangle is a page decoration (tall, near edge)
+                    rect_height = rect_box.y2 - rect_box.y
+                    page_height = page_box.y2 - page_box.y
+                    
+                    # Is it a tall rectangle (sidebar-like)?
+                    is_tall = rect_height > page_height * 0.3
+                    
+                    # Is it near the left or right edge?
+                    is_near_left = rect_box.x < page_box.x + page_width * 0.15
+                    is_near_right = rect_box.x2 > page_box.x2 - page_width * 0.15
+                    
+                    if is_tall and (is_near_left or is_near_right):
+                        # Check if mirrored paragraph would overlap with this decoration
+                        if (new_x < rect_box.x2 and new_x2 > rect_box.x and
+                            para_box.y < rect_box.y2 and para_box.y2 > rect_box.y):
+                            return True
+            
+            # Also check for figures that might be decorative elements
+            if hasattr(page, 'pdf_figure') and page.pdf_figure:
+                for figure in page.pdf_figure:
+                    if not figure.box:
+                        continue
+                    
+                    fig_box = figure.box
+                    
+                    # Check if this figure is near the edge (potential decoration)
+                    fig_width = fig_box.x2 - fig_box.x
+                    is_near_left = fig_box.x < page_box.x + page_width * 0.15
+                    is_near_right = fig_box.x2 > page_box.x2 - page_width * 0.15
+                    
+                    if is_near_left or is_near_right:
+                        # Check if mirrored paragraph would overlap
+                        if (new_x < fig_box.x2 and new_x2 > fig_box.x and
+                            para_box.y < fig_box.y2 and para_box.y2 > fig_box.y):
+                            return True
+        
+        return False
+
     def render_paragraph(
         self,
         paragraph: il_version_1.PdfParagraph,
@@ -1238,42 +6615,101 @@ class Typesetting:
             il_version_1.PdfFont | dict[str, il_version_1.PdfFont],
         ],
     ):
-        typesetting_units = self.create_typesetting_units(paragraph, fonts)
-        # 如果所有单元都可以直接传递，则直接传递
+        typesetting_units = self._deduplicate_artificial_header_units(
+            paragraph, page, self.create_typesetting_units(paragraph, fonts, page=page)
+        )
+        
+        # Check if Arabic output for RTL margin mirroring
+        is_arabic_output = self._is_arabic_output()
+        
+        # Check if this paragraph is table CELL content that should NOT have margin mirroring
+        # Table cells should maintain their original positions within the table structure
+        # Note: table_caption, table_title, table_footnote are NOT excluded - they should be mirrored
+        is_table_content = self._is_paragraph_inside_table(paragraph, page)
+        
+        # Initialize or update pipeline trace for diagnostic reporting
+        if not hasattr(paragraph, "pipeline_trace") or paragraph.pipeline_trace is None:
+            paragraph.pipeline_trace = {}
+        paragraph.pipeline_trace.update({
+            "is_arabic_output": is_arabic_output,
+            "is_table_content": is_table_content,
+            "layout_label": paragraph.layout_label,
+            "can_passthrough": all(unit.can_passthrough for unit in typesetting_units),
+        })
+
+        # If all typesetting units can be passed through directly, no need to layout
         if all(unit.can_passthrough for unit in typesetting_units):
             paragraph.scale = 1.0
             paragraph.pdf_paragraph_composition = self.create_passthrough_composition(
                 typesetting_units,
             )
+            
+            # Apply RTL margin mirroring for Arabic output on passthrough paragraphs
+            # Skip table, code, figure, and boxed container content to preserve structure
+            if is_arabic_output and not self._should_skip_margin_mirroring(paragraph, page):
+                shift_x = self._calculate_rtl_margin_shift(paragraph, page)
+                if shift_x != 0:
+                    self._apply_rtl_margin_shift_to_composition(
+                        paragraph.pdf_paragraph_composition, 
+                        shift_x,
+                        page  # Pass page for clamping
+                    )
+                    # Also update the paragraph box to reflect the new position
+                    if paragraph.box:
+                        paragraph.box.x += shift_x
+                        paragraph.box.x2 += shift_x
+                        # Clamp paragraph box to page bounds
+                        if page.cropbox and page.cropbox.box:
+                            page_box = page.cropbox.box
+                            page_margin = (page_box.x2 - page_box.x) * 0.02
+                            if paragraph.box.x2 > page_box.x2 - page_margin:
+                                overflow = paragraph.box.x2 - (page_box.x2 - page_margin)
+                                paragraph.box.x -= overflow
+                                paragraph.box.x2 -= overflow
+                            if paragraph.box.x < page_box.x + page_margin:
+                                underflow = (page_box.x + page_margin) - paragraph.box.x
+                                paragraph.box.x += underflow
+                                paragraph.box.x2 += underflow
         else:
-            # 使用预计算的缩放因子进行重排版
+            # Use precomputed scale factor to layout typesetting units
             precomputed_scale = (
                 paragraph.optimal_scale if paragraph.optimal_scale is not None else 1.0
             )
 
-            # 如果有单元无法直接传递，则进行重排版
+            # If precomputed scale is available, use precomputed scale for layout
             paragraph.pdf_paragraph_composition = []
             self.retypeset_with_precomputed_scale(
                 paragraph, page, typesetting_units, precomputed_scale
             )
 
-            # 重排版后，重新设置段落各字符的 render order
+            # Update paragraph render order for child characters
             self._update_paragraph_render_order(paragraph)
+            
+            # Apply RTL margin mirroring for Arabic output on layout paragraphs
+            # Apply RTL margin mirroring for Arabic output on body paragraphs
+            # Skip tables, figures, charts, captions, footnotes, and fallback lines
+            if is_arabic_output and not self._should_skip_margin_mirroring(paragraph, page):
+                shift_x = self._calculate_rtl_margin_shift(paragraph, page)
+                if shift_x != 0:
+                    self._apply_rtl_margin_shift_to_composition(
+                        paragraph.pdf_paragraph_composition, 
+                        shift_x,
+                        page  # Pass page for clamping
+                    )
+                    # Also update the paragraph box to reflect the new position
+                    if paragraph.box:
+                        paragraph.box.x += shift_x
+                        paragraph.box.x2 += shift_x
 
-    def _get_width_before_next_break_point(
-        self, typesetting_units: list[TypesettingUnit], scale: float
-    ) -> float:
-        if not typesetting_units:
-            return 0
-        if typesetting_units[0].can_break_line:
-            return 0
-
-        total_width = 0
-        for unit in typesetting_units:
-            if unit.can_break_line:
-                return total_width * scale
-            total_width += unit.width
-        return total_width * scale
+    def _is_arabic_char(self, char: str) -> bool:
+        """Check if character is Arabic - OPTIMIZED"""
+        if not char:
+            return False
+        try:
+            code_point = ord(char[0])
+            return (0x0600 <= code_point <= 0x06FF) or (0xFB50 <= code_point <= 0xFDFF) or (0xFE70 <= code_point <= 0xFEFF)
+        except:
+            return False
 
     def _layout_typesetting_units(
         self,
@@ -1283,35 +6719,33 @@ class Typesetting:
         line_skip: float,
         paragraph: il_version_1.PdfParagraph,
         use_english_line_break: bool = True,
+        *,
+        centered_display: bool = False,
     ) -> tuple[list[TypesettingUnit], bool]:
-        """布局排版单元。
-
-        Args:
-            typesetting_units: 要布局的排版单元列表
-            box: 布局边界框
-            scale: 缩放因子
-
-        Returns:
-            tuple[list[TypesettingUnit], bool]: (已布局的排版单元列表，是否所有单元都放得下)
-        """
-        # 计算字号众数
+        """Layout typesetting units - OPTIMIZED FOR ARABIC RTL"""
+        
+        # Detect Arabic FIRST
+        lang_out = (self.translation_config.lang_out or "").lower()
+        is_arabic = any(marker in lang_out for marker in ["ar", "arabic", "ara"])
+        
+        # Calculate font size
         font_sizes = []
         for unit in typesetting_units:
             if unit.font_size:
                 font_sizes.append(unit.font_size)
             if unit.char and unit.char.pdf_style and unit.char.pdf_style.font_size:
                 font_sizes.append(unit.char.pdf_style.font_size)
+        if not font_sizes:
+            font_sizes = [12]
         font_sizes.sort()
         font_size = statistics.mode(font_sizes)
 
         space_width = (
-            self.font_mapper.base_font.char_lengths("你", font_size * scale)[0] * 0.5
+            self.font_mapper.base_font.char_lengths(" ", font_size * scale)[0] * 0.5
         )
 
-        # 计算行高（使用众数）
-        unit_heights = (
-            [unit.height for unit in typesetting_units] if typesetting_units else []
-        )
+        # Calculate line height
+        unit_heights = [unit.height for unit in typesetting_units] if typesetting_units else []
         if not unit_heights:
             avg_height = 0
         elif len(unit_heights) == 1:
@@ -1320,152 +6754,891 @@ class Typesetting:
             try:
                 avg_height = statistics.mode(unit_heights) * scale
             except statistics.StatisticsError:
-                # 如果没有众数（所有值都出现相同次数），则使用平均值
                 avg_height = sum(unit_heights) / len(unit_heights) * scale
 
-        # 初始化位置：支持阿拉伯语 RTL 从右到左放置
-        rtl = self.lang_code.startswith("en-ar")
-        current_x = box.x2 if rtl else box.x
-        current_y = box.y2 - avg_heightss
+        # Initialize position
+        current_x = box.x
+        current_y = box.y2 - avg_height
         box = copy.deepcopy(box)
-        # box.y -= avg_height * (line_spacing - 1.01) # line_spacing 已被替换为 line_skip
         line_height = 0
-        current_line_heights = []  # 存储当前行所有元素的高度
-
-        # 存储已排版的单元
+        current_line_heights = []
         typeset_units = []
         all_units_fit = True
         last_unit: TypesettingUnit | None = None
         line_ys = [current_y]
+        current_line_index = 0
+        
         if paragraph.first_line_indent:
-            if rtl:
-                current_x -= space_width * 4
-            else:
-                current_x += space_width * 4
-        # 遍历所有排版单元
-        for i, unit in enumerate(typesetting_units):
-            # 计算当前单元在当前缩放下的尺寸
-            unit_width = unit.width * scale
-            unit_height = unit.height * scale
+            current_x += space_width * 4
+        
+        # OPTIMIZED ARABIC WORD-LEVEL PROCESSING WITH PER-LINE BIDI
+        if is_arabic:
+            _isolate_to_embed = {
+                0x2066: 0x202A,  # LRI -> LRE
+                0x2067: 0x202B,  # RLI -> RLE
+                0x2068: 0x202A,  # FSI -> LRE
+                0x2069: 0x202C,  # PDI -> PDF
+                0x061C: 0x200F,  # ALM -> RLM
+            }
 
-            # 跳过行首的空格（RTL/LTR）
-            if unit.is_space:
-                if (not rtl and current_x == box.x) or (rtl and current_x == box.x2):
+            def get_bidi_indices_and_chars(text: str, base_dir: str = 'R') -> list[tuple[int, str]]:
+                try:
+                    compat_text = text.translate(_isolate_to_embed)
+                    storage = ba.get_empty_storage()
+                    storage['base_level'] = 1 if base_dir == 'R' else 0
+                    storage['base_dir'] = base_dir
+                    ba.get_embedding_levels(compat_text, storage, False, False)
+                    for i, c in enumerate(storage['chars']):
+                        c['orig_idx'] = i
+                    ba.explicit_embed_and_overrides(storage, False)
+                    ba.resolve_weak_types(storage, False)
+                    ba.resolve_neutral_types(storage, False)
+                    ba.resolve_implicit_levels(storage, False)
+                    ba.reorder_resolved_levels(storage, False)
+                    ba.apply_mirroring(storage, False)
+                    return [
+                        (
+                            c['orig_idx'],
+                            text[c['orig_idx']] if ord(text[c['orig_idx']]) in _isolate_to_embed else c['ch'],
+                        )
+                        for c in storage['chars']
+                    ]
+                except Exception as e:
+                    logger.warning(f"Error in per-line bidi: {e}")
+                    return [(i, ch) for i, ch in enumerate(text)]
+
+            from babeldoc.format.pdf.document_il.utils.layout_helper import BULLET_POINT_PATTERN
+
+            # 1. Break typesetting_units into tokens:
+            # Each token is either a single space unit, an undivided bounded inline
+            # LTR/formula island (when <= 72% of line width), or a word (list of non-space units).
+            # Bullet points (standard or PUA like \uF0B7) are isolated into their own tokens
+            # so they never glue to adjacent words.
+            effective_line_width = box.x2 - box.x
+            atomic_island_max_w = max(effective_line_width * 0.72, 24.0)
+            tokens: list[list[TypesettingUnit]] = []
+            idx = 0
+            n = len(typesetting_units)
+            while idx < n:
+                u = typesetting_units[idx]
+                if u.forced_line_break:
+                    tokens.append([u])
+                    idx += 1
                     continue
-
-            if (
-                last_unit  # 有上一个单元
-                and last_unit.is_cjk_char ^ unit.is_cjk_char  # 中英文交界处
-                and (
-                    last_unit.box
-                    and last_unit.box.y
-                    and current_y - 0.1
-                    <= last_unit.box.y2
-                    <= current_y + line_height + 0.1
-                )  # 在同一行，且有垂直重叠
-                and not last_unit.mixed_character_blacklist  # 不是混排空格黑名单字符
-                and not unit.mixed_character_blacklist  # 同上
-                and current_x > box.x  # 不是行首
-                and unit.try_get_unicode() != " "  # 不是空格
-                and last_unit.try_get_unicode() != " "  # 不是空格
-                and last_unit.try_get_unicode()
-                not in [
-                    "。",
-                    "！",
-                    "？",
-                    "；",
-                    "：",
-                    "，",
-                ]
-            ):
-                if rtl:
-                    current_x -= space_width * 0.5
+                u_str = u.try_get_unicode() or ""
+                if u_str in {"\u200e", "\u2066", "\u2067", "\u2068"}:
+                    close_marker = "\u200e" if u_str == "\u200e" else "\u2069"
+                    close_idx = None
+                    scan_w = u.width * scale
+                    for probe in range(idx + 1, n):
+                        pu = typesetting_units[probe]
+                        if pu.forced_line_break:
+                            break
+                        scan_w += pu.width * scale
+                        if (pu.try_get_unicode() or "") == close_marker:
+                            close_idx = probe
+                            break
+                    if close_idx is not None and scan_w <= atomic_island_max_w:
+                        tokens.append(typesetting_units[idx : close_idx + 1])
+                        idx = close_idx + 1
+                        continue
+                if u.is_space:
+                    tokens.append([u])
+                    idx += 1
+                elif u.is_drawn_list_bullet or BULLET_POINT_PATTERN.match(u_str) or (u_str and 0xE000 <= ord(u_str[0]) <= 0xF8FF):
+                    # Standalone bullet token: never glue bullet to following word
+                    tokens.append([u])
+                    idx += 1
                 else:
-                    current_x += space_width * 0.5
-            if use_english_line_break:
-                width_before_next_break_point = self._get_width_before_next_break_point(
-                    typesetting_units[i:], scale
-                )
-            else:
-                width_before_next_break_point = 0
+                    word = [u]
+                    word_w = u.width * scale
+                    idx += 1
+                    while idx < n:
+                        next_u = typesetting_units[idx]
+                        if next_u.forced_line_break:
+                            break
+                        if getattr(word[-1], "no_break_after", False):
+                            word.append(next_u)
+                            word_w += next_u.width * scale
+                            idx += 1
+                            continue
+                        next_str = next_u.try_get_unicode() or ""
+                        if next_str in {"\u200e", "\u2066", "\u2067", "\u2068"}:
+                            break
+                        if next_u.is_space:
+                            # Keep adjacent PdfFormula segments connected by an internal
+                            # formula space atomic when the combined expression fits.
+                            if (
+                                word[-1].formular
+                                and idx + 1 < n
+                                and typesetting_units[idx + 1].formular
+                                and word_w + next_u.width * scale + typesetting_units[idx + 1].width * scale <= atomic_island_max_w
+                            ):
+                                word.append(next_u)
+                                word_w += next_u.width * scale
+                                idx += 1
+                                continue
+                            break
+                        if BULLET_POINT_PATTERN.match(next_str) or (next_str and 0xE000 <= ord(next_str[0]) <= 0xF8FF):
+                            break
+                        word.append(next_u)
+                        word_w += next_u.width * scale
+                        idx += 1
+                    tokens.append(word)
 
-            # 如果当前行放不下这个元素，换行（RTL/LTR）
-            overflow = False
-            if rtl:
+            # 2. Wrap tokens into lines in LOGICAL order:
+            first_indent = space_width * 4 if paragraph.first_line_indent else 0.0
+
+            # Detect bullet points and list markers for RTL hanging indent (Item 2)
+            is_bullet_para = False
+            bullet_indent = 0.0
+            if tokens and not tokens[0][0].is_space:
+                first_token_str = "".join(u.try_get_unicode() or "" for u in tokens[0])
+                first_char_code = ord(first_token_str[0]) if first_token_str else 0
                 if (
-                    (current_x - unit_width < box.x)
-                    or (
-                        use_english_line_break
-                        and current_x - unit_width - width_before_next_break_point < box.x
-                    )
-                    or (
-                        unit.is_cannot_appear_in_line_end_punctuation
-                        and current_x - unit_width * 2 < box.x
-                    )
+                    BULLET_POINT_PATTERN.match(first_token_str)
+                    or (0xE000 <= first_char_code <= 0xF8FF)
+                    or re.match(r'^(?:\d{1,3}|[a-zA-Z]|(?:i{1,3}|iv|v|vi{1,3}|ix|x))[\.\):]', first_token_str)
+                    or (paragraph.layout_label and any(m in paragraph.layout_label.lower() for m in ['list_item', 'bullet_item']))
                 ):
-                    overflow = True
-            else:
-                if (
-                    (current_x + unit_width > box.x2)
-                    or (
-                        use_english_line_break
-                        and current_x + unit_width + width_before_next_break_point > box.x2
-                    )
-                    or (
-                        unit.is_cannot_appear_in_line_end_punctuation
-                        and current_x + unit_width * 2 > box.x2
-                    )
-                ):
-                    overflow = True
+                    is_bullet_para = True
+                    first_token_w = sum(u.width * scale for u in tokens[0])
+                    bullet_indent = max(first_token_w + (space_width * 2.5), 14.0)
 
-            if not unit.is_hung_punctuation and overflow:
-                # 换行
-                current_x = box.x2 if rtl else box.x
-                if not current_line_heights:
-                    return [], False
-                max_height = max(current_line_heights)
-                mode_height = statistics.mode(current_line_heights)
+            lines_tokens: list[list[TypesettingUnit]] = []
+            current_line_tokens: list[TypesettingUnit] = []
+            current_line_w = 0.0
 
-                current_y -= max(mode_height * line_skip, max_height * 1.05)
-                line_ys.append(current_y)
-                line_height = 0.0
-                current_line_heights = []  # 清空当前行高度列表
+            for token_idx, token in enumerate(tokens):
+                if not token:
+                    continue
+                line_idx_current = len(lines_tokens)
+                if is_bullet_para and line_idx_current > 0:
+                    avail = effective_line_width - bullet_indent
+                elif line_idx_current == 0 and paragraph.first_line_indent:
+                    avail = effective_line_width - first_indent
+                else:
+                    avail = effective_line_width
 
-                # 检查是否超出底部边界
-                # if current_y - unit_height < box.y:
-                if current_y < box.y:
-                    all_units_fit = False
-                    # 这里不要 break，继续排版剩余内容
+                # Explicit line boundaries originate from structured source
+                # records (Step N, calculation/result, contact fields).  They
+                # are semantic boundaries, so width-based wrapping must never
+                # collapse two records onto the same visual line.
+                if token[0].forced_line_break:
+                    while current_line_tokens and current_line_tokens[-1].is_space:
+                        current_line_tokens.pop()
+                    lines_tokens.append(current_line_tokens)
+                    current_line_tokens = []
+                    current_line_w = 0.0
+                    continue
+                # Dynamic Table of Contents leader dot adjustment:
+                # Recognize both contiguous ("........") and spaced (". . . .") leader runs
+                # followed by a page number (numeric, Roman, or alphanumeric like "A-1").
+                # Dynamically resize or shorten the dot leader so title + leader + page_number
+                # stays in its horizontal lane and never wraps or pushes the page number off-page!
+                if token and all((u.try_get_unicode() or "") in {'.', '·', '…'} for u in token):
+                    # Check if this is part of a spaced leader run (e.g. "." " " "." " " ".")
+                    spaced_end_idx = token_idx
+                    dot_tokens_count = 1 if len(token) == 1 else len(token)
+                    is_spaced_leader = False
+                    if len(token) == 1:
+                        probe = token_idx + 1
+                        while probe + 1 < len(tokens):
+                            t_sp = tokens[probe]
+                            t_dt = tokens[probe + 1]
+                            if (
+                                len(t_sp) == 1
+                                and t_sp[0].is_space
+                                and len(t_dt) == 1
+                                and (t_dt[0].try_get_unicode() or "") in {'.', '·', '…'}
+                            ):
+                                dot_tokens_count += 1
+                                spaced_end_idx = probe + 1
+                                probe += 2
+                            else:
+                                break
+                        if dot_tokens_count >= 3:
+                            is_spaced_leader = True
+                            # Collapse subsequent spaced dot tokens into this token; mark consumed tokens as empty spaces
+                            space_sample = tokens[token_idx + 1][0]
+                            for clear_i in range(token_idx + 1, spaced_end_idx + 1):
+                                tokens[clear_i] = []
+                    if len(token) >= 3 or is_spaced_leader:
+                        rem = [t for t in tokens[spaced_end_idx + 1:] if t]
+                        non_space = [t for t in rem if not t[0].is_space]
+                        last_tok_str = "".join(u.try_get_unicode() or "" for u in non_space[-1]) if non_space else ""
+                        is_toc_pnum = bool(
+                            non_space
+                            and len(non_space) == 1
+                            and re.fullmatch(r"(?:[A-Z]-?\d+|\d+|[ivxlcdmIVXLCDM]{1,6})", last_tok_str)
+                        )
+                        if is_toc_pnum:
+                            if not hasattr(paragraph, "pipeline_trace") or paragraph.pipeline_trace is None:
+                                paragraph.pipeline_trace = {}
+                            paragraph.pipeline_trace["is_toc_row"] = True
+                            paragraph.pipeline_trace["toc_page_number"] = last_tok_str
+                            pnum_w = sum(u.width * scale for u in non_space[-1])
+                            reserved_pnum_lane = max(pnum_w + (space_width * 3.0), 22.0)
+                            dot_unit = token[0]
+                            dot_w = max(0.5, dot_unit.width * scale)
+                            # If the title alone + minimum leader + page number exceeds avail,
+                            # wrap the title BEFORE the leader so the final title line + leader + page_num
+                            # sit cleanly on the next line with the page number in its dedicated lane.
+                            min_leader_w = dot_w * 4
+                            if current_line_tokens and (current_line_w + min_leader_w + reserved_pnum_lane > avail):
+                                while current_line_tokens and current_line_tokens[-1].is_space:
+                                    current_line_tokens.pop()
+                                if current_line_tokens:
+                                    lines_tokens.append(current_line_tokens)
+                                current_line_tokens = []
+                                current_line_w = 0.0
+                            avail_dots = avail - current_line_w - reserved_pnum_lane
+                            if is_spaced_leader:
+                                step_w = max(1.0, dot_w + space_width)
+                                needed = max(3, int(avail_dots / step_w)) if avail_dots > step_w * 3 else 3
+                                new_leader: list[TypesettingUnit] = []
+                                for d_i in range(needed):
+                                    new_leader.append(copy.copy(dot_unit))
+                                    if d_i + 1 < needed:
+                                        new_leader.append(copy.copy(space_sample))
+                                token[:] = new_leader
+                            else:
+                                needed = max(4, int(avail_dots / dot_w)) if avail_dots > dot_w * 4 else 4
+                                token[:] = [copy.copy(dot_unit) for _ in range(needed)]
 
-                if unit.is_space:
-                    line_height = max(line_height, unit_height)
+                if not token:
+                    continue
+                token_w = sum(u.width * scale for u in token)
+
+                # Skip leading space on a line
+                if not current_line_tokens and token[0].is_space:
                     continue
 
-            # 放置当前单元
-            # 计算放置位置并更新 current_x
-            place_x = (current_x - unit_width) if rtl else current_x
-            relocated_unit = unit.relocate(place_x, current_y, scale)
-            typeset_units.append(relocated_unit)
+                if current_line_tokens and (current_line_w + token_w > avail):
+                    # Wrap to new line: trim trailing spaces
+                    while current_line_tokens and current_line_tokens[-1].is_space:
+                        current_line_tokens.pop()
+                    if current_line_tokens:
+                        lines_tokens.append(current_line_tokens)
+                    current_line_tokens = []
+                    current_line_w = 0.0
+                    if token[0].is_space:
+                        continue
 
-            # 添加当前单元的高度到当前行高度列表
-            if not unit.is_space:
-                current_line_heights.append(unit_height)
+                current_line_tokens.extend(token)
+                current_line_w += token_w
 
-            # 更新 x 坐标（RTL 向左推进，LTR 向右推进）
-            current_x = place_x if rtl else relocated_unit.box.x2
+            if current_line_tokens:
+                while current_line_tokens and current_line_tokens[-1].is_space:
+                    current_line_tokens.pop()
+                if current_line_tokens:
+                    lines_tokens.append(current_line_tokens)
 
-            last_unit = relocated_unit
+            # Record line stats in pipeline trace
+            if not hasattr(paragraph, "pipeline_trace") or paragraph.pipeline_trace is None:
+                paragraph.pipeline_trace = {}
+            paragraph.pipeline_trace.update({
+                "num_lines": len(lines_tokens),
+                "is_bullet_para": is_bullet_para,
+                "bullet_indent": bullet_indent if is_bullet_para else 0.0,
+            })
 
+            # Check if paragraph is inside table
+            is_table_content = False
+            if paragraph.layout_label:
+                layout_label_lower = paragraph.layout_label.lower()
+                if any(table_marker in layout_label_lower for table_marker in [
+                    'table_cell', 'table_text', 'wired_table_cell', 'wireless_table_cell'
+                ]):
+                    is_table_content = True
+            centered_table_header = paragraph.layout_label == "wired_table_cell_fixed_rtl_centered"
+
+            # 3. Layout each line with per-line BiDi
+            for line_idx, line in enumerate(lines_tokens):
+                if not line:
+                    continue
+
+                # A list marker belongs at the RTL margin even when the
+                # translated item consists entirely of Latin text.
+                bullet_prefix = []
+                if line_idx == 0 and line[0].is_drawn_list_bullet:
+                    prefix_length = 2 if len(line) > 1 and line[1].is_space else 1
+                    bullet_prefix = line[:prefix_length]
+                    line = line[prefix_length:]
+
+                line_characters = [unit.try_get_unicode() or "" for unit in line]
+                line_str = "".join(line_characters)
+                
+                # Check if this line is a chronological time-series axis (e.g., sequence of month/year labels)
+                # In charts, timelines progress Left-to-Right even in Arabic contexts to match the chart data curves
+                months_pattern = r'\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec|يناير|فبراير|مارس|أبريل|مايو|يونيو|يوليو|أغسطس|سبتمبر|أكتوبر|نوفمبر|ديسمبر|أوج)\b'
+                is_chronological_axis = len(re.findall(months_pattern, line_str, re.I)) >= 3
+
+                # Check if line contains isolated Latin alphanumeric codes without any Arabic text
+                # (e.g. ISO country codes AL, BA, GB, CZ; SWIFT BICs, arithmetic formulas)
+                has_arabic_chars = any(
+                    (0x0600 <= ord(c) <= 0x06FF) or (0xFB50 <= ord(c) <= 0xFEFF)
+                    for c in line_str
+                )
+                is_isolated_latin = (not has_arabic_chars) and bool(
+                    re.match(r'^[A-Za-z0-9\s\-–—/._\(\)+:=#\$\€\£\¥\%\*]+$', line_str.strip())
+                )
+                is_procedure_code = (
+                    "procedure_step" in (paragraph.layout_label or "").lower()
+                    and is_isolated_latin
+                    and bool(re.search(r'\d|[A-Z]{4,}', line_str))
+                )
+
+                if is_chronological_axis or is_isolated_latin:
+                    # Keep native LTR character order matching original code, formula, or timeline
+                    visual_units = line
+                elif line_str.strip():
+                    # Give BiDi one position per visible text unit and one atomic
+                    # position per consecutive formula run. A technical expression
+                    # is commonly extracted as several one-character PdfFormula
+                    # objects (W, =, {, w1, ...). Reordering those objects separately
+                    # reverses the expression inside an Arabic line.
+                    bidi_atoms = []
+                    for unit, text in zip(line, line_characters):
+                        if unit.formular:
+                            if bidi_atoms and bidi_atoms[-1]["is_formula"]:
+                                bidi_atoms[-1]["units"].append(unit)
+                            else:
+                                bidi_atoms.append(
+                                    {"text": "\ufffc", "units": [unit], "is_formula": True}
+                                )
+                        else:
+                            bidi_atoms.append(
+                                {
+                                    "text": text if len(text) == 1 else "\ufffc",
+                                    "units": [unit],
+                                    "is_formula": False,
+                                }
+                            )
+
+                    # Treat inline math/formula atoms containing Latin/Greek variables
+                    # or digits as strong LTR islands regardless of neighboring script,
+                    # so subscripts and grouped expressions never reverse beside Arabic.
+                    for index, atom in enumerate(bidi_atoms):
+                        if not atom["is_formula"]:
+                            continue
+                        if any(getattr(u, "is_drawn_list_bullet", False) for u in atom["units"]):
+                            continue
+                        directions = {
+                            unicodedata.bidirectional(glyph)
+                            for unit in atom["units"]
+                            for char in unit.formular.pdf_character
+                            for glyph in char.char_unicode or ""
+                        }
+                        if directions & {"R", "AL", "AN"}:
+                            continue
+                        if directions & {"L", "EN"}:
+                            atom["text"] = "L"
+                            continue
+                        neighbors = bidi_atoms[max(0, index - 1):index] + bidi_atoms[index + 1:index + 2]
+                        if directions and any(
+                            unicodedata.bidirectional(item["text"]) in {"L", "EN"}
+                            for item in neighbors
+                        ):
+                            atom["text"] = "L"
+
+                    bidi_text = "".join(atom["text"] for atom in bidi_atoms)
+                    bidi_map = get_bidi_indices_and_chars(bidi_text, base_dir='R')
+                    visual_units = []
+                    visual_indices = []
+                    for orig_idx, mirrored_char in bidi_map:
+                        if orig_idx >= len(bidi_atoms):
+                            continue
+                        atom = bidi_atoms[orig_idx]
+                        atom_units = [copy.copy(unit) for unit in atom["units"]]
+                        if not atom["is_formula"] and len(atom_units) == 1:
+                            unit = atom_units[0]
+                            if mirrored_char and unit.unicode and unit.unicode != mirrored_char:
+                                unit.unicode = mirrored_char
+                        visual_units.extend(atom_units)
+                        visual_indices.extend([orig_idx] * len(atom_units))
+
+                    # LRM-delimited and LRI/PDI-isolated formulas/codes are semantic
+                    # LTR islands. Restore each island's *logical* unit sequence
+                    # without moving the island within the RTL line.
+                    for open_marker, close_marker in (("\u200e", "\u200e"), ("\u2066", "\u2069")):
+                        start = 0
+                        while True:
+                            left = bidi_text.find(open_marker, start)
+                            if left < 0:
+                                break
+                            right = bidi_text.find(close_marker, left + 1)
+                            if right < 0:
+                                break
+                            positions = [
+                                pos for pos, source_index in enumerate(visual_indices)
+                                if left < source_index < right
+                            ]
+                            if len(positions) > 1:
+                                ordered = sorted(
+                                    (
+                                        visual_indices[pos],
+                                        sequence,
+                                        visual_units[pos],
+                                    )
+                                    for sequence, pos in enumerate(positions)
+                                )
+                                for pos, (source_index, _sequence, unit) in zip(positions, ordered):
+                                    visual_indices[pos] = source_index
+                                    visual_units[pos] = unit
+                            start = right + 1
+                else:
+                    visual_units = line
+
+                if bullet_prefix:
+                    visual_units = [*visual_units, *reversed(bullet_prefix)]
+
+                # Calculate total line width
+                visual_line_w = sum(u.width * scale for u in visual_units)
+
+                # Check horizontal overflow within paragraph/cell box
+                if visual_line_w > (box.x2 - box.x) + 0.5:
+                    all_units_fit = False
+
+                # Hanging indent on wrapped lines (line_idx >= 1) for bullets
+                if is_bullet_para and line_idx > 0:
+                    current_indent = bullet_indent
+                elif line_idx == 0 and paragraph.first_line_indent:
+                    current_indent = first_indent
+                else:
+                    current_indent = 0.0
+
+                # Determine starting X position
+                if is_chronological_axis:
+                    line_start_x = box.x
+                elif centered_display or centered_table_header:
+                    line_start_x = max(box.x, (box.x + box.x2 - visual_line_w) / 2)
+                elif is_table_content:
+                    line_start_x = box.x2 - visual_line_w
+                    if line_start_x < box.x:
+                        line_start_x = box.x
+                else:
+                    # Codes, equations and section identifiers retain their
+                    # native LTR character order, but they are content of an
+                    # RTL paragraph.  Anchoring them at ``box.x`` placed them
+                    # on the English-side margin after mirroring.
+                    line_start_x = (box.x2 - current_indent) - visual_line_w
+                    if line_start_x < box.x:
+                        line_start_x = box.x
+
+                # Place each unit along the line LTR from line_start_x
+                cur_x = line_start_x
+                line_heights = []
+                for u in visual_units:
+                    relocated = u.relocate(cur_x, current_y, scale)
+                    relocated.line_id = line_idx
+                    if is_procedure_code:
+                        relocated.presentation_role = "procedure_code"
+                    if is_table_content and relocated.box and relocated.box.x2 > box.x2 + 0.5:
+                        all_units_fit = False
+                    typeset_units.append(relocated)
+                    cur_x = relocated.box.x2
+                    if not u.is_space:
+                        line_heights.append(u.height * scale)
+
+                # Advance Y for the next line only if there is another line to place
+                if line_idx < len(lines_tokens) - 1:
+                    if line_heights:
+                        max_h = max(line_heights)
+                        try:
+                            mode_h = statistics.mode(line_heights)
+                        except statistics.StatisticsError:
+                            mode_h = max_h
+                        current_y -= max(mode_h * line_skip, max_h * 1.05)
+                    else:
+                        current_y -= avg_height * line_skip
+
+                    line_ys.append(current_y)
+                    if current_y < box.y:
+                        all_units_fit = False
+        else:
+            # ORIGINAL NON-ARABIC LOGIC (UNCHANGED)
+            for i, unit in enumerate(typesetting_units):
+                unit_width = unit.width * scale
+                unit_height = unit.height * scale
+
+                if current_x == box.x and unit.is_space:
+                    continue
+
+                if (last_unit and last_unit.is_cjk_char ^ unit.is_cjk_char
+                    and last_unit.box and last_unit.box.y
+                    and current_y - 0.1 <= last_unit.box.y2 <= current_y + line_height + 0.1
+                    and not last_unit.mixed_character_blacklist and not unit.mixed_character_blacklist
+                    and current_x > box.x and unit.try_get_unicode() != " "
+                    and last_unit.try_get_unicode() != " "
+                    and last_unit.try_get_unicode() not in ["ÃƒÂ£Ã¢â€šÂ¬Ã‚Â", "ÃƒËœÃ…â€™", "ÃƒÂ£Ã¢â€šÂ¬Ã¢â‚¬Å¡", "ÃƒÂ¯Ã‚Â¼Ã…Â¡", "ÃƒÂ¯Ã‚Â¼Ã‚Â", "ÃƒÂ¯Ã‚Â¼Ã…Â¸"]):
+                    current_x += space_width * 0.5
+                
+                if use_english_line_break:
+                    width_before_next_break_point = self._get_width_before_next_break_point(typesetting_units[i:], scale)
+                else:
+                    width_before_next_break_point = 0
+
+                if not unit.is_hung_punctuation and (
+                    (current_x + unit_width > box.x2) or
+                    (use_english_line_break and current_x + unit_width + width_before_next_break_point > box.x2) or
+                    (unit.is_cannot_appear_in_line_end_punctuation and current_x + unit_width * 2 > box.x2)):
+                    
+                    current_x = box.x
+                    if not current_line_heights:
+                        return [], False
+                    max_height = max(current_line_heights)
+                    mode_height = statistics.mode(current_line_heights)
+                    current_y -= max(mode_height * line_skip, max_height * 1.05)
+                    line_ys.append(current_y)
+                    line_height = 0.0
+                    current_line_heights = []
+
+                    if current_y < box.y:
+                        all_units_fit = False
+
+                    if unit.is_space:
+                        line_height = max(line_height, unit_height)
+                        continue
+
+                relocated_unit = unit.relocate(current_x, current_y, scale)
+                typeset_units.append(relocated_unit)
+
+                if not unit.is_space:
+                    current_line_heights.append(unit_height)
+
+                prev_x = current_x
+                current_x = relocated_unit.box.x2
+                if prev_x > current_x:
+                    logger.warning(f"Position regression occurred, TypesettingUnit: {unit.box}, ")
+
+                last_unit = relocated_unit
+        
+        # NOTE: Arabic RTL text flows RIGHT-to-LEFT horizontally but still TOP-to-BOTTOM vertically
+        # The right-alignment is already handled in the Arabic layout logic above (lines 1909-1963)
+        # DO NOT reverse Y positions - this was causing text overlap issues
+        
         return typeset_units, all_units_fit
+
+    def _apply_arabic_word_spacing(
+        self,
+        line_units_map: dict[int, list[TypesettingUnit]],
+        spacing: float,
+        box: Box = None,
+    ):
+        """Apply additional spacing between Arabic words post layout.
+        
+        If box is provided, ensures the total line width doesn't exceed box width.
+        """
+        if spacing <= 0:
+            return
+
+        for line_idx, units in line_units_map.items():
+            if not units:
+                continue
+            
+            # Count word gaps
+            word_gap_count = sum(1 for unit in units if getattr(unit, "ends_word", False))
+            if word_gap_count == 0:
+                continue
+            
+            # Calculate total spacing that would be added
+            total_spacing = word_gap_count * spacing
+            
+            # If box is provided, check if spacing would cause overflow
+            actual_spacing = spacing
+            if box is not None:
+                box_width = box.x2 - box.x
+                # Get current line width
+                line_min_x = min(u.box.x for u in units if u.box and u.box.x is not None)
+                line_max_x = max(u.box.x2 for u in units if u.box and u.box.x2 is not None)
+                current_width = line_max_x - line_min_x
+                
+                # Calculate available space for word spacing
+                available_space = box_width - current_width
+                
+                if available_space <= 0:
+                    # Line already at or beyond box width, skip spacing
+                    continue
+                
+                # If total spacing would exceed available space, reduce it
+                if total_spacing > available_space:
+                    actual_spacing = available_space / word_gap_count
+            
+            # Apply the (possibly reduced) spacing
+            cumulative_shift = 0.0
+            for unit in units:
+                if cumulative_shift:
+                    self._shift_unit_x(unit, cumulative_shift)
+                if getattr(unit, "ends_word", False):
+                    cumulative_shift += actual_spacing
+
+    def _shift_unit_x(self, unit: TypesettingUnit, shift_x: float):
+        """Shift a typesetting unit horizontally."""
+        if shift_x == 0 or unit is None:
+            return
+        if unit.box:
+            unit.box.x += shift_x
+            unit.box.x2 += shift_x
+        if unit.x is not None:
+            unit.x += shift_x
+        if unit.char and unit.char.box:
+            unit.char.box.x += shift_x
+            unit.char.box.x2 += shift_x
+        if (
+            unit.char
+            and unit.char.visual_bbox
+            and unit.char.visual_bbox.box
+        ):
+            unit.char.visual_bbox.box.x += shift_x
+            unit.char.visual_bbox.box.x2 += shift_x
+
+    def _justify_arabic_line(
+        self, 
+        line_units: list[TypesettingUnit], 
+        target_left: float, 
+        target_right: float,
+        current_left: float,
+        current_right: float,
+    ):
+        """Justify an Arabic line by distributing space between words.
+        
+        For RTL text, we want the line to:
+        - Start from the right margin (target_right)
+        - Extend to the left margin (target_left)
+        - Space between words is distributed evenly to fill the gap
+        
+        IMPORTANT: The line must stay within bounds - left edge >= target_left
+        
+        Args:
+            line_units: List of typesetting units in the line
+            target_left: Target left edge (box.x)
+            target_right: Target right edge (box.x2)
+            current_left: Current line left edge (min x)
+            current_right: Current line right edge (max x)
+        """
+        if not line_units:
+            return
+        
+        target_width = target_right - target_left
+        current_width = current_right - current_left
+        
+        if current_width <= 0 or target_width <= current_width:
+            # Line already fills the space or is wider, just right-align
+            # But clamp to prevent left-side overflow!
+            shift_x = target_right - current_right
+            
+            # Check if shifting would push left edge beyond target_left
+            new_left = current_left + shift_x
+            if new_left < target_left:
+                # Clamp shift to keep left edge at target_left
+                shift_x = target_left - current_left
+            
+            for unit in line_units:
+                self._shift_unit_x(unit, shift_x)
+            return
+        
+        # Calculate the extra space to distribute
+        extra_space = target_width - current_width
+        
+        # Find word boundaries by looking for units marked as ending a word
+        # or by detecting spaces between character groups
+        word_gaps = []
+        sorted_units = sorted(line_units, key=lambda u: u.box.x if u.box else 0)
+        
+        # Count word boundaries (gaps between words)
+        for i, unit in enumerate(sorted_units):
+            if getattr(unit, 'ends_word', False) and i < len(sorted_units) - 1:
+                word_gaps.append(i)
+        
+        # Alternative: detect gaps by looking at spaces between consecutive units
+        if not word_gaps:
+            for i in range(len(sorted_units) - 1):
+                unit = sorted_units[i]
+                next_unit = sorted_units[i + 1]
+                if unit.box and next_unit.box:
+                    gap = next_unit.box.x - unit.box.x2
+                    # If gap is significant (larger than typical character spacing), it's a word gap
+                    if gap > 1:  # Threshold for word gap detection
+                        word_gaps.append(i)
+        
+        num_gaps = len(word_gaps)
+        
+        if num_gaps == 0:
+            # No word gaps found, just right-align
+            shift_x = target_right - current_right
+            for unit in line_units:
+                self._shift_unit_x(unit, shift_x)
+            return
+        
+        # Distribute extra space evenly between word gaps
+        space_per_gap = extra_space / num_gaps
+        
+        # First, right-align the line to target_right
+        initial_shift = target_right - current_right
+        for unit in line_units:
+            self._shift_unit_x(unit, initial_shift)
+        
+        # Now expand gaps by shifting units to the left based on which gap they're after
+        # Units after gap i get shifted left by (num_gaps - gap_index) * space_per_gap
+        # This creates justified spacing from right to left
+        gap_index = 0
+        cumulative_shift = 0.0
+        
+        # Re-sort after initial shift
+        sorted_units = sorted(line_units, key=lambda u: u.box.x if u.box else 0)
+        
+        for i, unit in enumerate(sorted_units):
+            # Apply cumulative shift (negative, to move left)
+            if cumulative_shift != 0:
+                self._shift_unit_x(unit, -cumulative_shift)
+            
+            # Check if this unit ends a word (next position should expand)
+            if i in word_gaps:
+                cumulative_shift += space_per_gap
+
+    def _get_width_before_next_break_point(
+        self, units: list[TypesettingUnit], scale: float
+    ) -> float:
+        """Calculate the width before the next line break point"""
+        width = 0.0
+        for unit in units:
+            if unit.can_break_line:
+                break
+            width += unit.width * scale
+        return width
 
     def create_typesetting_units(
         self,
         paragraph: il_version_1.PdfParagraph,
         fonts: dict[str, il_version_1.PdfFont],
+        *,
+        page: il_version_1.Page | None = None,
     ) -> list[TypesettingUnit]:
         if not paragraph.pdf_paragraph_composition:
             return []
         result = []
+        centered_display = page is not None and self._is_centered_display_text(paragraph, page)
+        # Page-level paragraphs are not inside an XObject.  The rest of the
+        # pipeline represents that case with -1 (rather than None), while a
+        # TypesettingUnit requires a concrete ownership ID for generated text.
+        paragraph_xobj_id = (
+            paragraph.xobj_id
+            if getattr(paragraph, "xobj_id", None) is not None
+            else -1
+        )
+        def resolve_unicode(source_font, value: str):
+            """Resolve a target character without ever accepting glyph 0.
+
+            Arabic reshaping can generate contextual presentation forms absent
+            from a target cmap. Only in that case, use its NFKC base letter;
+            supported presentation forms are retained for correct joining.
+            Fallbacks run strictly after direct target-font coverage misses.
+            """
+            if len(value) != 1:
+                raise ValueError(f"Expected a single output character, got {value!r}")
+            codepoint = ord(value)
+            # Variation selectors change the presentation of the preceding
+            # character and do not render as standalone glyphs.  Requiring a
+            # target-font cmap entry for them makes otherwise valid translated
+            # text fail during export (for example, U+FE0F after a symbol).
+            if self._is_variation_selector(codepoint):
+                return None, None
+            if unicodedata.category(value) == "Cc":
+                return None, None
+            if 0xE000 <= codepoint <= 0xF8FF:
+                bullet = "\u2022"
+                bullet_font = self.font_mapper.map(source_font, bullet)
+                if bullet_font is not None:
+                    self._record_glyph_substitution(value, bullet, "pua_bullet", paragraph)
+                    return bullet, bullet_font
+            is_arabic_target = (
+                0x0600 <= codepoint <= 0x06FF
+                or 0x0750 <= codepoint <= 0x077F
+                or 0x08A0 <= codepoint <= 0x08FF
+                or 0xFB50 <= codepoint <= 0xFDFF
+                or 0xFE70 <= codepoint <= 0xFEFF
+            )
+            # A translated paragraph can inherit Source Han's style ID from
+            # the English PDF; that face must never become the output owner of
+            # Arabic glyphs. The source style is still a weight hint: a bold
+            # English heading must use GoNotoKurrent-Bold in Arabic.
+            if self.is_arabic and is_arabic_target:
+                weighted_target = self.font_mapper.map(source_font, value)
+                if weighted_target is not None:
+                    return value, weighted_target
+                for arabic_font in self.font_mapper.arabic_fonts:
+                    if arabic_font.has_glyph(codepoint):
+                        return value, arabic_font
+            else:
+                target_font = self.font_mapper.map(source_font, value)
+                if target_font is not None:
+                    return value, target_font
+
+            normalized = unicodedata.normalize("NFKC", value)
+            if (
+                len(normalized) == 1
+                and normalized != value
+                and not self._is_forbidden_operator_substitution(value, normalized)
+            ):
+                target_font = self.font_mapper.map(source_font, normalized)
+                if target_font is not None:
+                    self._record_glyph_substitution(value, normalized, "nfkc", paragraph)
+                    return normalized, target_font
+                if self.is_arabic and is_arabic_target:
+                    for arabic_font in self.font_mapper.arabic_fonts:
+                        if arabic_font.has_glyph(ord(normalized)):
+                            self._record_glyph_substitution(value, normalized, "nfkc", paragraph)
+                            return normalized, arabic_font
+
+            fallback_value = self._SYMBOL_GLYPH_FALLBACKS.get(value)
+            if fallback_value and not self._is_forbidden_operator_substitution(value, fallback_value):
+                target_font = self.font_mapper.map(source_font, fallback_value)
+                if target_font is not None:
+                    self._record_glyph_substitution(
+                        value, fallback_value, "symbol_fallback", paragraph
+                    )
+                    return fallback_value, target_font
+
+            if unicodedata.category(value) == "Cf":
+                # Preserve BiDi directional controls and isolates as zero-width
+                # layout units when a real base font is available so per-line
+                # BiDi ordering and island grouping see them before render()
+                # omits them from glyph drawing.
+                if value in {
+                    "\u200e", "\u200f", "\u061c",
+                    "\u202a", "\u202b", "\u202c", "\u202d", "\u202e",
+                    "\u2066", "\u2067", "\u2068", "\u2069",
+                }:
+                    carrier_font = getattr(self.font_mapper, "base_font", None)
+                    if carrier_font is not None:
+                        return value, carrier_font
+                self._skipped_format_chars[value] = self._skipped_format_chars.get(value, 0) + 1
+                logger.debug(
+                    "Skipped uncovered format control U+%04X in paragraph %s",
+                    codepoint,
+                    getattr(paragraph, "debug_id", None) or "<unknown>",
+                )
+                return None, None
+
+            if not is_arabic_target:
+                replacement = "\uFFFD"
+                replacement_font = self.font_mapper.map(source_font, replacement)
+                if (
+                    replacement_font is not None
+                    and replacement_font.has_glyph(ord(replacement))
+                ):
+                    self._record_glyph_substitution(
+                        value, replacement, "unsupported_replacement", paragraph
+                    )
+                    return replacement, replacement_font
+
+            message = (
+                f"No target-font coverage for {value!r} in paragraph "
+                f"{getattr(paragraph, 'debug_id', None) or '<unknown>'}"
+            )
+            logger.error(message)
+            raise RuntimeError(message)
 
         @cache
         def get_font(font_id: str, xobj_id: int | None):
@@ -1475,27 +7648,61 @@ class Typesetting:
                 font = fonts[font_id]
             return font
 
+        def unit_from_source_char(char: il_version_1.PdfCharacter) -> TypesettingUnit:
+            """Retype portable bullets and Arabic glyphs in the target font."""
+            value = char.char_unicode or ""
+            is_pua_bullet = len(value) == 1 and 0xE000 <= ord(value) <= 0xF8FF
+            is_arabic_glyph = len(value) == 1 and (
+                0x0600 <= ord(value) <= 0x06FF
+                or 0x0750 <= ord(value) <= 0x077F
+                or 0x08A0 <= ord(value) <= 0x08FF
+                or 0xFB50 <= ord(value) <= 0xFDFF
+                or 0xFE70 <= ord(value) <= 0xFEFF
+            )
+            if (is_pua_bullet or (self.is_arabic and is_arabic_glyph)) and char.pdf_style:
+                style = char.pdf_style
+                char_xobj = (
+                    char.xobj_id
+                    if getattr(char, "xobj_id", None) is not None
+                    else (
+                        paragraph_xobj_id
+                    )
+                )
+                source_font = get_font(style.font_id, char_xobj)
+                target_value, target_font = resolve_unicode(source_font, value)
+                if target_value is None:
+                    return TypesettingUnit(char=char)
+                return TypesettingUnit(
+                    unicode=target_value,
+                    font=target_font,
+                    arabic_fallback_font=(self.font_mapper.arabic_fonts[0] if self.is_arabic else None),
+                    original_font=source_font,
+                    font_size=style.font_size,
+                    style=style,
+                    xobj_id=char_xobj,
+                    debug_info=getattr(paragraph, "debug_info", False) or False,
+                )
+            return TypesettingUnit(
+                char=char,
+                debug_info=getattr(paragraph, "debug_info", False) or False,
+            )
+
         for composition in paragraph.pdf_paragraph_composition:
             if composition is None:
                 continue
             if composition.pdf_line:
                 result.extend(
                     [
-                        TypesettingUnit(char=char)
+                        unit_from_source_char(char)
                         for char in composition.pdf_line.pdf_character
                     ],
                 )
             elif composition.pdf_character:
-                result.append(
-                    TypesettingUnit(
-                        char=composition.pdf_character,
-                        debug_info=paragraph.debug_info,
-                    ),
-                )
+                result.append(unit_from_source_char(composition.pdf_character))
             elif composition.pdf_same_style_characters:
                 result.extend(
                     [
-                        TypesettingUnit(char=char)
+                        unit_from_source_char(char)
                         for char in composition.pdf_same_style_characters.pdf_character
                     ],
                 )
@@ -1516,34 +7723,130 @@ class Typesetting:
                         f"Paragraph: {paragraph}. ",
                     )
                     continue
-                font = get_font(font_id, paragraph.xobj_id)
+                font = get_font(font_id, paragraph_xobj_id)
                 if composition.pdf_same_style_unicode_characters.unicode:
-                    # Arabic shaping + bidi for RTL languages (single centralized pass)
                     unicode_text = composition.pdf_same_style_unicode_characters.unicode
-                    if self.lang_code.startswith("en-ar"):
-                        from babeldoc.format.pdf.document_il.utils.rtl import apply_arabic_shaping_to_text
-                        unicode_text = apply_arabic_shaping_to_text(unicode_text, self.lang_code, debug_print=False)
-                    result.extend(
-                        [
-                            TypesettingUnit(
-                                unicode=char_unicode,
-                                font=self.font_mapper.map(
-                                    font,
-                                    char_unicode,
-                                ),
-                                original_font=font,
-                                font_size=style.font_size,
-                                style=style,
-                                xobj_id=paragraph.xobj_id,
-                                debug_info=composition.pdf_same_style_unicode_characters.debug_info
-                                or False,
-                            )
-                            for char_unicode in unicode_text
-                            if char_unicode not in ("\n",)
-                        ],
+                    preflight_font = (
+                        (self.font_mapper.map(font, "\u0627") or self.font_mapper.arabic_fonts[0])
+                        if self.is_arabic
+                        else font
                     )
+                    self._preflight_arabic_run(unicode_text, preflight_font)
+                    shaped_text = self.shape_arabic_text(unicode_text)
+                    optical_factor = 1.08 if self.is_arabic else 1.0
+                    target_font_size = self._arabic_publication_font_size(
+                        paragraph,
+                        style.font_size * optical_factor,
+                        centered_display=centered_display,
+                    )
+                    pending_no_break = False
+                    for char_unicode in shaped_text:
+                        if char_unicode in "\r\n":
+                            if char_unicode == "\n":
+                                result.append(TypesettingUnit(forced_line_break=True))
+                            pending_no_break = False
+                            continue
+                        if char_unicode == "\u2060":
+                            if result:
+                                result[-1].no_break_after = True
+                            pending_no_break = True
+                        target_value, target_font = resolve_unicode(font, char_unicode)
+                        if target_value is None:
+                            continue
+                        new_tu = TypesettingUnit(
+                            unicode=target_value,
+                            font=target_font,
+                            arabic_fallback_font=(self.font_mapper.arabic_fonts[0] if self.is_arabic else None),
+                            original_font=font,
+                            # Contact rectangles in older PDFs commonly
+                            # inherit a tiny label font.  A translated card
+                            # is a field block and must remain readable.
+                            font_size=max(
+                                target_font_size,
+                                11.5 if "contact_card" in (paragraph.layout_label or "").lower() else 0.0,
+                            ),
+                            style=style,
+                            xobj_id=paragraph_xobj_id,
+                            debug_info=composition.pdf_same_style_unicode_characters.debug_info or False,
+                        )
+                        if pending_no_break:
+                            new_tu.can_break_line_cache = False
+                            if char_unicode != "\u2060":
+                                pending_no_break = False
+                        result.append(new_tu)
             elif composition.pdf_formula:
-                result.extend([TypesettingUnit(formular=composition.pdf_formula)])
+                formula_chars = composition.pdf_formula.pdf_character or []
+                has_pua_bullet = any(
+                    char.char_unicode
+                    and len(char.char_unicode) == 1
+                    and 0xE000 <= ord(char.char_unicode) <= 0xF8FF
+                    for char in formula_chars
+                )
+                has_arabic_glyph = any(
+                    char.char_unicode
+                    and len(char.char_unicode) == 1
+                    and (
+                        0x0600 <= ord(char.char_unicode) <= 0x06FF
+                        or 0x0750 <= ord(char.char_unicode) <= 0x077F
+                        or 0x08A0 <= ord(char.char_unicode) <= 0x08FF
+                        or 0xFB50 <= ord(char.char_unicode) <= 0xFDFF
+                        or 0xFE70 <= ord(char.char_unicode) <= 0xFEFF
+                    )
+                    for char in formula_chars
+                )
+                formula_has_graphics = bool(
+                    composition.pdf_formula.pdf_curve or composition.pdf_formula.pdf_form
+                )
+                if has_pua_bullet and all(
+                    not char.char_unicode
+                    or char.char_unicode.isspace()
+                    or (
+                        len(char.char_unicode) == 1
+                        and 0xE000 <= ord(char.char_unicode) <= 0xF8FF
+                    )
+                    for char in formula_chars
+                ):
+                    result.extend(unit_from_source_char(char) for char in formula_chars)
+                elif has_arabic_glyph and not formula_has_graphics:
+                    # Text-only formulas are layout-parser false positives.
+                    # Retype them so shaped Arabic never falls back to Source Han.
+                    result.extend(unit_from_source_char(char) for char in formula_chars)
+                else:
+                    # A genuine formula may also contain Arabic labels and
+                    # presentation forms alongside its preserved graphics.
+                    # Keep its geometry, but remap those characters to the
+                    # embedded Arabic font instead of rendering .notdef from
+                    # the source serif font.
+                    if has_arabic_glyph:
+                        for char in formula_chars:
+                            value = char.char_unicode or ""
+                            if not (
+                                len(value) == 1
+                                and (
+                                    0x0600 <= ord(value) <= 0x06FF
+                                    or 0x0750 <= ord(value) <= 0x077F
+                                    or 0x08A0 <= ord(value) <= 0x08FF
+                                    or 0xFB50 <= ord(value) <= 0xFDFF
+                                    or 0xFE70 <= ord(value) <= 0xFEFF
+                                )
+                                and char.pdf_style
+                            ):
+                                continue
+                            char_xobj = (
+                                char.xobj_id
+                                if char.xobj_id is not None
+                                else paragraph_xobj_id
+                            )
+                            source_font = get_font(char.pdf_style.font_id, char_xobj)
+                            target_value, target_font = resolve_unicode(source_font, value)
+                            if target_value is None:
+                                continue
+                            style = copy.copy(char.pdf_style)
+                            style.font_id = target_font.font_id
+                            char.pdf_style = style
+                            char.char_unicode = target_value
+                            char.pdf_character_id = target_font.has_glyph(ord(target_value))
+                    result.extend([TypesettingUnit(formular=composition.pdf_formula)])
             else:
                 logger.error(
                     f"Unknown composition type. "
@@ -1551,36 +7854,38 @@ class Typesetting:
                     f"Paragraph: {paragraph}. ",
                 )
                 continue
-        result = list(
-            filter(
-                lambda x: x.unicode is None or x.font is not None,
-                result,
-            ),
-        )
+        unresolved = [unit for unit in result if unit.unicode is not None and unit.font is None]
+        if unresolved:
+            message = (
+                f"Unresolved target glyphs in paragraph {getattr(paragraph, 'debug_id', None) or '<unknown>'}: "
+                + ", ".join(repr(unit.unicode) for unit in unresolved[:8])
+            )
+            logger.error(message)
+            raise RuntimeError(message)
 
         if any(x.width < 0 for x in result):
-            logger.warning("有排版单元宽度小于 0，请检查字体映射是否正确。")
+            logger.warning("Typesetting unit width is less than 0, please check if positioning is incorrect or if text is being drawn in reverse")
         return result
 
     def create_passthrough_composition(
         self,
         typesetting_units: list[TypesettingUnit],
     ) -> list[PdfParagraphComposition]:
-        """从排版单元创建直接传递的段落组合。
+        """Create passthrough composition from typesetting units - used when all units can be directly passed through
 
         Args:
-            typesetting_units: 排版单元列表
+            typesetting_units: List of typesetting units
 
         Returns:
-            段落组合列表
+            Paragraph composition list
         """
         composition = []
         for unit in typesetting_units:
             if unit.formular:
-                # 对于公式单元，直接创建包含完整公式的组合
+                # For formula units, directly create PdfParagraphComposition containing the formula object
                 composition.append(PdfParagraphComposition(pdf_formula=unit.formular))
             else:
-                # 对于字符单元，使用原有逻辑
+                # For character units, use existing logic to passthrough
                 chars, curves, forms = unit.passthrough()
                 composition.extend(
                     [PdfParagraphComposition(pdf_character=char) for char in chars],
@@ -1588,23 +7893,23 @@ class Typesetting:
         return composition
 
     def get_max_right_space(self, current_box: Box, page) -> float:
-        """获取段落右侧最大可用空间
+        """Get the maximum right space available next to the current paragraph
 
         Args:
-            current_box: 当前段落的边界框
-            page: 当前页面
+            current_box: Current paragraph bounding box
+            page: Current page
 
         Returns:
-            可以扩展到的最大 x 坐标
+            Maximum available right edge x position
         """
-        # 获取页面的裁剪框作为初始最大限制
+        # Get page's right margin as the upper limit
         max_x = page.cropbox.box.x2 * 0.9
 
-        # 检查所有可能的阻挡元素
+        # Check for content on the right side that may interfere
         for para in page.pdf_paragraph:
-            if para.box == current_box or para.box is None:  # 跳过当前段落
+            if para.box == current_box or para.box is None:  # Skip current paragraph
                 continue
-            # 只考虑在当前段落右侧且有垂直重叠的元素
+            # If the paragraph is on the right side of current paragraph and their vertical ranges overlap
             if para.box.x > current_box.x and not (
                 para.box.y >= current_box.y2 or para.box.y2 <= current_box.y
             ):
@@ -1614,7 +7919,7 @@ class Typesetting:
                 char.box.y >= current_box.y2 or char.box.y2 <= current_box.y
             ):
                 max_x = min(max_x, char.box.x)
-        # 检查图形
+        # Check figures
         for figure in page.pdf_figure:
             if figure.box.x > current_box.x and not (
                 figure.box.y >= current_box.y2 or figure.box.y2 <= current_box.y
@@ -1623,24 +7928,53 @@ class Typesetting:
 
         return max_x
 
-    def get_max_bottom_space(self, current_box: Box, page: il_version_1.Page) -> float:
-        """获取段落下方最大可用空间
+    def get_max_bottom_space(
+        self,
+        current_box: Box,
+        page: il_version_1.Page,
+        *,
+        paragraph: il_version_1.PdfParagraph | None = None,
+    ) -> float:
+        """Get the maximum bottom space available below the current paragraph.
 
         Args:
-            current_box: 当前段落的边界框
-            page: 当前页面
+            current_box: Current paragraph bounding box
+            page: Current page
+            paragraph: Optional paragraph being laid out, for zone-aware floor limits
 
         Returns:
-            可以扩展到的最小 y 坐标
+            Maximum available bottom edge y position
         """
-        # 获取页面的裁剪框作为初始最小限制
-        min_y = page.cropbox.box.y * 1.1
+        zones = self._get_page_vertical_zones(page)
+        if paragraph is not None and self._is_bottom_fixed_paragraph(paragraph, page):
+            if self._is_footnote_paragraph(paragraph):
+                min_y = zones["content_floor"]
+            else:
+                min_y = zones["crop_y"] + 4.0
+        else:
+            # Reserve page bottom margin, running footers, and the footnote band.
+            min_y = zones["body_floor"]
 
-        # 检查所有可能的阻挡元素
+        # Fixed/ruled or preserved irregular table cells must stay inside their own row floor
+        # instead of expanding downward into empty sibling slots or the next table row.
+        if paragraph is not None and self._is_fixed_table_paragraph(paragraph):
+            lbl = (paragraph.layout_label or "").lower()
+            trace = paragraph.pipeline_trace or {}
+            if "fixed" in lbl or trace.get("preserve_irregular_table") or trace.get("anchored_numeric_columns"):
+                min_y = max(min_y, current_box.y)
+        if paragraph is not None and paragraph.layout_label == "form_row":
+            min_y = max(min_y, current_box.y)
+
+        if paragraph is not None:
+            enclosing = self._find_enclosing_region_box(paragraph, page)
+            if enclosing is not None:
+                min_y = max(min_y, enclosing.y + 1.5)
+
+        # Check for content below that may interfere
         for para in page.pdf_paragraph:
-            if para.box == current_box or para.box is None:  # 跳过当前段落
+            if para.box == current_box or para.box is None:  # Skip current paragraph
                 continue
-            # 只考虑在当前段落下方且有水平重叠的元素
+            # If the paragraph is below current paragraph and their horizontal ranges overlap
             if para.box.y2 < current_box.y and not (
                 para.box.x >= current_box.x2 or para.box.x2 <= current_box.x
             ):
@@ -1650,19 +7984,25 @@ class Typesetting:
                 char.box.x >= current_box.x2 or char.box.x2 <= current_box.x
             ):
                 min_y = max(min_y, char.box.y2)
-        # 检查图形
+        # Check figures and bitmap/XObject images
         for figure in page.pdf_figure:
             if figure.box.y2 < current_box.y and not (
                 figure.box.x >= current_box.x2 or figure.box.x2 <= current_box.x
             ):
                 min_y = max(min_y, figure.box.y2)
+        for form in getattr(page, "pdf_form", None) or []:
+            fbox = getattr(form, "box", None)
+            if fbox and fbox.y2 < current_box.y and not (
+                fbox.x >= current_box.x2 or fbox.x2 <= current_box.x
+            ):
+                min_y = max(min_y, fbox.y2)
 
         return min_y
 
     def _update_paragraph_render_order(self, paragraph: il_version_1.PdfParagraph):
         """
-        重新设置段落各字符的 render order
-        主 render order 等于 paragraph 的 renderorder，sub render order 从 1 开始自增
+        Update paragraph render order for child characters.
+        From render order = paragraph's render order, sub render order starts from 1
         """
         if not hasattr(paragraph, "render_order") or paragraph.render_order is None:
             return
@@ -1670,9 +8010,9 @@ class Typesetting:
         main_render_order = paragraph.render_order
         sub_render_order = 1
 
-        # 遍历段落的所有组成部分
+        # Iterate through paragraph composition list
         for composition in paragraph.pdf_paragraph_composition:
-            # 检查单个字符
+            # Check for character and assign render order
             if composition.pdf_character:
                 char = composition.pdf_character
                 char.render_order = main_render_order

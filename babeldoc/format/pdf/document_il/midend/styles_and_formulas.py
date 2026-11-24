@@ -38,13 +38,29 @@ from babeldoc.format.pdf.document_il.utils.layout_helper import is_same_style
 from babeldoc.format.pdf.document_il.utils.spatial_analyzer import (
     is_element_contained_in_formula,
 )
+from babeldoc.format.pdf.document_il.utils.structured_tokens import (
+    QUANTITY_PATTERN,
+    _PAREN_QUANTITY_PATTERN,
+)
+from babeldoc.format.pdf.document_il.utils.web_references import iter_web_references
 from babeldoc.format.pdf.translation_config import TranslationConfig
+from babeldoc.translator.translator import _ATOMIC_EXPRESSION
+
+_LITERAL_NON_FORMULA_RE = re.compile(
+    rf"{QUANTITY_PATTERN}"
+    rf"|{_PAREN_QUANTITY_PATTERN}"
+    r"|[A-Za-z]:\\(?:[^\s\\/:*?\"<>|]+\\)*[^\s\\/:*?\"<>|]*[^\s\\/:*?\"<>|.,;:!?)\]]"
+    r"|(?<![A-Za-z0-9_])(?:/|\.\.?/)[A-Za-z0-9._\-]+(?:/[A-Za-z0-9._\-]+)+/?"
+    r"|(?<![A-Za-z0-9_])[A-Za-z0-9][A-Za-z0-9._\-]*\.(?:pdf|xlsx?|csv|tsv|json|ya?ml|xml|html?|sql|py|sh|txt|md|docx?|pptx?|png|jpe?g|svg|zip|tar\.gz|log|ini|cfg|env)\b"
+    r"|\b[A-Za-z0-9]+(?:_[A-Za-z0-9]+)+\b"
+)
 
 
 class StylesAndFormulas:
     stage_name = "Parse Formulas and Styles"
 
     def __init__(self, translation_config: TranslationConfig):
+        self.detailed_logger = None
         self.translation_config = translation_config
         self.font_mapper = FontMapper(translation_config)
 
@@ -52,6 +68,8 @@ class StylesAndFormulas:
         update_formula_data(formula)
 
     def process(self, document: Document):
+        if self.detailed_logger:
+            self.detailed_logger.log_step("Formula and Style Detection Started")
         with self.translation_config.progress_monitor.stage_start(
             self.stage_name,
             len(document.page),
@@ -60,6 +78,19 @@ class StylesAndFormulas:
                 self.translation_config.raise_if_cancelled()
                 self.process_page(page)
                 pbar.advance()
+                
+        if self.detailed_logger:
+            formula_count = sum(
+                sum(1 for comp in para.pdf_paragraph_composition if hasattr(comp, 'pdf_formula') and comp.pdf_formula)
+                for page in document.page
+                for para in page.pdf_paragraph
+                if hasattr(page, 'pdf_paragraph')
+            )
+            
+            self.detailed_logger.log_step(
+                "Formula and Style Detection Complete",
+                f"Total formulas detected: {formula_count}"
+            )
 
     def update_all_formula_data(self, page: Page):
         for para in page.pdf_paragraph:
@@ -394,6 +425,8 @@ class StylesAndFormulas:
         formula_font_ids: set[int],
         first_is_bullet_so_far: bool,
         line_index: int,
+        web_reference_chars: set[int] | None = None,
+        chemical_expression_chars: set[int] | None = None,
     ) -> tuple[list[tuple[PdfCharacter, bool]], bool]:
         """
         Phase 1: Classify every character in a composition as either formula or text.
@@ -413,6 +446,16 @@ class StylesAndFormulas:
 
         # Determine the `is_formula` tag for each character
         for i, char in enumerate(line.pdf_character):
+            if web_reference_chars and id(char) in web_reference_chars:
+                is_formula_tags.append(False)
+                corner_mark_info.append(False)
+                in_formula_state = in_corner_mark_state = False
+                continue
+            if chemical_expression_chars and id(char) in chemical_expression_chars:
+                is_formula_tags.append(True)
+                corner_mark_info.append(False)
+                in_formula_state, in_corner_mark_state = True, False
+                continue
             # The original logic for `first_is_bullet`: it is set if any segment starts with a bullet.
             # A "segment" started when `current_chars` was empty.
             # We determine the start of a segment by looking at the previous char's tag.
@@ -450,10 +493,15 @@ class StylesAndFormulas:
                 )
                 or (
                     # 如果字符的视觉框和实际框不一致，则认为是公式字符
-                    char.box.x > char.visual_bbox.box.x2
-                    or char.box.x2 < char.visual_bbox.box.x
-                    or char.box.y > char.visual_bbox.box.y2
-                    or char.box.y2 < char.visual_bbox.box.y
+                    # Underscores naturally draw below the baseline in standard text fonts
+                    # and must not be turned into standalone formula boxes (<bN>).
+                    char.char_unicode != "_"
+                    and (
+                        char.box.x > char.visual_bbox.box.x2
+                        or char.box.x2 < char.visual_bbox.box.x
+                        or char.box.y > char.visual_bbox.box.y2
+                        or char.box.y2 < char.visual_bbox.box.y
+                    )
                 )
             )
 
@@ -462,11 +510,17 @@ class StylesAndFormulas:
                 line.pdf_character[i + 1] if i < len(line.pdf_character) - 1 else None
             )
             isspace = char.char_unicode.isspace() if char.char_unicode else False
+            prev_is_space = (
+                previous_char.char_unicode.isspace()
+                if previous_char and previous_char.char_unicode
+                else False
+            )
 
             is_corner_mark = (
                 (
                     previous_char is not None
                     and not isspace
+                    and not prev_is_space
                     and not first_is_bullet
                     # 角标字体，有 0.76 的角标和 0.799 的大写，这里用 0.79 取中，同时考虑首字母放大的情况
                     and char.pdf_style.font_size
@@ -476,6 +530,7 @@ class StylesAndFormulas:
                 or (
                     previous_char is not None
                     and not isspace
+                    and not prev_is_space
                     and not first_is_bullet
                     # 角标字体，有 0.76 的角标和 0.799 的大写，这里用 0.79 取中，同时考虑首字母放大的情况
                     and char.pdf_style.font_size
@@ -487,12 +542,54 @@ class StylesAndFormulas:
                     previous_char is None
                     and next_char is not None
                     and not isspace
+                    and not prev_is_space
                     and not first_is_bullet
                     # 当前字符字体大小明显小于下一个字符，判定为角标
                     and char.pdf_style.font_size < next_char.pdf_style.font_size * 0.79
                     and not in_corner_mark_state
                 )
             )
+
+            # Superscripted English ordinal suffixes (1st, 2nd, 3rd, 4th, 23rd, 29th)
+            # in Word-generated PDFs use smaller font sizes (< 0.79x), which would
+            # otherwise be misclassified as mathematical corner-mark formulas (<b1>).
+            if is_corner_mark and (char.char_unicode or "") == "/":
+                prev_u = (previous_char.char_unicode or "") if previous_char else ""
+                tail_u = "".join(
+                    (c.char_unicode or "") for c in line.pdf_character[i:] if c.char_unicode
+                ).split()[0] if i < len(line.pdf_character) else ""
+                if (
+                    prev_u.isascii()
+                    and prev_u.isupper()
+                    and re.fullmatch(r"/[A-Za-z0-9][A-Za-z0-9./\-]{2,}", tail_u)
+                ):
+                    is_corner_mark = False
+
+            if is_corner_mark and (char.char_unicode or "").isascii() and (char.char_unicode or "").isalpha():
+                prev_u = (previous_char.char_unicode or "") if previous_char else ""
+                next_u = (next_char.char_unicode or "") if next_char else ""
+                prev2_u = (
+                    (line.pdf_character[i - 2].char_unicode or "")
+                    if i >= 2 and line.pdf_character[i - 2]
+                    else ""
+                )
+                after_next_u = (
+                    (line.pdf_character[i + 2].char_unicode or "")
+                    if i + 2 < len(line.pdf_character) and line.pdf_character[i + 2]
+                    else ""
+                )
+                pair_start = (char.char_unicode + next_u).lower()
+                pair_end = (prev_u + char.char_unicode).lower()
+                if (
+                    prev_u.isdigit()
+                    and pair_start in {"st", "nd", "rd", "th"}
+                    and (not after_next_u or not after_next_u.isalpha())
+                ) or (
+                    prev2_u.isdigit()
+                    and pair_end in {"st", "nd", "rd", "th"}
+                    and (not next_u or not next_u.isalpha())
+                ):
+                    is_corner_mark = False
 
             is_formula = is_formula or is_corner_mark
 
@@ -582,6 +679,49 @@ class StylesAndFormulas:
             else:
                 current_formula_font_ids = page_level_formula_font_ids
 
+            # URL, path, filename, identifier, and signed-quantity punctuation
+            # ('=', '_', '/', '−', '+') is literal text. Scan across source lines
+            # before classifying those glyphs as standalone formula operators.
+            source_parts = []
+            char_ids: list[int | None] = []
+            char_by_id: dict[int, PdfCharacter] = {}
+            for composition in paragraph.pdf_paragraph_composition:
+                if composition.pdf_line:
+                    for char in composition.pdf_line.pdf_character:
+                        value = char.char_unicode or " "
+                        source_parts.append(value)
+                        cid = id(char)
+                        char_by_id[cid] = char
+                        char_ids.extend([cid] * len(value))
+                source_parts.append("\n" if composition.pdf_line else "<>")
+                char_ids.extend([None] * len(source_parts[-1]))
+            source_text = "".join(source_parts)
+            web_reference_chars = {
+                char_id
+                for start, end, _ in iter_web_references(source_text)
+                for char_id in char_ids[start:end]
+                if char_id is not None
+            }
+            for match in _LITERAL_NON_FORMULA_RE.finditer(source_text):
+                span_ids = [
+                    cid for cid in char_ids[match.start():match.end()] if cid is not None
+                ]
+                if span_ids and all(
+                    not char_by_id[cid].formula_layout_id
+                    and (
+                        char_by_id[cid].pdf_style is None
+                        or char_by_id[cid].pdf_style.font_id not in current_formula_font_ids
+                    )
+                    for cid in span_ids
+                ):
+                    web_reference_chars.update(span_ids)
+            chemical_expression_chars = {
+                char_id
+                for match in _ATOMIC_EXPRESSION.finditer(source_text)
+                for char_id in char_ids[match.start():match.end()]
+                if char_id is not None
+            }
+
             new_paragraph_compositions = []
             # This flag is carried through all compositions in a paragraph, as in the original implementation.
             first_is_bullet = False
@@ -597,6 +737,8 @@ class StylesAndFormulas:
                     current_formula_font_ids,
                     first_is_bullet,
                     line_index,
+                    web_reference_chars,
+                    chemical_expression_chars,
                 )
 
                 if not tagged_chars:
@@ -947,7 +1089,10 @@ class StylesAndFormulas:
         text = "".join(char.char_unicode for char in formula.pdf_character)
         if formula.y_offset > 0.1:
             return False
-        return bool(re.match(r"^[0-9, .]+$", text))
+        return bool(
+            re.match(r"^(?:[<>≤≥=±]\s*)?[+\-\u2212]?\s*[0-9, .()]+$", text.strip())
+            and any(ch.isdigit() for ch in text)
+        )
 
     def should_split_formula(self, formula: PdfFormula) -> bool:
         """判断公式是否需要按逗号拆分（包含逗号且有其他特殊符号）"""

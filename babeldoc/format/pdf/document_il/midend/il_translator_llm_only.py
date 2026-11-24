@@ -32,6 +32,7 @@ from babeldoc.format.pdf.document_il.utils.paragraph_helper import (
 from babeldoc.format.pdf.translation_config import TranslationConfig
 from babeldoc.translator.translator import BaseTranslator
 from babeldoc.utils.priority_thread_pool_executor import PriorityThreadPoolExecutor
+from arabic_reshaper import reshape
 
 logger = logging.getLogger(__name__)
 
@@ -40,9 +41,11 @@ class BatchParagraph:
     def __init__(
         self,
         paragraphs: list[PdfParagraph],
+        pages: list[Page],
         page_tracker: PageTranslateTracker,
     ):
         self.paragraphs = paragraphs
+        self.pages = pages
         self.trackers = [page_tracker.new_paragraph() for _ in paragraphs]
 
 
@@ -55,6 +58,7 @@ class ILTranslatorLLMOnly:
         translation_config: TranslationConfig,
         tokenizer=None,
     ):
+        self.detailed_logger = None  # Will be set from high_level.py
         self.translate_engine = translate_engine
         self.translation_config = translation_config
         self.font_mapper = FontMapper(translation_config)
@@ -88,8 +92,137 @@ class ILTranslatorLLMOnly:
         self.ok_count = 0
         self.fallback_count = 0
         self.total_count = 0
+    
+    def shape_arabic_text(self, text: str) -> str:
+        """Shape Arabic text for proper glyph joining (ligatures, contextual forms).
+
+        IMPORTANT: This function only applies arabic_reshaper for character joining.
+        It does NOT apply bidi get_display() reordering, because the PDF layout engine
+        handles character positioning via explicit (x,y) coordinates.
+
+        Args:
+            text: Input text to shape
+
+        Returns:
+            Shaped text if language is Arabic, original text otherwise
+        """
+        if not text:
+            return text
+
+        # Robust Arabic output detection
+        lang_out = (self.translation_config.lang_out or "").lower()
+        is_arabic = False
+        if lang_out in ("en-ar", "ar", "ara", "arabic"):
+            is_arabic = True
+        elif "-ar" in lang_out or "->ar" in lang_out or "/ar" in lang_out:
+            is_arabic = True
+
+        if is_arabic:
+            logger.debug("Shaping Arabic text (reshape only, no bidi reorder)")
+            try:
+                if not re.search(r'[\uFB50-\uFDFF\uFE70-\uFEFF]', text):
+                    from arabic_reshaper import ArabicReshaper
+                    configuration = {
+                        'delete_harakat': False,
+                        'support_ligatures': True,
+                        'RIAL SIGN': True,
+                        'ARABIC COMMA': True,
+                        'ARABIC SEMICOLON': True,
+                        'ARABIC QUESTION MARK': True,
+                        'ZWNJ': True,
+                    }
+                    reshaper = ArabicReshaper(configuration=configuration)
+                    reshaped_text = reshaper.reshape(text)
+                    # DO NOT call get_display() - PDF layout engine handles positioning
+                    return reshaped_text
+                else:
+                    return text
+            except Exception as e:
+                logger.warning(f"Failed to shape Arabic text: {e}")
+                return text
+
+        return text
+
+    def _normalize_arabic_output(self, text: str) -> str:
+        """Post-translation normalization for Arabic text.
+
+        Fixes:
+        - Inconsistent percent signs (% vs ٪)
+        - Stray periods around percent signs (e.g. '5.7 .٪' -> '5.7 ٪.')
+        - Compound tokens like Q4-2022
+        - Phonetic table header translations (يـو يـو -> Y-o-Y)
+        - Petroleum economic terminology (الزيت -> النفط for sector labels)
+        - Currency unit standardization (QR / كرو -> ريال قطري)
+        - Financial mistranslations cleanup (bps, bbl, repo rate)
+        - Chart and chapter reference cleanup (الشريط -> المخطط)
+        - Atomic parenthetical acronym protection with LRM
+        - Latin acronyms/numbers spacing around Arabic text
+        """
+        if not text:
+            return text
+
+        lang_out = (self.translation_config.lang_out or "").lower()
+        is_arabic = any(marker in lang_out for marker in ["ar", "arabic", "ara"])
+        if not is_arabic:
+            return text
+
+        # 1. Normalize percent signs: replace Western % with Arabic ٪
+        text = text.replace('%', '\u066A')  # U+066A = Arabic percent sign ٪
+
+        # 2. Fix stray periods around percent signs (e.g. "8.6 .٪" -> "8.6٪.", ".٪ 8.6" -> "8.6٪.")
+        text = re.sub(r'\.\s*(\u066A)\s*(\d+(?:[,.]\d+)?)', r'\2\1.', text)
+        text = re.sub(r'(\d+(?:[,.]\d+)?)\s*\.\s*(\u066A)', r'\1\2.', text)
+        text = re.sub(r'(\d+(?:[,.]\d+)?)\s*(\u066A)\s*\.', r'\1\2.', text)
+        text = re.sub(r'(\d+(?:[,.]\d+)?)\s+(\u066A)', r'\1\2', text)
+
+        # 3. Compound alphanumeric tokens: preserve Q4-2022 as an atomic token
+        text = re.sub(r'\bQ\s*([1-4])\s*[-–—]\s*(\d{4})\b', r'Q\1-\2', text)
+
+        # 5. Petroleum terminology: standardize oil/non-oil sector labels
+        text = re.sub(r'\bغير\s+الزيت\b', 'غير النفط', text)
+        text = re.sub(r'\bالزيت\s+غير\b', 'غير النفط', text)
+        text = re.sub(r'\bقطاع\s+الزيت\b', 'قطاع النفط', text)
+        text = re.sub(r'\bالقطاع\s+الزيتي\b', 'قطاع النفط', text)
+        if text.strip().lower() == 'oil':
+            text = 'النفط'
+
+        # 6. Currency standardization: eliminate كرو / sporadic QR
+        text = re.sub(r'\bمليارات\s+(?:الكرو|كرو)\b', 'مليارات الريالات القطرية', text)
+        text = re.sub(r'\b(?:الكرو|كرو)\s+مليون\b', 'مليون ريال قطري', text)
+        text = re.sub(r'\bمليون\s+(?:الكرو|كرو)\b', 'مليون ريال قطري', text)
+        text = re.sub(r'\b(?:الكرو|كرو)\b', 'ريال قطري', text)
+        text = re.sub(r'\bمليارات\s+QR\b', 'مليار ريال قطري', text)
+        text = re.sub(r'\bQR\s*(\d+(?:[,.]\d+)?)', r'\1 ريال قطري', text)
+        text = re.sub(r'(\d+(?:[,.]\d+)?)\s*QR\b', r'\1 ريال قطري', text)
+        text = re.sub(r'\bمليارات\s+الدولارات\b', 'مليارات الريالات القطرية', text)
+
+        # 7. Financial unit mistranslations cleanup
+        text = re.sub(r'\bبيليومتر\b', 'برميل', text)
+        text = re.sub(r'\bنقاط\s+(?:أوروبية|أرضية|أوراق)\b', 'نقطة أساس', text)
+        text = re.sub(r'\bإعادة\s+التأمين\b', 'سعر الريبو', text)
+
+        # 8. Structural reference preservation (Chart / Chapter / Table)
+        text = re.sub(r'\b(?:الشريط|شريط)\s+(\d+[-–—]\d+)', r'المخطط \1', text)
+        text = re.sub(r'\bCHAPTER\s+(\d+)', r'الفصل \1', text, flags=re.I)
+        text = re.sub(r'\bTable\s+(\d+[-–—]\d+)', r'الجدول \1', text, flags=re.I)
+        text = re.sub(r'\bChart\s+(\d+[-–—]\d+)', r'المخطط \1', text, flags=re.I)
+
+        # 9. Wrap Latin parenthetical acronyms with Left-to-Right Mark (\u200E) to preserve BiDi order
+        text = re.sub(r'\([A-Z0-9]{2,}\)', lambda m: f'\u200E{m.group(0)}\u200E', text)
+
+        # 10. Insert spaces at Arabic letters ↔ Latin/digit script boundaries (excluding Arabic percent sign \u066A)
+        ar_letters = r'[\u0621-\u064A\u066E-\u06D3\u06D5\uFB50-\uFDFF\uFE70-\uFEFF]'
+        text = re.sub(rf'({ar_letters})([A-Za-z0-9])', r'\1 \2', text)
+        text = re.sub(rf'([A-Za-z0-9])({ar_letters})', r'\1 \2', text)
+
+        # 11. Collapse multiple spaces to single space
+        text = re.sub(r'  +', ' ', text).strip()
+
+        return text
 
     def calc_token_count(self, text: str) -> int:
+        if text is None:  # ADD THIS LINE
+            return 0       # ADD THIS LINE
         try:
             return len(self.tokenizer.encode(text, disallowed_special=()))
         except Exception:
@@ -112,6 +245,7 @@ class ILTranslatorLLMOnly:
         return None
 
     def translate(self, docs: Document) -> None:
+        self.il_translator.docs = docs
         tracker = DocumentTranslateTracker()
         self.mid = 0
 
@@ -190,7 +324,7 @@ class ILTranslatorLLMOnly:
         )
 
     def _is_body_text_paragraph(self, paragraph: PdfParagraph) -> bool:
-        """判断正文段落（当前仅 layout_label == 'text'）。
+        """åˆ¤æ–­æ­£æ–‡æ®µè½ï¼ˆå½“å‰ä»… layout_label == 'text'ï¼‰ã€‚
 
         Args:
             paragraph: PDF paragraph to check
@@ -361,8 +495,9 @@ class ILTranslatorLLMOnly:
 
             # Create batch with both paragraphs
             cross_page_paragraphs = [last_curr_paragraph, first_next_paragraph]
+            cross_page_pages = [page_curr, page_next]
             batch_paragraph = BatchParagraph(
-                cross_page_paragraphs, tracker.new_cross_page()
+                cross_page_paragraphs, cross_page_pages, tracker.new_cross_page()
             )
 
             self.mid += 1
@@ -438,7 +573,7 @@ class ILTranslatorLLMOnly:
                 p1.unicode
             ) + self.calc_token_count(p2.unicode)
 
-            batch = BatchParagraph([p1, p2], tracker.new_cross_column())
+            batch = BatchParagraph([p1, p2], [page, page], tracker.new_cross_column())
             self.mid += 1
             executor.submit(
                 self.translate_paragraph,
@@ -495,7 +630,7 @@ class ILTranslatorLLMOnly:
                 continue
 
             # Check minimum length - advance progress bar if filtered out
-            if len(paragraph.unicode) < self.translation_config.min_text_length:
+            if not paragraph.unicode or len(paragraph.unicode) < self.translation_config.min_text_length:
                 if pbar:
                     pbar.advance(1)
                 continue
@@ -520,28 +655,33 @@ class ILTranslatorLLMOnly:
                 )
 
             if total_token_count > 200 or len(paragraphs) > 5:
-                self.mid += 1
-                executor.submit(
-                    self.translate_paragraph,
-                    BatchParagraph(paragraphs, tracker),
-                    pbar,
-                    page_font_map,
-                    page_xobj_font_map,
-                    self.translation_config.shared_context_cross_split_part.first_paragraph,
-                    self.translation_config.shared_context_cross_split_part.recent_title_paragraph,
-                    executor2,
-                    priority=1048576 - total_token_count,
-                    paragraph_token_count=total_token_count,
-                    mp_id=self.mid,
-                )
-                paragraphs = []
-                total_token_count = 0
+                    if self.detailed_logger:
+                        self.detailed_logger.log_memory_batch(
+                            f"Submitting batch (tokens: {total_token_count})",
+                            [p.unicode[:100] for p in paragraphs if hasattr(p, 'unicode')]
+                        )
+            self.mid += 1
+            executor.submit(
+                self.translate_paragraph,
+                BatchParagraph(paragraphs, [page] * len(paragraphs), tracker),
+                pbar,
+                page_font_map,
+                page_xobj_font_map,
+                self.translation_config.shared_context_cross_split_part.first_paragraph,
+                self.translation_config.shared_context_cross_split_part.recent_title_paragraph,
+                executor2,
+                priority=1048576 - total_token_count,
+                paragraph_token_count=total_token_count,
+                mp_id=self.mid,
+            )
+            paragraphs = []
+            total_token_count = 0
 
         if paragraphs:
             self.mid += 1
             executor.submit(
                 self.translate_paragraph,
-                BatchParagraph(paragraphs, tracker),
+                BatchParagraph(paragraphs, [page] * len(paragraphs), tracker),
                 pbar,
                 page_font_map,
                 page_xobj_font_map,
@@ -554,394 +694,454 @@ class ILTranslatorLLMOnly:
             )
 
     def translate_paragraph(
-        self,
-        batch_paragraph: BatchParagraph,
-        pbar: tqdm | None = None,
-        page_font_map: dict[str, PdfFont] = None,
-        xobj_font_map: dict[int, dict[str, PdfFont]] = None,
-        title_paragraph: PdfParagraph | None = None,
-        local_title_paragraph: PdfParagraph | None = None,
-        executor: PriorityThreadPoolExecutor | None = None,
-        paragraph_token_count: int = 0,
-        mp_id: int = 0,
-    ):
-        """Translate a paragraph using pre and post processing functions."""
-        self.translation_config.raise_if_cancelled()
-        should_translate_paragraph = []
-        try:
-            inputs = []
-            llm_translate_trackers = []
-            paragraph_unicodes = []
-            for i in range(len(batch_paragraph.paragraphs)):
-                paragraph = batch_paragraph.paragraphs[i]
-                tracker = batch_paragraph.trackers[i]
-                text, translate_input = self.il_translator.pre_translate_paragraph(
-                    paragraph, tracker, page_font_map, xobj_font_map
+            self,
+            batch_paragraph: BatchParagraph,
+            pbar: tqdm | None = None,
+            page_font_map: dict[str, PdfFont] = None,
+            xobj_font_map: dict[int, dict[str, PdfFont]] = None,
+            title_paragraph: PdfParagraph | None = None,
+            local_title_paragraph: PdfParagraph | None = None,
+            executor: PriorityThreadPoolExecutor | None = None,
+            paragraph_token_count: int = 0,
+            mp_id: int = 0,
+        ):
+            """Translate a paragraph using pre and post processing functions."""
+            logger.info(f"translate_paragraph called with {len(batch_paragraph.paragraphs)} paragraphs")
+            logger.info(f"Language out: {self.translation_config.lang_out}")
+            
+            # Log the start of translation batch
+            if hasattr(self, 'detailed_logger') and self.detailed_logger:
+                original_texts = [p.unicode for p in batch_paragraph.paragraphs if hasattr(p, 'unicode') and p.unicode]
+                self.detailed_logger.log_step(
+                    f"Translation Batch {mp_id} Started",
+                    data={
+                        'batch_size': len(batch_paragraph.paragraphs),
+                        'token_count': paragraph_token_count,
+                        'sample_texts': original_texts[:3] if original_texts else []  # First 3 texts
+                    }
                 )
-                if text is None:
-                    pbar.advance(1)
-                    continue
-
-                tracker.record_multi_paragraph_id(mp_id)
-
-                llm_translate_tracker = tracker.new_llm_translate_tracker()
-                should_translate_paragraph.append(i)
-                llm_translate_trackers.append(llm_translate_tracker)
-                inputs.append(
-                    (
-                        text,
-                        translate_input,
-                        paragraph,
-                        tracker,
-                        llm_translate_tracker,
-                        paragraph_unicodes,
+            
+            self.translation_config.raise_if_cancelled()
+            should_translate_paragraph = []
+            try:
+                inputs = []
+                llm_translate_trackers = []
+                paragraph_unicodes = []
+                for i in range(len(batch_paragraph.paragraphs)):
+                    paragraph = batch_paragraph.paragraphs[i]
+                    tracker = batch_paragraph.trackers[i]
+                    text, translate_input = self.il_translator.pre_translate_paragraph(
+                        paragraph, tracker, page_font_map, xobj_font_map
                     )
+                    if text is None:
+                        pbar.advance(1)
+                        continue
+
+                    tracker.record_multi_paragraph_id(mp_id)
+
+                    llm_translate_tracker = tracker.new_llm_translate_tracker()
+                    should_translate_paragraph.append(i)
+                    llm_translate_trackers.append(llm_translate_tracker)
+                    inputs.append(
+                        (
+                            text,
+                            translate_input,
+                            paragraph,
+                            tracker,
+                            llm_translate_tracker,
+                            paragraph_unicodes,
+                        )
+                    )
+                    paragraph_unicodes.append(paragraph.unicode)
+                if not inputs:
+                    return
+                json_format_input = []
+
+                for id_, input_text in enumerate(inputs):
+                    ti: il_translator.ILTranslator.TranslateInput = input_text[1]
+                    tracker: ParagraphTranslateTracker = input_text[3]
+                    tracker.record_multi_paragraph_index(id_)
+                    placeholders_hint = ti.get_placeholders_hint()
+                    obj = {
+                        "id": id_,
+                        "input": input_text[0],
+                        "layout_label": input_text[2].layout_label,
+                    }
+                    if (
+                        placeholders_hint
+                        and self.translation_config.add_formula_placehold_hint
+                    ):
+                        obj["formula_placeholders_hint"] = placeholders_hint
+                    json_format_input.append(obj)
+
+                json_format_input_str = json.dumps(
+                    json_format_input, ensure_ascii=False, indent=2
                 )
-                paragraph_unicodes.append(paragraph.unicode)
-            if not inputs:
-                return
-            json_format_input = []
 
-            for id_, input_text in enumerate(inputs):
-                ti: il_translator.ILTranslator.TranslateInput = input_text[1]
-                tracker: ParagraphTranslateTracker = input_text[3]
-                tracker.record_multi_paragraph_index(id_)
-                placeholders_hint = ti.get_placeholders_hint()
-                obj = {
-                    "id": id_,
-                    "input": input_text[0],
-                    "layout_label": input_text[2].layout_label,
-                }
-                if (
-                    placeholders_hint
-                    and self.translation_config.add_formula_placehold_hint
-                ):
-                    obj["formula_placeholders_hint"] = placeholders_hint
-                json_format_input.append(obj)
+                # Start building the new prompt
+                llm_prompt_parts = []
 
-            json_format_input_str = json.dumps(
-                json_format_input, ensure_ascii=False, indent=2
-            )
+                # 1. #role
+                llm_prompt_parts.append("#role")
+                if self.translation_config.custom_system_prompt:
+                    llm_prompt_parts.append(self.translation_config.custom_system_prompt)
+                    llm_prompt_parts.append(
+                        "When translating, strictly follow the instructions below to ensure translation quality and preserve all formatting, tags, and placeholders:\n"
+                    )
+                else:
+                    llm_prompt_parts.append(
+                        f"You are a professional and reliable machine translation engine responsible for translating the input text into {self.translation_config.lang_out}.\n"
+                        "When translating, strictly follow the instructions below to ensure translation quality and preserve all formatting, tags, and placeholders:\n"
+                    )
 
-            # Start building the new prompt
-            llm_prompt_parts = []
-
-            # 1. #role
-            llm_prompt_parts.append("#role")
-            if self.translation_config.custom_system_prompt:
-                llm_prompt_parts.append(self.translation_config.custom_system_prompt)
-            else:
+                # 3. ## Strict Rules:
+                llm_prompt_parts.append("\n## Strict Rules:")
                 llm_prompt_parts.append(
-                    f"You are a professional and reliable machine translation engine responsible for translating the input text into {self.translation_config.lang_out}.\n"
-                    "When translating, strictly follow the instructions below to ensure translation quality and preserve all formatting, tags, and placeholders:\n"
+                    "1. Do NOT translate or alter any of the following elements:"
+                )
+                llm_prompt_parts.append(
+                    "    Style or HTML-like tags: e.g., <style id='1'>...</style>, <b>...</b>, <i>...</i>, <code>...</code>, etc."
+                )
+                llm_prompt_parts.append(
+                    "    Formula or variable placeholders enclosed in curly braces: e.g., {v3}, {equation_1}, {name}, etc."
+                )
+                llm_prompt_parts.append(
+                    "    Any other placeholders like [[...]], %%...%%, %s, %d, etc."
+                )
+                llm_prompt_parts.append(
+                    "2. Preserve the exact structure, position, and content of the above elements, do not modify spacing, punctuation, or formatting."
+                )
+                llm_prompt_parts.append(
+                    "3. If the input contains:Proper nouns, code, or non-translatable technical terms, retain them in the original form."
+                )
+                llm_prompt_parts.append(
+                    "4. If adjacent paragraphs are semantically coherent, you may appropriately adjust the word order, but you must keep the number of paragraphs unchanged and must not move placeholders from one paragraph to another."
                 )
 
-            # 2. ##Contextual Hints for Better Translation
-            contextual_hints_section: list[str] = []
-            hint_idx = 1
-            if title_paragraph:
-                contextual_hints_section.append(
-                    f"{hint_idx}. First title in full text: {title_paragraph.unicode}"
+                # 4. ## Input/Output Format:
+                llm_prompt_parts.append("\n## Input/Output Format:")
+                llm_prompt_parts.append(
+                    '1. You will receive a JSON object with entries containing "id" and "input" fields.'
                 )
-                hint_idx += 1
+                llm_prompt_parts.append(
+                    f'2. Your task is to translate the value of "input" into {self.translation_config.lang_out}, while applying the rules above.'
+                )
+                llm_prompt_parts.append(
+                    '3. Return a new JSON object with the same "id" and the translated "output" field.'
+                )
+                llm_prompt_parts.append(
+                    "Please return the translated json directly without wrapping ```json``` tag or include any additional information."
+                )
 
-            if local_title_paragraph:
-                is_different_from_global = True
+                # 5. ##example (Renumbered from 5 to 4)
+                llm_prompt_parts.append("\n## Example:")
+                llm_prompt_parts.append("Here is an example of the expected format:")
+                llm_prompt_parts.append("")  # Blank line
+                llm_prompt_parts.append("<example>")
+                llm_prompt_parts.append("```json")
+                llm_prompt_parts.append("Input:")
+                llm_prompt_parts.append("{")
+                llm_prompt_parts.append('    "id": 0,')
+                llm_prompt_parts.append(
+                    '    "input": "{v1}<style id=\'2\'>hello</style>,world!",'
+                )
+                llm_prompt_parts.append('    "layout_label": "list_item_hybrid"')
+                llm_prompt_parts.append("}")
+                llm_prompt_parts.append("```")
+                llm_prompt_parts.append("Output:")
+                llm_prompt_parts.append("```json")
+                llm_prompt_parts.append("{")
+                llm_prompt_parts.append('    "id": 0,')
+                llm_prompt_parts.append(
+                    '    "output": "{v1}<style id=\'2\'>Ã¤Â½ Ã¥Â¥Â½</style>Ã¯Â¼Å’Ã¤Â¸â€“Ã§â€¢Å’Ã¯Â¼"'
+                )
+                llm_prompt_parts.append("}")
+                llm_prompt_parts.append("```")
+                llm_prompt_parts.append("</example>")
+
+                # 2. ##Contextual Hints for Better Translation
+                contextual_hints_section: list[str] = []
+                hint_idx = 1
                 if title_paragraph:
-                    if local_title_paragraph.debug_id == title_paragraph.debug_id:
-                        is_different_from_global = False
-
-                if is_different_from_global:
                     contextual_hints_section.append(
-                        f"{hint_idx}. Most similar section title: {local_title_paragraph.unicode}"
+                        f"{hint_idx}. First title in full text: {title_paragraph.unicode}"
                     )
                     hint_idx += 1
 
-            # --- ADD GLOSSARY HINTS ---
-            batch_text_for_glossary_matching = "\n".join(
-                item.get("input", "") for item in json_format_input
-            )
+                if local_title_paragraph:
+                    is_different_from_global = True
+                    if title_paragraph:
+                        if local_title_paragraph.debug_id == title_paragraph.debug_id:
+                            is_different_from_global = False
 
-            active_glossary_markdown_blocks: list[str] = []
-            # Use cached glossaries
-            if self._cached_glossaries:
-                for glossary in self._cached_glossaries:
-                    # Get active entries for the current batch_text_for_glossary_matching
-                    active_entries = glossary.get_active_entries_for_text(
-                        batch_text_for_glossary_matching
-                    )
+                    if is_different_from_global:
+                        contextual_hints_section.append(
+                            f"{hint_idx}. The most recent title is: {local_title_paragraph.unicode}"
+                        )
+                        hint_idx += 1
 
-                    if active_entries:
-                        current_glossary_md_entries: list[str] = []
-                        for original_source, target_text in sorted(active_entries):
-                            current_glossary_md_entries.append(
-                                f"| {original_source} | {target_text} |"
-                            )
-
-                        if current_glossary_md_entries:
-                            glossary_table_md = (
-                                f"### Glossary: {glossary.name}\n\n"
-                                "| Source Term | Target Term |\n"
-                                "|-------------|-------------|\n"
-                                + "\n".join(current_glossary_md_entries)
-                            )
-                            active_glossary_markdown_blocks.append(glossary_table_md)
-
-            if contextual_hints_section or active_glossary_markdown_blocks:
-                llm_prompt_parts.append("\n## Contextual Hints for Better Translation")
-                llm_prompt_parts.extend(contextual_hints_section)
-
-                if active_glossary_markdown_blocks:
-                    llm_prompt_parts.append(
-                        f"{hint_idx}. You MUST strictly adhere to the following glossaries. auto_extracted_glossary has a lower priority; please give preference to other glossaries. If a source term from a table appears in the text, use the corresponding target term in your translation:"
-                    )
-                    # hint_idx += 1 # No need to increment if tables are part of this point
-                    for md_block in active_glossary_markdown_blocks:
-                        llm_prompt_parts.append(f"\n{md_block}\n")
-
-            # 3. ## Strict Rules:
-            llm_prompt_parts.append("\n## Strict Rules:")
-            llm_prompt_parts.append(
-                "1. Do NOT translate or alter any of the following elements:"
-            )
-            llm_prompt_parts.append(
-                "    Style or HTML-like tags: e.g., <style id='1'>...</style>, <b>...</b>, <i>...</i>, <code>...</code>, etc."
-            )
-            llm_prompt_parts.append(
-                "    Formula or variable placeholders enclosed in curly braces: e.g., {v3}, {equation_1}, {name}, etc."
-            )
-            llm_prompt_parts.append(
-                "    Any other placeholders like [[...]], %%...%%, %s, %d, etc."
-            )
-            llm_prompt_parts.append(
-                "2. Preserve the exact structure, position, and content of the above elements — do not modify spacing, punctuation, or formatting."
-            )
-            llm_prompt_parts.append(
-                "3. If the input contains:Proper nouns, code, or non-translatable technical terms, retain them in the original form."
-            )
-            llm_prompt_parts.append(
-                "4. If adjacent paragraphs are semantically coherent, you may appropriately adjust the word order, but you must keep the number of paragraphs unchanged and must not move placeholders from one paragraph to another."
-            )
-
-            # 4. ## Input/Output Format:
-            llm_prompt_parts.append("\n## Input/Output Format:")
-            llm_prompt_parts.append(
-                '1. You will receive a JSON object with entries containing "id" and "input" fields.'
-            )
-            llm_prompt_parts.append(
-                f'2. Your task is to translate the value of "input" into {self.translation_config.lang_out}, while applying the rules above.'
-            )
-            llm_prompt_parts.append(
-                '3. Return a new JSON object with the same "id" and the translated "output" field.'
-            )
-            llm_prompt_parts.append(
-                "Please return the translated json directly without wrapping ```json``` tag or include any additional information."
-            )
-
-            # 5. ##example (Renumbered from 5 to 4)
-            llm_prompt_parts.append("\n## Example:")
-            llm_prompt_parts.append("Here is an example of the expected format:")
-            llm_prompt_parts.append("")  # Blank line
-            llm_prompt_parts.append("<example>")
-            llm_prompt_parts.append("```json")
-            llm_prompt_parts.append("Input:")
-            llm_prompt_parts.append("{")
-            llm_prompt_parts.append('    "id": 0,')
-            llm_prompt_parts.append(
-                '    "input": "{v1}<style id=\'2\'>hello</style>,world!",'
-            )
-            llm_prompt_parts.append('    "layout_label": "list_item_hybrid"')
-            llm_prompt_parts.append("}")
-            llm_prompt_parts.append("```")
-            llm_prompt_parts.append("Output:")
-            llm_prompt_parts.append("```json")
-            llm_prompt_parts.append("{")
-            llm_prompt_parts.append('    "id": 0,')
-            llm_prompt_parts.append(
-                '    "output": "{v1}<style id=\'2\'>你好</style>，世界！"'
-            )
-            llm_prompt_parts.append("}")
-            llm_prompt_parts.append("```")
-            llm_prompt_parts.append("</example>")
-
-            # 6. ## Here is the input:
-            llm_prompt_parts.append("\n## Here is the input:")
-
-            # Combine all parts for the main prompt
-            main_prompt_content = "\n".join(llm_prompt_parts)
-
-            # Append the actual JSON input string at the end, without markdown fence
-            final_input = main_prompt_content + "\n\n" + json_format_input_str
-
-            for llm_translate_tracker in llm_translate_trackers:
-                llm_translate_tracker.set_input(final_input)
-            llm_output = self.translate_engine.llm_translate(
-                final_input,
-                rate_limit_params={
-                    "paragraph_token_count": paragraph_token_count,
-                    "request_json_mode": True,
-                },
-            )
-            for llm_translate_tracker in llm_translate_trackers:
-                llm_translate_tracker.set_output(llm_output)
-            llm_output = llm_output.strip()
-
-            llm_output = self._clean_json_output(llm_output)
-
-            parsed_output = json.loads(llm_output)
-
-            if isinstance(parsed_output, dict) and parsed_output.get(
-                "output", parsed_output.get("input", False)
-            ):
-                parsed_output = [parsed_output]
-
-            translation_results = {
-                item["id"]: item.get("output", item.get("input"))
-                for item in parsed_output
-            }
-
-            if len(translation_results) != len(inputs):
-                raise Exception(
-                    f"Translation results length mismatch. Expected: {len(inputs)}, Got: {len(translation_results)}"
+                # --- ADD GLOSSARY HINTS ---
+                batch_text_for_glossary_matching = "\n".join(
+                    item.get("input", "") for item in json_format_input
                 )
 
-            for id_, output in translation_results.items():
-                should_fallback = True
-                try:
-                    if not isinstance(output, str):
-                        logger.warning(
-                            f"Translation result is not a string. Output: {output}"
+                active_glossary_markdown_blocks: list[str] = []
+                # Use cached glossaries
+                if self._cached_glossaries:
+                    for glossary in self._cached_glossaries:
+                        # Get active entries for the current batch_text_for_glossary_matching
+                        active_entries = glossary.get_active_entries_for_text(
+                            batch_text_for_glossary_matching
                         )
-                        continue
 
-                    id_ = int(id_)  # Ensure id is an integer
-                    if id_ >= len(inputs):
-                        logger.warning(f"Invalid id {id_}, skipping")
-                        continue
+                        if active_entries:
+                            current_glossary_md_entries: list[str] = []
+                            for original_source, target_text in sorted(active_entries):
+                                current_glossary_md_entries.append(
+                                    f"| {original_source} | {target_text} |"
+                                )
 
-                    # Clean up any excessive punctuation in the translated text
-                    translated_text = re.sub(r"[. 。…，]{20,}", ".", output)
+                            if current_glossary_md_entries:
+                                glossary_table_md = (
+                                    f"### Glossary: {glossary.name}\n\n"
+                                    "| Source Term | Target Term |\n"
+                                    "|-------------|-------------|\n"
+                                    + "\n".join(current_glossary_md_entries)
+                                )
+                                active_glossary_markdown_blocks.append(glossary_table_md)
 
-                    # Do NOT shape here; shaping is centralized in typesetting
-                    if self.translation_config.lang_out.startswith("en-ar") and translated_text.strip():
-                        pass
+                if contextual_hints_section or active_glossary_markdown_blocks:
+                    llm_prompt_parts.append("\n## Contextual Hints for Better Translation")
+                    llm_prompt_parts.extend(contextual_hints_section)
 
-                    # Get the original input for this translation
-                    translate_input = inputs[id_][1]
-                    llm_translate_tracker = inputs[id_][4]
-
-                    input_unicode = inputs[id_][0]
-                    output_unicode = translated_text
-
-                    trimed_input = re.sub(r"[. 。…，]{20,}", ".", input_unicode)
-
-                    input_token_count = self.calc_token_count(trimed_input)
-                    output_token_count = self.calc_token_count(output_unicode)
-
-                    if trimed_input == output_unicode and input_token_count > 10:
-                        llm_translate_tracker.set_error_message(
-                            "Translation result is the same as input, fallback."
+                    if active_glossary_markdown_blocks:
+                        llm_prompt_parts.append(
+                            f"{hint_idx}. You MUST strictly adhere to the following glossaries. please give preference to other glossaries. If a source term from a table appears in the text, use the corresponding target term in your translation:"
                         )
-                        logger.warning(
-                            "Translation result is the same as input, fallback."
-                        )
-                        continue
+                        # hint_idx += 1 # No need to increment if tables are part of this point
+                        for md_block in active_glossary_markdown_blocks:
+                            llm_prompt_parts.append(f"\n{md_block}\n")
 
-                    if not (0.3 < output_token_count / input_token_count < 3):
-                        llm_translate_tracker.set_error_message(
-                            f"Translation result is too long or too short. Input: {input_token_count}, Output: {output_token_count}"
-                        )
-                        logger.warning(
-                            f"Translation result is too long or too short. Input: {input_token_count}, Output: {output_token_count}"
-                        )
-                        continue
+                # 6. ## Here is the input:
+                llm_prompt_parts.append("\n## Here is the input:")
 
-                    edit_distance = Levenshtein.distance(input_unicode, output_unicode)
-                    if edit_distance < 5 and input_token_count > 20:
-                        llm_translate_tracker.set_error_message(
-                            f"Translation result edit distance is too small. distance: {edit_distance}, input: {input_unicode}, output: {output_unicode}"
-                        )
-                        logger.warning(
-                            f"Translation result edit distance is too small. distance: {edit_distance}, input: {input_unicode}, output: {output_unicode}"
-                        )
-                        continue
-                    # Apply the translation to the paragraph
-                    self.il_translator.post_translate_paragraph(
-                        inputs[id_][2],
-                        inputs[id_][3],
-                        translate_input,
-                        translated_text,
+                # Combine all parts for the main prompt
+                main_prompt_content = "\n".join(llm_prompt_parts)
+
+                # Append the actual JSON input string at the end, without markdown fence
+                final_input = main_prompt_content + "\n\n" + json_format_input_str
+
+                for llm_translate_tracker in llm_translate_trackers:
+                    llm_translate_tracker.set_input(final_input)
+                llm_output = self.translate_engine.llm_translate(
+                    final_input,
+                    rate_limit_params={
+                        "paragraph_token_count": paragraph_token_count,
+                        "request_json_mode": True,
+                    },
+                )
+                for llm_translate_tracker in llm_translate_trackers:
+                    llm_translate_tracker.set_output(llm_output)
+                llm_output = llm_output.strip()
+
+                llm_output = self._clean_json_output(llm_output)
+
+                parsed_output = json.loads(llm_output)
+
+                if isinstance(parsed_output, dict) and parsed_output.get(
+                    "output", parsed_output.get("input", False)
+                ):
+                    parsed_output = [parsed_output]
+
+                translation_results = {
+                    item["id"]: item.get("output", item.get("input"))
+                    for item in parsed_output
+                }
+
+                if len(translation_results) != len(inputs):
+                    raise Exception(
+                        f"Translation results length mismatch. Expected: {len(inputs)}, Got: {len(translation_results)}"
                     )
-                    should_fallback = False
-                    if pbar:
-                        pbar.advance(1)
-                except Exception as e:
-                    error_message = f"Error translating paragraph. Error: {e}."
-                    logger.exception(error_message)
-                    # Ignore error and continue
-                    for llm_translate_tracker in llm_translate_trackers:
-                        llm_translate_tracker.set_error_message(error_message)
-                    continue
-                finally:
-                    self.total_count += 1
-                    if should_fallback:
-                        self.fallback_count += 1
-                        inputs[id_][4].set_fallback_to_translate()
-                        logger.warning(
-                            f"Fallback to simple translation. paragraph id: {inputs[id_][2].debug_id}"
-                        )
-                        paragraph_token_count = self.calc_token_count(
-                            inputs[id_][2].unicode
-                        )
-                        paragraph_unicodes = inputs[id_][5]
-                        inputs[id_][2].unicode = paragraph_unicodes[id_]
-                        executor.submit(
-                            self.il_translator.translate_paragraph,
+
+                # Store translated texts for logging
+                translated_texts_for_logging = []
+
+                for id_, output in translation_results.items():
+                    should_fallback = True
+                    try:
+                        if not isinstance(output, str):
+                            logger.warning(
+                                f"Translation result is not a string. Output: {output}"
+                            )
+                            continue
+
+                        id_ = int(id_)  # Ensure id is an integer
+                        if id_ >= len(inputs):
+                            logger.warning(f"Invalid id {id_}, skipping")
+                            continue
+
+                        # Clean up any excessive punctuation in the translated text
+                        translated_text = re.sub(r"[. Ã£â‚¬â€šÃ¢â‚¬Â¦Ã¯Â¼Å’]{20,}", ".", output)
+
+                        # Store for logging
+                        translated_texts_for_logging.append(translated_text)
+
+                        # Log the language configuration
+                        lang_out = (self.translation_config.lang_out or "").lower()
+                        logger.info(f"Output language configured as: '{lang_out}'")
+
+                        # Apply Arabic post-translation normalization (percent signs, Latin spacing)
+                        if lang_out.rsplit("-", 1)[-1] in {"ar", "ara", "arabic"}:
+                            translated_text = il_translator.normalize_year_over_year(inputs[id_][0], translated_text)
+                            translated_text = self.il_translator._normalize_arabic_output(translated_text)
+                        else:
+                            translated_text = self._normalize_arabic_output(translated_text)
+                        # Shape glyphs after normalization, leaving visual ordering to typesetting.
+                        translated_text = self.shape_arabic_text(translated_text)
+
+                        logger.info(f"Final Translated paragraph: {translated_text}")
+
+                        # Get the original input for this translation
+                        translate_input = inputs[id_][1]
+                        llm_translate_tracker = inputs[id_][4]
+
+                        input_unicode = inputs[id_][0]
+                        output_unicode = translated_text
+
+                        trimed_input = re.sub(r"[. Ã£â‚¬â€šÃ¢â‚¬Â¦Ã¯Â¼Å’]{20,}", ".", input_unicode)
+
+                        input_token_count = self.calc_token_count(trimed_input)
+                        output_token_count = self.calc_token_count(output_unicode)
+
+                        if trimed_input == output_unicode and input_token_count > 10:
+                            llm_translate_tracker.set_error_message(
+                                "Translation result is the same as input, fallback."
+                            )
+                            logger.warning(
+                                "Translation result is the same as input, fallback."
+                            )
+                            continue
+
+                        if not (0.3 < output_token_count / input_token_count < 3):
+                            llm_translate_tracker.set_error_message(
+                                f"Translation result is too long or too short. Input: {input_token_count}, Output: {output_token_count}"
+                            )
+                            logger.warning(
+                                f"Translation result is too long or too short. Input: {input_token_count}, Output: {output_token_count}"
+                            )
+                            continue
+
+                        edit_distance = Levenshtein.distance(input_unicode, output_unicode)
+                        if edit_distance < 5 and input_token_count > 20:
+                            llm_translate_tracker.set_error_message(
+                                f"Translation result edit distance is too small. distance: {edit_distance}, input: {input_unicode}, output: {output_unicode}"
+                            )
+                            logger.warning(
+                                f"Translation result edit distance is too small. distance: {edit_distance}, input: {input_unicode}, output: {output_unicode}"
+                            )
+                            continue
+                        # Apply the translation to the paragraph
+                        self.il_translator.post_translate_paragraph(
                             inputs[id_][2],
-                            pbar,
                             inputs[id_][3],
-                            page_font_map,
-                            xobj_font_map,
-                            priority=1048576 - paragraph_token_count,
-                            paragraph_token_count=paragraph_token_count,
-                            title_paragraph=title_paragraph,
-                            local_title_paragraph=local_title_paragraph,
+                            translate_input,
+                            translated_text,
                         )
-                    else:
-                        self.ok_count += 1
+                        should_fallback = False
+                        if pbar:
+                            pbar.advance(1)
+                    except Exception as e:
+                        error_message = f"Error translating paragraph. Error: {e}."
+                        logger.exception(error_message)
+                        # Ignore error and continue
+                        for llm_translate_tracker in llm_translate_trackers:
+                            llm_translate_tracker.set_error_message(error_message)
+                        continue
+                    finally:
+                        self.total_count += 1
+                        if should_fallback:
+                            self.fallback_count += 1
+                            inputs[id_][4].set_fallback_to_translate()
+                            logger.warning(
+                                f"Fallback to simple translation. paragraph id: {inputs[id_][2].debug_id}"
+                            )
+                            paragraph_token_count = self.calc_token_count(
+                                inputs[id_][2].unicode
+                            )
+                            paragraph_unicodes = inputs[id_][5]
+                            inputs[id_][2].unicode = paragraph_unicodes[id_]
+                            executor.submit(
+                                self.il_translator.translate_paragraph,
+                                inputs[id_][2],
+                                batch_paragraph.pages[id_],
+                                pbar,
+                                inputs[id_][3],
+                                page_font_map,
+                                xobj_font_map,
+                                priority=1048576 - paragraph_token_count,
+                                paragraph_token_count=paragraph_token_count,
+                                title_paragraph=title_paragraph,
+                                local_title_paragraph=local_title_paragraph,
+                            )
+                        else:
+                            self.ok_count += 1
 
-        except Exception as e:
-            error_message = f"Error {e} during translation. try fallback"
-            logger.warning(error_message)
-            for llm_translate_tracker in llm_translate_trackers:
-                llm_translate_tracker.set_error_message(error_message)
-                llm_translate_tracker.set_fallback_to_translate()
-            self.total_count += len(llm_translate_trackers)
-            self.fallback_count += len(llm_translate_trackers)
-            for input_ in inputs:
-                input_[2].unicode = input_[5]
-            if not should_translate_paragraph:
-                should_translate_paragraph = list(
-                    range(len(batch_paragraph.paragraphs))
-                )
-            for i in should_translate_paragraph:
-                paragraph = batch_paragraph.paragraphs[i]
-                tracker = batch_paragraph.trackers[i]
-                if paragraph.debug_id is None:
-                    continue
-                paragraph_token_count = self.calc_token_count(paragraph.unicode)
-                executor.submit(
-                    self.il_translator.translate_paragraph,
-                    paragraph,
-                    pbar,
-                    tracker,
-                    page_font_map,
-                    xobj_font_map,
-                    priority=1048576 - paragraph_token_count,
-                    paragraph_token_count=paragraph_token_count,
-                    title_paragraph=title_paragraph,
-                    local_title_paragraph=local_title_paragraph,
-                )
+                # Log translation batch completion with results
+                if hasattr(self, 'detailed_logger') and self.detailed_logger:
+                    input_texts = [inp[0] for inp in inputs][:3]  # First 3 input texts
+                    self.detailed_logger.log_step(
+                        f"Translation Batch {mp_id} Complete",
+                        data={
+                            'batch_size': len(inputs),
+                            'translations_completed': len(translated_texts_for_logging),
+                            'sample_inputs': input_texts,
+                            'sample_outputs': translated_texts_for_logging[:3] if translated_texts_for_logging else []
+                        }
+                    )
+
+            except Exception as e:
+                # Log translation batch error
+                if hasattr(self, 'detailed_logger') and self.detailed_logger:
+                    self.detailed_logger.log_step(
+                        f"Translation Batch {mp_id} Error",
+                        data={
+                            'error': str(e),
+                            'batch_size': len(batch_paragraph.paragraphs)
+                        }
+                    )
+                
+                error_message = f"Error {e} during translation. try fallback"
+                logger.warning(error_message)
+                for llm_translate_tracker in llm_translate_trackers:
+                    llm_translate_tracker.set_error_message(error_message)
+                    llm_translate_tracker.set_fallback_to_translate()
+                self.total_count += len(llm_translate_trackers)
+                self.fallback_count += len(llm_translate_trackers)
+                for input_ in inputs:
+                    input_[2].unicode = input_[5]
+                if not should_translate_paragraph:
+                    should_translate_paragraph = list(
+                        range(len(batch_paragraph.paragraphs))
+                    )
+                for i in should_translate_paragraph:
+                    paragraph = batch_paragraph.paragraphs[i]
+                    tracker = batch_paragraph.trackers[i]
+                    if paragraph.debug_id is None:
+                        continue
+                    paragraph_token_count = self.calc_token_count(paragraph.unicode)
+                    executor.submit(
+                        self.il_translator.translate_paragraph,
+                        paragraph,
+                        batch_paragraph.pages[i],
+                        pbar,
+                        tracker,
+                        page_font_map,
+                        xobj_font_map,
+                        priority=1048576 - paragraph_token_count,
+                        paragraph_token_count=paragraph_token_count,
+                        title_paragraph=title_paragraph,
+                        local_title_paragraph=local_title_paragraph,
+                    )
 
     def _clean_json_output(self, llm_output: str) -> str:
         # Clean up JSON output by removing common wrapper tags

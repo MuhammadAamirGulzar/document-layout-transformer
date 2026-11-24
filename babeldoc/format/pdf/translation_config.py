@@ -7,6 +7,7 @@ from collections import Counter
 from pathlib import Path
 
 from babeldoc.const import CACHE_FOLDER
+from babeldoc.format.pdf.document_il.utils.quality_report import ContentLedger
 from babeldoc.format.pdf.split_manager import BaseSplitStrategy
 from babeldoc.format.pdf.split_manager import PageCountStrategy
 from babeldoc.glossary import Glossary
@@ -32,6 +33,12 @@ class SharedContextCrossSplitPart:
         self.auto_extracted_glossary: Glossary | None = None
         self.raw_extracted_terms: list[tuple[str, str]] = []
         self.auto_enabled_ocr_workaround = False
+        self.content_ledger = ContentLedger()
+        self.continuation_pages: dict[int, int] = {}
+        self.layout_issues: list[dict] = []
+        self.detected_domain: str = "general"
+        self.document_abbreviations: dict[str, str] = {}
+        self.translation_memory = None
 
     def initialize_glossaries(self, initial_glossaries: list[Glossary] | None):
         with self._lock:
@@ -174,8 +181,11 @@ class TranslationConfig:
         non_formula_line_iou_threshold: float = 0.9,
         figure_table_protection_threshold: float = 0.9,
         skip_formula_offset_calculation: bool = False,
+        term_extraction_translator: BaseTranslator | None = None,
+        metadata_extra_data: str | None = None,
     ):
         self.translator = translator
+        self.term_extraction_translator = term_extraction_translator or translator
         initial_user_glossaries = list(glossaries) if glossaries else []
 
         self.input_file = input_file
@@ -224,6 +234,7 @@ class TranslationConfig:
 
         if self.ocr_workaround:
             self.skip_scanned_detection = True
+            self.disable_rich_text_translate = True
 
         # for backward compatibility
         if use_side_by_side_dual is False and use_alternating_pages_dual is False:
@@ -311,6 +322,15 @@ class TranslationConfig:
         self.non_formula_line_iou_threshold = non_formula_line_iou_threshold
         self.figure_table_protection_threshold = figure_table_protection_threshold
         self.skip_formula_offset_calculation = skip_formula_offset_calculation
+
+        self.metadata_extra_data = metadata_extra_data
+
+        self.term_extraction_token_usage: dict[str, int] = {
+            "total_tokens": 0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "cache_hit_prompt_tokens": 0,
+        }
 
         if self.ocr_workaround:
             self.remove_non_formula_lines = False
@@ -417,6 +437,29 @@ class TranslationConfig:
         if self.progress_monitor is not None:
             self.progress_monitor.cancel()
 
+    def get_term_extraction_translator(self) -> BaseTranslator:
+        """Return the translator to use for automatic term extraction."""
+        return self.term_extraction_translator
+
+    def record_term_extraction_usage(
+        self,
+        total_tokens: int,
+        prompt_tokens: int,
+        completion_tokens: int,
+        cache_hit_prompt_tokens: int,
+    ) -> None:
+        """Accumulate token usage for automatic term extraction."""
+        if total_tokens > 0:
+            self.term_extraction_token_usage["total_tokens"] += total_tokens
+        if prompt_tokens > 0:
+            self.term_extraction_token_usage["prompt_tokens"] += prompt_tokens
+        if completion_tokens > 0:
+            self.term_extraction_token_usage["completion_tokens"] += completion_tokens
+        if cache_hit_prompt_tokens > 0:
+            self.term_extraction_token_usage["cache_hit_prompt_tokens"] += (
+                cache_hit_prompt_tokens
+            )
+
 
 class TranslateResult:
     original_pdf_path: str
@@ -427,12 +470,14 @@ class TranslateResult:
     no_watermark_dual_pdf_path: Path | None
     peak_memory_usage: int | None
     auto_extracted_glossary_path: Path | None
+    quality_report_path: Path | None
 
     def __init__(
         self,
         mono_pdf_path: Path | None,
         dual_pdf_path: Path | None,
         auto_extracted_glossary_path: Path | None = None,
+        quality_report_path: Path | None = None,
     ):
         self.mono_pdf_path = mono_pdf_path
         self.dual_pdf_path = dual_pdf_path
@@ -443,6 +488,7 @@ class TranslateResult:
         self.no_watermark_dual_pdf_path = dual_pdf_path
 
         self.auto_extracted_glossary_path = auto_extracted_glossary_path
+        self.quality_report_path = quality_report_path
 
     def __str__(self):
         """Return a human-readable string representation of the translation result."""

@@ -3,7 +3,6 @@ import functools
 import logging
 import re
 from pathlib import Path
-import os
 
 import pymupdf
 
@@ -13,6 +12,17 @@ from babeldoc.format.pdf.document_il import il_version_1
 from babeldoc.format.pdf.translation_config import TranslationConfig
 
 logger = logging.getLogger(__name__)
+
+
+def is_arabic_codepoint(codepoint: int) -> bool:
+    """Return whether *codepoint* belongs to an Arabic shaping block."""
+    return (
+        0x0600 <= codepoint <= 0x06FF
+        or 0x0750 <= codepoint <= 0x077F
+        or 0x08A0 <= codepoint <= 0x08FF
+        or 0xFB50 <= codepoint <= 0xFDFF
+        or 0xFE70 <= codepoint <= 0xFEFF
+    )
 
 
 class PrimaryFontFamily(enum.IntEnum):
@@ -81,35 +91,6 @@ class FontMapper:
                 "encoding_length"
             ]
 
-        # Optional: allow injecting additional fonts via env for languages not bundled yet
-        # e.g., set BABELDOC_EXTRA_FONTS to a semicolon-separated list of font file paths
-        extra_fonts_env = os.environ.get("BABELDOC_EXTRA_FONTS")
-        if extra_fonts_env:
-            for font_path_str in extra_fonts_env.split(";"):
-                font_path_str = font_path_str.strip()
-                if not font_path_str:
-                    continue
-                p = Path(font_path_str)
-                if not p.exists():
-                    logger.warning("Extra font not found: %s", p)
-                    continue
-                try:
-                    pym_font = pymupdf.Font(fontfile=str(p))
-                    font_id = p.name
-                    if font_id in self.fonts:
-                        continue
-                    self.fonts[font_id] = pym_font
-                    self.fontid2fontpath[font_id] = p
-                    self.fonts[font_id].font_id = font_id
-                    self.fonts[font_id].font_path = p
-                    # Fallback metadata for non-embedded fonts
-                    self.fonts[font_id].ascent_fontmap = getattr(pym_font, "ascent", 1069)
-                    self.fonts[font_id].descent_fontmap = getattr(pym_font, "descent", -293)
-                    # Use 2 bytes per glyph id as a safe default
-                    self.fonts[font_id].encoding_length = 2
-                except Exception as e:
-                    logger.warning("Failed to load extra font %s: %s", p, e)
-
         self.normal_font_ids: list[str] = font_family["normal"]
         self.script_font_ids: list[str] = font_family["script"]
         self.fallback_font_ids: list[str] = font_family["fallback"]
@@ -129,12 +110,8 @@ class FontMapper:
             self.fontid2font[font_id] for font_id in self.script_font_ids
         ]
         self.fallback_fonts: list[pymupdf.Font] = [
-            self.fontid2font[font_id] for font_id in self.fallback_font_ids if font_id in self.fontid2font
+            self.fontid2font[font_id] for font_id in self.fallback_font_ids
         ]
-        # Append any extra injected fonts to fallback set
-        for k, v in self.fontid2font.items():
-            if k not in set(self.normal_font_ids + self.script_font_ids + self.fallback_font_ids + self.base_font_ids):
-                self.fallback_fonts.append(v)
 
         self.base_font = self.fontid2font["base"]
 
@@ -144,6 +121,17 @@ class FontMapper:
             "fallback": self.fallback_fonts,
             "base": [self.base_font],
         }
+
+        # The metadata layer deliberately appends other language families as
+        # broad fallbacks. That is useful for CJK documents, but unsafe for
+        # Arabic: Source Han can become a candidate despite lacking Arabic
+        # glyphs. Arabic selection therefore uses this explicit target set.
+        self.arabic_fonts = [
+            font for font in self.fonts.values()
+            if "gonotokurrent" in font.font_id.lower()
+        ]
+        if "AR" in (translation_config.lang_out or "").upper() and not self.arabic_fonts:
+            raise RuntimeError("Arabic output requires an embedded Arabic target font")
 
         self.has_char = functools.lru_cache(maxsize=10240, typed=True)(self.has_char)
         self.map_in_type = functools.lru_cache(maxsize=10240, typed=True)(
@@ -187,14 +175,33 @@ class FontMapper:
 
     def map(self, original_font: PdfFont, char_unicode: str):
         current_char = ord(char_unicode)
+        if 0xE000 <= current_char <= 0xF8FF:
+            # PUA glyphs have font-specific meanings. A source Wingdings font can
+            # report that it supports U+F0B7 while the resolved Arabic font cannot,
+            # resulting in a .notdef glyph in the final PDF. Canonicalize list
+            # markers before target-font selection instead of consulting source
+            # font coverage.
+            current_char = 0x2022
+            char_unicode = '•'
+
         if isinstance(original_font, pymupdf.Font):
-            bold = original_font.is_bold
-            italic = original_font.is_italic
+            font_name_lower = (getattr(original_font, "name", "") or "").lower()
+            bold = bool(original_font.is_bold) or any(
+                b in font_name_lower for b in ["bold", "black", "heavy", "semibold", "demibold"]
+            )
+            italic = bool(original_font.is_italic) or any(
+                it in font_name_lower for it in ["italic", "oblique"]
+            )
             monospaced = original_font.is_monospaced
             serif = original_font.is_serif
         elif isinstance(original_font, PdfFont):
-            bold = original_font.bold
-            italic = original_font.italic
+            font_name_lower = (getattr(original_font, "name", "") or getattr(original_font, "font_name", "") or "").lower()
+            bold = bool(original_font.bold) or any(
+                b in font_name_lower for b in ["bold", "black", "heavy", "semibold", "demibold"]
+            )
+            italic = bool(original_font.italic) or any(
+                it in font_name_lower for it in ["italic", "oblique"]
+            )
             monospaced = original_font.monospace
             serif = original_font.serif
         else:
@@ -212,6 +219,23 @@ class FontMapper:
         elif self.primary_font_family == PrimaryFontFamily.SCRIPT:
             serif = False
             italic = True
+
+        # Arabic source PDFs frequently declare their Latin source font as a
+        # serif face (for example Source Han Serif).  The Arabic target family
+        # is GoNotoKurrent, whose font-id does not contain "serif".  Carrying
+        # that unrelated source classification through target-font selection
+        # makes presentation-form glyphs fall back to the source font and emit
+        # .notdef boxes.  Arabic code points must select an Arabic target face
+        # by coverage and weight, never by the source serif flag.
+        if "AR" in (self.translation_config.lang_out or "").upper() and is_arabic_codepoint(current_char):
+            # Select only an Arabic target face before entering the generic
+            # script/fallback cascade, which may contain Source Han.
+            weighted = [font for font in self.arabic_fonts if bool(font.is_bold) == bool(bold)]
+            for font in weighted + self.arabic_fonts:
+                if font.has_glyph(current_char):
+                    return font
+            logger.warning("Arabic target fonts do not cover %s (U+%04X)", char_unicode, current_char)
+            return None
 
         script_font_map_result = self.map_in_type(
             bold, italic, monospaced, serif, char_unicode, "script"
@@ -257,6 +281,10 @@ class FontMapper:
                     if char := comp.pdf_character:
                         if char.pdf_style and char.pdf_style.font_id:
                             result.add(char.pdf_style.font_id)
+                    if comp.pdf_formula:
+                        for char in comp.pdf_formula.pdf_character:
+                            if char.pdf_style and char.pdf_style.font_id:
+                                result.add(char.pdf_style.font_id)
         return result
 
     def add_font(self, doc_zh: pymupdf.Document, il: il_version_1.Document):

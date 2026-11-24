@@ -1,4 +1,7 @@
 import logging
+import math
+import os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import cv2
@@ -7,7 +10,6 @@ from pymupdf import Document
 
 import babeldoc.format.pdf.document_il.utils.extract_char
 from babeldoc.format.pdf.document_il import il_version_1
-from babeldoc.format.pdf.document_il.utils.mupdf_helper import get_no_rotation_img
 from babeldoc.format.pdf.document_il.utils.style_helper import GREEN
 from babeldoc.format.pdf.translation_config import TranslationConfig
 
@@ -18,6 +20,7 @@ class LayoutParser:
     stage_name = "Parse Page Layout"
 
     def __init__(self, translation_config: TranslationConfig):
+        self.detailed_logger = None
         self.translation_config = translation_config
         self.model = translation_config.doc_layout_model
 
@@ -117,10 +120,15 @@ class LayoutParser:
     def process(self, docs: il_version_1.Document, mupdf_doc: Document):
         """Generate layouts for all pages that need to be translated."""
         # Get pages that need to be translated
+        if self.detailed_logger:
+            self.detailed_logger.log_step(
+                "Layout Parsing Started",
+                f"Total pages to process: {len(docs.page)}"
+            )
         total = len(docs.page)
         with self.translation_config.progress_monitor.stage_start(
             self.stage_name,
-            total,
+            total * 2,
         ) as progress:
             # Process predictions for each page
             for page, layouts in self.model.handle_document(
@@ -134,9 +142,15 @@ class LayoutParser:
                     # Convert coordinate system from picture to il
                     # system to the il coordinate system
                     x0, y0, x1, y1 = layout.xyxy
-                    pix = get_no_rotation_img(mupdf_doc[page.page_number])
+                    # pix = get_no_rotation_img(mupdf_doc[page.page_number])
                     # pix = mupdf_doc[page.page_number].get_pixmap()
-                    h, w = pix.height, pix.width
+                    # h, w = pix.height, pix.width
+                    box = mupdf_doc[page.page_number].mediabox_size
+                    b_h = math.ceil(box.y)
+                    b_w = math.ceil(box.x)
+                    # if b_h != h or b_w != w:
+                    #     logger.warning(f"page {page.page_number} mediabox is not correct, b_h: {b_h}, h: {h}, b_w: {b_w}, w: {w}")
+                    h, w = b_h, b_w
                     x0, y0, x1, y1 = (
                         np.clip(int(x0 - 1), 0, w - 1),
                         np.clip(int(h - y1 - 1), 0, h - 1),
@@ -157,39 +171,100 @@ class LayoutParser:
                     page_layouts.append(page_layout)
 
                 page.page_layout = page_layouts
-                self.generate_fallback_line_layout_for_page(page)
-                self._save_debug_box_to_page(page)
+                # self.generate_fallback_line_layout_for_page(page)
+                # self._save_debug_box_to_page(page)
                 progress.advance(1)
-
+            with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
+                for page in docs.page:
+                    executor.submit(
+                        self.generate_fallback_line_layout_for_page, page, progress
+                    )
+        for i, page in enumerate(docs.page):
+            if self.detailed_logger:
+                layout_info = {
+                    'page_number': i + 1,
+                    'detected_elements': len(page.pdf_layout_element) if hasattr(page, 'pdf_layout_element') else 0,
+                    'element_types': {}
+                }
+                
+                if hasattr(page, 'pdf_layout_element'):
+                    for elem in page.pdf_layout_element:
+                        elem_type = elem.layout_label if hasattr(elem, 'layout_label') else 'unknown'
+                        layout_info['element_types'][elem_type] = layout_info['element_types'].get(elem_type, 0) + 1
+                
+                self.detailed_logger.log_step(
+                    f"Page {i+1} Layout Detection",
+                    data=layout_info
+                )
+    
         return docs
 
-    def generate_fallback_line_layout_for_page(self, page: il_version_1.Page):
-        exists_page_layouts = page.page_layout
-        char_boxes = babeldoc.format.pdf.document_il.utils.extract_char.convert_page_to_char_boxes(
-            page
-        )
-        if not char_boxes:
-            return
-
-        clusters = babeldoc.format.pdf.document_il.utils.extract_char.process_page_chars_to_lines(
-            char_boxes
-        )
-        for cluster in clusters:
-            boxes = [c[0] for c in cluster.chars]
-            min_x = min(b.x for b in boxes)
-            max_x = max(b.x2 for b in boxes)
-            min_y = min(b.y for b in boxes)
-            max_y = max(b.y2 for b in boxes)
-            cluster.chars = il_version_1.Box(min_x, min_y, max_x, max_y)
-            page_layout = il_version_1.PageLayout(
-                id=len(exists_page_layouts) + 1,
-                box=il_version_1.Box(
-                    min_x,
-                    min_y,
-                    max_x,
-                    max_y,
-                ),
-                conf=1,
-                class_name="fallback_line",
+    def generate_fallback_line_layout_for_page(self, page: il_version_1.Page, progress):
+        try:
+            exists_page_layouts = page.page_layout
+            char_boxes = babeldoc.format.pdf.document_il.utils.extract_char.convert_page_to_char_boxes(
+                page
             )
-            exists_page_layouts.append(page_layout)
+            if not char_boxes:
+                return
+
+            clusters = babeldoc.format.pdf.document_il.utils.extract_char.process_page_chars_to_lines(
+                char_boxes
+            )
+            if not clusters:
+                return
+
+            # Compute bounding boxes for each cluster line
+            line_boxes = []
+            for cluster in clusters:
+                boxes = [c[0] for c in cluster.chars]
+                min_x = min(b.x for b in boxes)
+                max_x = max(b.x2 for b in boxes)
+                min_y = min(b.y for b in boxes)
+                max_y = max(b.y2 for b in boxes)
+                cluster.chars = il_version_1.Box(min_x, min_y, max_x, max_y)
+                line_boxes.append(il_version_1.Box(min_x, min_y, max_x, max_y))
+
+            # Group vertically consecutive lines in the same column into paragraph blocks
+            # Sort lines top-to-bottom (PDF y2 descending)
+            line_boxes.sort(key=lambda b: -b.y2)
+            blocks: list[list[il_version_1.Box]] = []
+            current_block: list[il_version_1.Box] = []
+
+            for b in line_boxes:
+                if not current_block:
+                    current_block.append(b)
+                else:
+                    prev_b = current_block[-1]
+                    vert_gap = prev_b.y - b.y2
+                    horiz_diff = abs(prev_b.x - b.x)
+                    line_h = prev_b.y2 - prev_b.y
+                    # Consistent line spacing and left alignment in the same column
+                    if 0 <= vert_gap <= (line_h * 1.6) and horiz_diff < (line_h * 2.5):
+                        current_block.append(b)
+                    else:
+                        blocks.append(current_block)
+                        current_block = [b]
+            if current_block:
+                blocks.append(current_block)
+
+            for block in blocks:
+                b_min_x = min(b.x for b in block)
+                b_max_x = max(b.x2 for b in block)
+                b_min_y = min(b.y for b in block)
+                b_max_y = max(b.y2 for b in block)
+                page_layout = il_version_1.PageLayout(
+                    id=len(exists_page_layouts) + 1,
+                    box=il_version_1.Box(
+                        b_min_x,
+                        b_min_y,
+                        b_max_x,
+                        b_max_y,
+                    ),
+                    conf=1,
+                    class_name="fallback_line",
+                )
+                exists_page_layouts.append(page_layout)
+            self._save_debug_box_to_page(page)
+        finally:
+            progress.advance(1)

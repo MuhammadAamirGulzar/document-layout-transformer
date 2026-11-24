@@ -1,3 +1,4 @@
+import copy
 import io
 import itertools
 import logging
@@ -28,6 +29,7 @@ logger = logging.getLogger(__name__)
 
 SUBSET_FONT_STAGE_NAME = "Subset font"
 SAVE_PDF_STAGE_NAME = "Save PDF"
+EMERGENCY_FALLBACK_COUNT = 0
 
 
 class RenderUnit(ABC):
@@ -383,7 +385,7 @@ def apply_normalization(cmap, gid, code):
 
 
 def batched(iterable, n, *, strict=False):
-    # batched('ABCDEFG', 3) → ABC DEF G
+    # batched('ABCDEFG', 3) â†’ ABC DEF G
     if n < 1:
         raise ValueError("n must be at least one")
     iterator = iter(iterable)
@@ -503,13 +505,13 @@ def _subset_fonts_process(pdf_path, output_path):
     """
     try:
         pdf = pymupdf.open(pdf_path)
-        pdf.subset_fonts(fallback=False)
+        pdf.subset_fonts(fallback=True)
         pdf.save(output_path)
-        # 返回 0 表示成功
+        # è¿”å›ž 0 è¡¨ç¤ºæˆåŠŸ
         os._exit(0)
     except Exception as e:
         logger.error(f"Error in font subsetting subprocess: {e}")
-        # 返回 1 表示失败
+        # è¿”å›ž 1 è¡¨ç¤ºå¤±è´¥
         os._exit(1)
 
 
@@ -543,11 +545,11 @@ def _save_pdf_clean_process(
             deflate_fonts=deflate_fonts,
             linear=linear,
         )
-        # 返回 0 表示成功
+        # è¿”å›ž 0 è¡¨ç¤ºæˆåŠŸ
         os._exit(0)
     except Exception as e:
         logger.error(f"Error in save PDF with clean=True subprocess: {e}")
-        # 返回 1 表示失败
+        # è¿”å›ž 1 è¡¨ç¤ºå¤±è´¥
         os._exit(1)
 
 
@@ -567,6 +569,7 @@ class PDFCreater:
         self.font_mapper = FontMapper(translation_config)
         self.translation_config = translation_config
         self.mediabox_data = mediabox_data
+        self.detailed_logger = None
 
     def render_graphic_state(
         self,
@@ -625,36 +628,118 @@ class PDFCreater:
                     f"Paragraph: {paragraph}. ",
                 )
                 continue
-        if not chars and paragraph.unicode and paragraph.debug_id:
-            logger.error(
-                f"Unable to export paragraphs that have "
-                f"not yet been formatted: {paragraph}",
+        if not chars and paragraph.unicode:
+            global EMERGENCY_FALLBACK_COUNT
+            EMERGENCY_FALLBACK_COUNT += 1
+            logger.warning(
+                f"[METRIC] Emergency fallback rendering triggered (count={EMERGENCY_FALLBACK_COUNT}) "
+                f"for unformatted paragraph {paragraph.debug_id} ('{paragraph.unicode[:40]}...')."
             )
+            box = paragraph.box or il_version_1.Box(x=50.0, y=50.0, x2=550.0, y2=64.0)
+            style = paragraph.pdf_style or il_version_1.PdfStyle(
+                font_id="base", font_size=9.0, graphic_state=il_version_1.GraphicState()
+            )
+            font_size = style.font_size if (style and style.font_size) else 9.0
+            char_w = max(font_size * 0.55, 4.0)
+            base_font = self.font_mapper.base_font
+            for i, ch in enumerate(paragraph.unicode):
+                glyph_id = base_font.has_glyph(ord(ch)) if len(ch) == 1 else 0
+                if not glyph_id or ch.isspace():
+                    # Nothing drawable for this code point; never emit glyph 0.
+                    continue
+                char_box = il_version_1.Box(
+                    x=box.x + i * char_w,
+                    y=box.y,
+                    x2=box.x + (i + 1) * char_w,
+                    y2=box.y + font_size,
+                )
+                fallback_style = copy.copy(style)
+                fallback_style.font_id = base_font.font_id
+                pdf_char = il_version_1.PdfCharacter(
+                    char_unicode=ch,
+                    pdf_character_id=glyph_id,
+                    box=char_box,
+                    pdf_style=fallback_style,
+                    xobj_id=paragraph.xobj_id if hasattr(paragraph, "xobj_id") else -1,
+                )
+                chars.append(pdf_char)
             return chars
         return chars
+
+    def _create_character_render_units(
+        self,
+        page: il_version_1.Page,
+    ) -> list[CharacterRenderUnit]:
+        # Collect all characters. A paragraph composition can retain a reference
+        # to the same source character as page.pdf_character; emitting both was
+        # the root of several doubled definition lines. Paragraph ownership wins
+        # and exact duplicate page-level draw operations are discarded.
+        paragraph_chars = []
+        for paragraph in page.pdf_paragraph:
+            paragraph_chars.extend(self.render_paragraph_to_char(paragraph))
+
+        def character_signature(char: il_version_1.PdfCharacter):
+            box = char.box
+            style = char.pdf_style
+            return (
+                char.char_unicode,
+                char.pdf_character_id,
+                char.xobj_id,
+                getattr(style, "font_id", None),
+                round(box.x, 3) if box else None,
+                round(box.y, 3) if box else None,
+                round(box.x2, 3) if box else None,
+                round(box.y2, 3) if box else None,
+            )
+
+        paragraph_signatures = {character_signature(char) for char in paragraph_chars}
+        chars = [
+            char for char in page.pdf_character
+            if character_signature(char) not in paragraph_signatures
+        ]
+        chars.extend(paragraph_chars)
+
+        # Source PDF text stores character codes in its original font encoding.
+        # Only our embedded output fonts use glyph indices directly.
+        invalid = [
+            char for char in chars
+            if (
+                char.char_unicode not in (None, "\n")
+                and (
+                    (
+                        char.pdf_character_id == 0
+                        and getattr(char.pdf_style, "font_id", None) in self.font_mapper.fontid2font
+                    )
+                    or (len(char.char_unicode) == 1 and unicodedata.category(char.char_unicode) == "Cc")
+                )
+            )
+        ]
+        if invalid:
+            sample = ", ".join(repr(char.char_unicode) for char in invalid[:6])
+            raise RuntimeError(
+                f"PDF glyph preflight failed on page {page.page_number}: {len(invalid)} invalid glyph(s): {sample}"
+            )
+
+        return [
+            CharacterRenderUnit(
+                char,
+                getattr(char, "render_order", 100),
+                getattr(char, "sub_render_order", i),
+            )
+            for i, char in enumerate(chars)
+        ]
 
     def create_render_units_for_page(
         self,
         page: il_version_1.Page,
         translation_config: TranslationConfig,
+        *,
+        skip_char: bool = False,
     ) -> list[RenderUnit]:
-        """Convert all renderable objects in a page to render units."""
-        render_units = []
-
-        # Collect all characters (from page and paragraphs)
-        chars = []
-        if page.pdf_character:
-            chars.extend(page.pdf_character)
-        for paragraph in page.pdf_paragraph:
-            chars.extend(self.render_paragraph_to_char(paragraph))
-
-        # Convert characters to render units
-        for i, char in enumerate(chars):
-            render_order = getattr(char, "render_order", 100)  # Default render order
-            sub_render_order = getattr(char, "sub_render_order", i)
-            render_units.append(
-                CharacterRenderUnit(char, render_order, sub_render_order)
-            )
+        """Convert the requested page objects to render units."""
+        render_units: list[RenderUnit] = []
+        if not skip_char:
+            render_units.extend(self._create_character_render_units(page))
 
         # Collect forms from formulas within paragraphs
         formula_forms = []
@@ -675,13 +760,17 @@ class PDFCreater:
                     FormRenderUnit(form, render_order, sub_render_order)
                 )
 
-        # Convert rectangles to render units (only for OCR workaround or debug)
+        # Convert rectangles to render units.  ``translated_code_band`` is a
+        # production semantic component created by the RTL typesetter; normal
+        # source/debug rectangles remain governed by the existing safeguards.
         for i, rect in enumerate(page.pdf_rectangle):
             if (
                 translation_config.ocr_workaround
                 and not rect.debug_info
                 and rect.fill_background
-            ) or (translation_config.debug and rect.debug_info):
+            ) or (translation_config.debug and rect.debug_info) or (
+                rect.debug_info == "translated_code_band"
+            ):
                 render_order = getattr(
                     rect, "render_order", 10
                 )  # Rectangles render first
@@ -805,12 +894,177 @@ class PDFCreater:
         # Restore graphics state
         draw_op.append(b" n Q\n")
 
+    def _ensure_continuation_pages_in_pdf(self, pdf: pymupdf.Document) -> None:
+        """Insert continuation pages with source resources for moved text and graphics."""
+        if not any(getattr(p, "continuation_of_page", None) is not None for p in self.docs.page):
+            return
+        docs_have_gaps = any(
+            getattr(p, "continuation_of_page", None) is None and p.page_number != idx
+            for idx, p in enumerate(self.docs.page)
+        )
+        for idx, il_page in enumerate(self.docs.page):
+            if not docs_have_gaps and il_page.page_number != idx:
+                il_page.page_number = idx
+            if (
+                getattr(il_page, "continuation_of_page", None) is not None
+                and (docs_have_gaps or pdf.page_count < len(self.docs.page))
+            ):
+                insert_pno = max(0, min(il_page.page_number, pdf.page_count))
+                crop = (
+                    il_page.cropbox.box
+                    if il_page.cropbox and il_page.cropbox.box
+                    else (
+                        il_page.mediabox.box
+                        if il_page.mediabox and il_page.mediabox.box
+                        else None
+                    )
+                )
+                width = max(1.0, crop.x2 - crop.x) if crop else 595.0
+                height = max(1.0, crop.y2 - crop.y) if crop else 842.0
+                new_page = pdf.new_page(pno=insert_pno, width=width, height=height)
+                try:
+                    resource_dict = "<< >>"
+                    if insert_pno > 0 and insert_pno - 1 < pdf.page_count:
+                        src_xref = pdf[insert_pno - 1].xref
+                        visited: set[int] = set()
+                        while src_xref not in visited:
+                            visited.add(src_xref)
+                            res_type, res_value = pdf.xref_get_key(src_xref, "Resources")
+                            if res_type in {"xref", "dict"}:
+                                if res_type == "xref":
+                                    res_value = pdf.xref_object(int(res_value.split()[0]))
+                                if res_value.strip().startswith("<<"):
+                                    resource_dict = res_value
+                                break
+                            parent_type, parent_value = pdf.xref_get_key(src_xref, "Parent")
+                            if parent_type != "xref":
+                                break
+                            src_xref = int(parent_value.split()[0])
+                    pdf.xref_set_key(new_page.xref, "Resources", resource_dict)
+                    font_type, font_value = pdf.xref_get_key(new_page.xref, "Resources/Font")
+                    if font_type == "xref":
+                        # Font registration on the continuation must not
+                        # mutate the source's shared font dictionary.
+                        font_dict = pdf.xref_object(int(font_value.split()[0]))
+                        pdf.xref_set_key(new_page.xref, "Resources/Font", font_dict)
+                    elif font_type == "null":
+                        pdf.xref_set_key(new_page.xref, "Resources/Font", "<< >>")
+                except Exception:
+                    logger.debug("Failed to initialize resources on continuation page %s", idx)
+
+    @staticmethod
+    def _resolve_original_source_pages(
+        docs_pages: list[il_version_1.Page],
+    ) -> list[int | None]:
+        """Return each IL page's true 0-based original source page index, or None for continuations."""
+        resolved: list[int | None] = []
+        prior_continuations = 0
+        orig_cursor = 0
+        for il_page in docs_pages:
+            if getattr(il_page, "continuation_of_page", None) is not None:
+                resolved.append(None)
+                prior_continuations += 1
+                continue
+            src_num = getattr(il_page, "source_page_number", None)
+            if src_num is not None:
+                orig_idx = int(src_num)
+            elif getattr(il_page, "page_number", None) is not None:
+                orig_idx = int(il_page.page_number) - prior_continuations
+            else:
+                orig_idx = orig_cursor
+            resolved.append(orig_idx)
+            orig_cursor += 1
+        return resolved
+
+    @staticmethod
+    def _resolve_continuation_owners(
+        docs_pages: list[il_version_1.Page],
+        orig_source_pages: list[int | None],
+    ) -> list[int | None]:
+        """Return the owning original 0-based source page for every IL page (including continuations)."""
+        shifted_to_orig: dict[int, int] = {}
+        owners: list[int | None] = []
+        last_orig: int | None = None
+        for il_page, orig_idx in zip(docs_pages, orig_source_pages):
+            if orig_idx is not None:
+                if getattr(il_page, "page_number", None) is not None:
+                    shifted_to_orig[int(il_page.page_number)] = orig_idx
+                last_orig = orig_idx
+                owners.append(orig_idx)
+            else:
+                cont_ref = getattr(il_page, "continuation_of_page", None)
+                owner = shifted_to_orig.get(cont_ref) if cont_ref is not None else None
+                if owner is None:
+                    owner = last_orig if last_orig is not None else cont_ref
+                owners.append(owner)
+        return owners
+
+    def _aligned_dual_page_pairs(
+        self,
+        original_count: int,
+        translated_count: int,
+        selected_pages: list[int] | None = None,
+    ) -> list[tuple[int | None, int]]:
+        """Map translated page indices (including continuation pages) to original page indices."""
+        docs = getattr(self, "docs", None)
+        docs_pages = list(docs.page) if docs and docs.page else []
+        if not docs_pages:
+            total = max(original_count, translated_count)
+            return [
+                (i if i < original_count else None, i)
+                for i in range(translated_count)
+            ] if total else []
+
+        orig_source_pages = self._resolve_original_source_pages(docs_pages)
+        if len(docs_pages) != translated_count:
+            if selected_pages is not None:
+                selected_set = set(selected_pages)
+                owners = self._resolve_continuation_owners(docs_pages, orig_source_pages)
+                kept_origs = [
+                    orig_idx
+                    for orig_idx, owner in zip(orig_source_pages, owners)
+                    if owner in selected_set
+                ]
+                if len(kept_origs) != translated_count:
+                    raise ValueError(
+                        "Selected dual-page mapping does not cover every translated page"
+                    )
+            else:
+                total = max(original_count, translated_count)
+                return [
+                    (i if i < original_count else None, i)
+                    for i in range(translated_count)
+                ] if total else []
+        else:
+            kept_origs = orig_source_pages
+
+        orig_index_map = (
+            {orig_pno: pos for pos, orig_pno in enumerate(selected_pages)}
+            if selected_pages is not None
+            else None
+        )
+        pairs: list[tuple[int | None, int]] = []
+        for trans_idx, orig_idx in enumerate(kept_origs):
+            if orig_idx is None:
+                pairs.append((None, trans_idx))
+            elif orig_index_map is not None:
+                mapped = orig_index_map.get(orig_idx)
+                if mapped is None or mapped >= original_count:
+                    raise ValueError(
+                        f"Translated page {trans_idx} references unselected source page {orig_idx}"
+                    )
+                pairs.append((mapped, trans_idx))
+            else:
+                pairs.append((orig_idx if 0 <= orig_idx < original_count else None, trans_idx))
+        return pairs
+
     def create_side_by_side_dual_pdf(
         self,
         original_pdf: pymupdf.Document,
         translated_pdf: pymupdf.Document,
         dual_out_path: str,
         translation_config: TranslationConfig,
+        aligned_pairs: list[tuple[int | None, int]] | None = None,
     ) -> pymupdf.Document:
         """Create a dual PDF with side-by-side pages (original and translation).
 
@@ -825,22 +1079,31 @@ class PDFCreater:
         """
         # Create a new PDF for side-by-side pages
         dual = pymupdf.open()
-        page_count = min(original_pdf.page_count, translated_pdf.page_count)
+        pairs = aligned_pairs or self._aligned_dual_page_pairs(
+            original_pdf.page_count, translated_pdf.page_count,
+        )
 
-        for page_id in range(page_count):
-            # Get pages from both PDFs
-            orig_page = original_pdf[page_id]
-            trans_page = translated_pdf[page_id]
-            rotate_angle = orig_page.rotation
-            total_width = orig_page.rect.width + trans_page.rect.width
-            max_height = max(orig_page.rect.height, trans_page.rect.height)
+        for orig_id, trans_id in pairs:
+            trans_page = translated_pdf[trans_id]
+            if orig_id is not None:
+                orig_page = original_pdf[orig_id]
+                rotate_angle = orig_page.rotation
+                orig_w = orig_page.rect.width
+                orig_h = orig_page.rect.height
+                orig_page.set_rotation(0)
+            else:
+                rotate_angle = 0
+                orig_w = trans_page.rect.width
+                orig_h = trans_page.rect.height
+
+            total_width = orig_w + trans_page.rect.width
+            max_height = max(orig_h, trans_page.rect.height)
             left_width = (
-                orig_page.rect.width
+                orig_w
                 if not translation_config.dual_translate_first
                 else trans_page.rect.width
             )
 
-            orig_page.set_rotation(0)
             trans_page.set_rotation(0)
 
             # Create new page with combined width
@@ -854,39 +1117,71 @@ class PDFCreater:
             if translation_config.dual_translate_first:
                 # Show translated page on left and original on right
                 rect_left, rect_right = rect_right, rect_left
-            try:
-                # Show original page on left and translated on right (default)
-                dual_page.show_pdf_page(
-                    rect_left,
-                    original_pdf,
-                    page_id,
-                    keep_proportion=True,
-                    rotate=-rotate_angle,
-                )
-            except Exception as e:
-                logger.warning(
-                    f"Failed to show original page on left and translated on right (default). "
-                    f"Page ID: {page_id}. "
-                    f"Original PDF: {self.original_pdf_path}. "
-                    f"Translated PDF: {translation_config.input_file}. ",
-                    exc_info=e,
-                )
+            if orig_id is not None:
+                try:
+                    # Show original page on left and translated on right (default)
+                    dual_page.show_pdf_page(
+                        rect_left,
+                        original_pdf,
+                        orig_id,
+                        keep_proportion=True,
+                        rotate=-rotate_angle,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to show original page on left and translated on right (default). "
+                        f"Page ID: {orig_id}. "
+                        f"Original PDF: {self.original_pdf_path}. "
+                        f"Translated PDF: {translation_config.input_file}. ",
+                        exc_info=e,
+                    )
             try:
                 dual_page.show_pdf_page(
                     rect_right,
                     translated_pdf,
-                    page_id,
+                    trans_id,
                     keep_proportion=True,
                     rotate=-rotate_angle,
                 )
             except Exception as e:
                 logger.warning(
                     f"Failed to show translated page on left and original on right. "
-                    f"Page ID: {page_id}. "
+                    f"Page ID: {trans_id}. "
                     f"Original PDF: {self.original_pdf_path}. "
                     f"Translated PDF: {translation_config.input_file}. ",
                     exc_info=e,
                 )
+        return dual
+
+    def _create_dual_pdf(
+        self,
+        translated_pdf: pymupdf.Document,
+        dual_out_path: str | Path,
+        translation_config: TranslationConfig,
+        selected_pages: list[int] | None,
+    ) -> pymupdf.Document:
+        original_pdf = pymupdf.open(self.original_pdf_path)
+        try:
+            if selected_pages is not None:
+                original_pdf.select(selected_pages)
+            aligned_pairs = self._aligned_dual_page_pairs(
+                original_pdf.page_count,
+                translated_pdf.page_count,
+                selected_pages=selected_pages,
+            )
+            if translation_config.use_alternating_pages_dual:
+                return self.create_alternating_pages_dual_pdf(
+                    original_pdf, translated_pdf, translation_config,
+                    aligned_pairs=aligned_pairs,
+                )
+            dual = self.create_side_by_side_dual_pdf(
+                original_pdf, translated_pdf, dual_out_path, translation_config,
+                aligned_pairs=aligned_pairs,
+            )
+        except BaseException:
+            original_pdf.close()
+            raise
+        original_pdf.close()
         return dual
 
     def create_alternating_pages_dual_pdf(
@@ -894,6 +1189,7 @@ class PDFCreater:
         original_pdf: pymupdf.Document,
         translated_pdf: pymupdf.Document,
         translation_config: TranslationConfig,
+        aligned_pairs: list[tuple[int | None, int]] | None = None,
     ) -> pymupdf.Document:
         """Create a dual PDF with alternating pages (original and translation).
 
@@ -905,18 +1201,44 @@ class PDFCreater:
         Returns:
             The created dual PDF document
         """
-        # Open the original PDF and insert translated PDF
-        dual = original_pdf
-        dual.insert_file(translated_pdf)
+        pairs = aligned_pairs or self._aligned_dual_page_pairs(
+            original_pdf.page_count, translated_pdf.page_count,
+        )
+        if (
+            original_pdf.page_count == translated_pdf.page_count
+            and len(pairs) == original_pdf.page_count
+            and all(
+                orig_id == idx and trans_id == idx
+                for idx, (orig_id, trans_id) in enumerate(pairs)
+            )
+        ):
+            # Fast path when page counts match 1:1
+            dual = original_pdf
+            dual.insert_file(translated_pdf)
 
-        # Rearrange pages to alternate between original and translated
-        page_count = translated_pdf.page_count
-        for page_id in range(page_count):
+            page_count = translated_pdf.page_count
+            for page_id in range(page_count):
+                current = page_count + page_id
+                target = page_id * 2 + int(not translation_config.dual_translate_first)
+                if current != target:
+                    dual.move_page(current, target)
+            return dual
+
+        dual = pymupdf.open()
+        for orig_id, trans_id in pairs:
+            trans_rect = translated_pdf[trans_id].rect
             if translation_config.dual_translate_first:
-                dual.move_page(page_count + page_id, page_id * 2)
+                dual.insert_pdf(translated_pdf, from_page=trans_id, to_page=trans_id)
+                if orig_id is not None:
+                    dual.insert_pdf(original_pdf, from_page=orig_id, to_page=orig_id)
+                else:
+                    dual.new_page(width=trans_rect.width, height=trans_rect.height)
             else:
-                dual.move_page(page_count + page_id, page_id * 2 + 1)
-
+                if orig_id is not None:
+                    dual.insert_pdf(original_pdf, from_page=orig_id, to_page=orig_id)
+                else:
+                    dual.new_page(width=trans_rect.width, height=trans_rect.height)
+                dual.insert_pdf(translated_pdf, from_page=trans_id, to_page=trans_id)
         return dual
 
     def write_debug_info(
@@ -948,16 +1270,16 @@ class PDFCreater:
             page_op.append(
                 f"q Q 1 0 0 1 {page.cropbox.box.x:.6f} {page.cropbox.box.y:.6f} cm \n".encode(),
             )
-            # 收集所有字符
+            # æ”¶é›†æ‰€æœ‰å­—ç¬¦
             chars = []
-            # 首先添加页面级别的字符
+            # é¦–å…ˆæ·»åŠ é¡µé¢çº§åˆ«çš„å­—ç¬¦
             if page.pdf_character:
                 chars.extend(page.pdf_character)
-            # 然后添加段落中的字符
+            # ç„¶åŽæ·»åŠ æ®µè½ä¸­çš„å­—ç¬¦
             for paragraph in page.pdf_paragraph:
                 chars.extend(self.render_paragraph_to_char(paragraph))
 
-            # 渲染所有字符
+            # æ¸²æŸ“æ‰€æœ‰å­—ç¬¦
             for char in chars:
                 if not getattr(char, "debug_info", False):
                     continue
@@ -1004,7 +1326,7 @@ class PDFCreater:
             pdf.update_stream(int(resource_xref_id), draw_op.tobytes())
         translation_config.raise_if_cancelled()
 
-        # 使用子进程进行字体子集化
+        # ä½¿ç”¨å­è¿›ç¨‹è¿›è¡Œå­—ä½“å­é›†åŒ–
         if not translation_config.skip_clean:
             pdf = self.subset_fonts_in_subprocess(pdf, translation_config, tag="debug")
         return pdf
@@ -1075,8 +1397,24 @@ class PDFCreater:
             and Path(temp_output).exists()
             and Path(temp_output).stat().st_size > 0
         ):
+            # Pre-flight / Post-subset audit: Check for .notdef (glyph 0) in subsetted PDF
+            candidate_pdf = pymupdf.open(temp_output)
+            has_corrupted_glyphs = False
+            for pno in range(len(candidate_pdf)):
+                contents = candidate_pdf[pno].read_contents()
+                if re.search(rb'<0{2,4}>\s*Tj', contents):
+                    has_corrupted_glyphs = True
+                    break
+
+            if has_corrupted_glyphs:
+                logger.warning(
+                    "Font subsetting introduced .notdef (glyph 0) characters; falling back to unsubsetted full font PDF to eliminate tofu boxes."
+                )
+                candidate_pdf.close()
+                return original_pdf
+
             logger.info("Font subsetting completed successfully")
-            return pymupdf.open(temp_output)
+            return candidate_pdf
         else:
             logger.warning(
                 f"Font subsetting failed with exit code {exit_code} or produced empty file"
@@ -1238,6 +1576,14 @@ class PDFCreater:
         translation_config: TranslationConfig,
         check_font_exists: bool = False,
     ) -> TranslateResult:
+        # Add detailed logging at the start
+        if self.detailed_logger:
+            self.detailed_logger.start_stage("Generate Drawing Instructions")
+            self.detailed_logger.log_step(
+                "PDF Generation Started",
+                f"Total pages: {len(self.docs.page)}"
+            )
+        
         try:
             basename = Path(translation_config.input_file).stem
             debug_suffix = ".debug" if translation_config.debug else ""
@@ -1250,20 +1596,39 @@ class PDFCreater:
                 f"{basename}{debug_suffix}.{translation_config.lang_out}.mono.pdf",
             )
             pdf = pymupdf.open(self.original_pdf_path)
+            self._ensure_continuation_pages_in_pdf(pdf)
             self.font_mapper.add_font(pdf, self.docs)
+            
             with self.translation_config.progress_monitor.stage_start(
                 self.stage_name,
                 len(self.docs.page),
             ) as pbar:
-                for page in self.docs.page:
+                # Add detailed logging for each page being rendered
+                for i, page in enumerate(self.docs.page):
+                    if self.detailed_logger:
+                        char_count = len(page.pdf_character) if hasattr(page, 'pdf_character') else 0
+                        para_count = len(page.pdf_paragraph) if hasattr(page, 'pdf_paragraph') else 0
+                        
+                        self.detailed_logger.log_step(
+                            f"Rendering Page {i+1}",
+                            f"Characters: {char_count}, Paragraphs: {para_count}"
+                        )
+                    
                     self.update_page_content_stream(
                         check_font_exists, page, pdf, translation_config
                     )
                     pbar.advance()
+            
             translation_config.raise_if_cancelled()
             gc_level = 1
             if self.translation_config.ocr_workaround:
                 gc_level = 4
+            
+            # Add detailed logging for font subsetting
+            if self.detailed_logger:
+                self.detailed_logger.start_stage("Subset Font")
+                self.detailed_logger.log_step("Font subsetting started")
+            
             with self.translation_config.progress_monitor.stage_start(
                 SUBSET_FONT_STAGE_NAME,
                 1,
@@ -1274,26 +1639,52 @@ class PDFCreater:
                     )
 
                 pbar.advance()
+            
+            # Add detailed logging after font subsetting
+            if self.detailed_logger:
+                self.detailed_logger.log_step("Font subsetting complete")
+                self.detailed_logger.end_stage("Subset Font")
+            
             try:
                 self.restore_media_box(pdf, self.mediabox_data)
             except Exception:
                 logger.exception("restore media box failed")
 
+            selected_pages = None
             if translation_config.only_include_translated_page:
-                total_page = set(range(0, len(pdf)))
-
-                pages_to_translate = {
-                    page.page_number
-                    for page in self.docs.page
-                    if self.translation_config.should_translate_page(
-                        page.page_number + 1
+                selected_orig_pages: list[int] = []
+                selected_trans_pages: list[int] = []
+                docs_pages = list(self.docs.page or [])
+                orig_source_pages = self._resolve_original_source_pages(docs_pages)
+                page_owners = self._resolve_continuation_owners(docs_pages, orig_source_pages)
+                docs_have_gaps = any(
+                    orig_idx is not None and orig_idx != seq_idx
+                    for seq_idx, orig_idx in enumerate(
+                        [o for o in orig_source_pages if o is not None]
                     )
-                }
+                )
+                for page, orig_idx, owner_orig in zip(docs_pages, orig_source_pages, page_owners):
+                    if orig_idx is None:
+                        if owner_orig is not None and (
+                            docs_have_gaps or self.translation_config.should_translate_page(owner_orig + 1)
+                        ):
+                            if 0 <= page.page_number < pdf.page_count:
+                                selected_trans_pages.append(page.page_number)
+                    else:
+                        if docs_have_gaps or self.translation_config.should_translate_page(orig_idx + 1):
+                            if 0 <= orig_idx < pdf.page_count:
+                                selected_orig_pages.append(orig_idx)
+                            if 0 <= page.page_number < pdf.page_count:
+                                selected_trans_pages.append(page.page_number)
+                selected_pages = sorted(set(selected_orig_pages))
+                if selected_trans_pages:
+                    pdf.select(sorted(set(selected_trans_pages)))
 
-                should_removed_page = list(total_page - pages_to_translate)
-
-                pdf.delete_pages(should_removed_page)
-
+            # Add detailed logging before saving
+            if self.detailed_logger:
+                self.detailed_logger.start_stage("Save PDF")
+                self.detailed_logger.log_step("Saving PDF files")
+            
             with self.translation_config.progress_monitor.stage_start(
                 SAVE_PDF_STAGE_NAME,
                 2,
@@ -1324,73 +1715,34 @@ class PDFCreater:
                     dual_out_path = translation_config.get_output_file_path(
                         f"{basename}{debug_suffix}.{translation_config.lang_out}.dual.pdf",
                     )
-                    translation_config.raise_if_cancelled()
-                    original_pdf = pymupdf.open(self.original_pdf_path)
-
-                    if translation_config.debug:
-                        translation_config.raise_if_cancelled()
-                        try:
-                            original_pdf = self.write_debug_info(
-                                original_pdf, translation_config
-                            )
-                        except Exception:
-                            logger.warning(
-                                "Failed to write debug info to dual PDF",
-                                exc_info=True,
-                            )
-
-                    if (
-                        self.translation_config.only_include_translated_page
-                        and should_removed_page
-                    ):
-                        original_pdf.delete_pages(should_removed_page)
-                    translated_pdf = pdf
-
-                    # Choose between alternating pages and side-by-side format
-                    # Default to side-by-side if not specified
-                    use_alternating_pages = (
-                        translation_config.use_alternating_pages_dual
-                    )
-
-                    if use_alternating_pages:
-                        # Create a dual PDF with alternating pages (original and translation)
-                        dual = self.create_alternating_pages_dual_pdf(
-                            original_pdf,
-                            translated_pdf,
-                            translation_config,
-                        )
-                    else:
-                        # Create a dual PDF with side-by-side pages (original and translation)
-                        dual = self.create_side_by_side_dual_pdf(
-                            original_pdf,
-                            translated_pdf,
+                    with self._create_dual_pdf(
+                        pdf, dual_out_path, translation_config, selected_pages,
+                    ) as dual:
+                        self.save_pdf_with_timeout(
+                            dual,
                             dual_out_path,
                             translation_config,
+                            garbage=gc_level,
+                            deflate=True,
+                            clean=not translation_config.skip_clean,
+                            deflate_fonts=True,
+                            linear=False,
+                            tag="dual",
                         )
-
-                    self.save_pdf_with_timeout(
-                        dual,
-                        dual_out_path,
-                        translation_config,
-                        garbage=gc_level,
-                        deflate=True,
-                        clean=not translation_config.skip_clean,
-                        deflate_fonts=True,
-                        linear=False,
-                        tag="dual",
-                    )
-                    if translation_config.debug:
-                        translation_config.raise_if_cancelled()
-                        dual.save(
-                            f"{dual_out_path}.decompressed.pdf",
-                            expand=True,
-                            pretty=True,
-                        )
+                        if translation_config.debug:
+                            translation_config.raise_if_cancelled()
+                            dual.save(
+                                f"{dual_out_path}.decompressed.pdf",
+                                expand=True,
+                                pretty=True,
+                            )
                 pbar.advance()
+            
             if self.translation_config.no_mono:
                 mono_out_path = None
             if self.translation_config.no_dual:
                 dual_out_path = None
+            
             auto_extracted_glossary_path = None
             if (
                 self.translation_config.save_auto_extracted_glossary
@@ -1407,6 +1759,16 @@ class PDFCreater:
                         self.translation_config.shared_context_cross_split_part.auto_extracted_glossary.to_csv()
                     )
 
+            # Add detailed logging after saving is complete
+            if self.detailed_logger:
+                self.detailed_logger.log_step(
+                    "PDF Save Complete",
+                    f"Mono PDF: {mono_out_path}\n"
+                    f"Dual PDF: {dual_out_path}"
+                )
+                self.detailed_logger.end_stage("Save PDF")
+                self.detailed_logger.end_stage("Generate Drawing Instructions")
+            
             return TranslateResult(
                 mono_out_path, dual_out_path, auto_extracted_glossary_path
             )
@@ -1482,13 +1844,9 @@ class PDFCreater:
             check_font_exists=check_font_exists,
         )
         # Create render units for all renderable objects
-        render_units = self.create_render_units_for_page(page, translation_config)
-        if skip_char:
-            render_units = [
-                unit
-                for unit in render_units
-                if not isinstance(unit, CharacterRenderUnit)
-            ]
+        render_units = self.create_render_units_for_page(
+            page, translation_config, skip_char=skip_char
+        )
         # Render all units to their appropriate streams
         self.render_units_to_stream(render_units, context, page_op, xobj_draw_ops)
         # Update xobject streams

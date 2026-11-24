@@ -1,387 +1,97 @@
-# Arabic-RTL Document Translator
+---
+title: TransDOC Translator
+emoji: 📄
+colorFrom: blue
+colorTo: purple
+sdk: docker
+app_port: 7860
+pinned: false
+---
 
-A fork of [BabelDOC](https://github.com/funstory-ai/BabelDOC) (by awwaawwa / funstory.ai) extended for right-to-left document translation. BabelDOC's typesetting pipeline is built for left-to-right languages; translating into Arabic requires more than swapping the target language code — glyph shaping, bidirectional text ordering, and layout mirroring all need separate handling to keep the output readable and correctly justified.
+# TransDOC (Doc-Translator V2.1)
+> Intelligent English-to-Arabic PDF Document Translation & Typesetting with Layout Preservation
 
-## What's different from upstream
+TransDOC is an enterprise-grade document translation and typesetting platform engineered specifically for translating complex PDF documents from **English (LTR) to Arabic (RTL)** while preserving the 1:1 visual structure, geometry, typography hierarchy, tables, charts, formulas, and diagrams.
 
-- `babeldoc/format/pdf/document_il/utils/rtl.py` — Arabic text shaping (contextual letter forms and ligatures via `arabic_reshaper`) combined with the Unicode bidi algorithm (`python-bidi`) so shaped Arabic renders correctly inside the PDF's left-to-right glyph stream.
-- `babeldoc/tools/arabic_text_shaper.py` — standalone CLI for inspecting shaping output character-by-character, used to debug reshaping regressions independent of the full PDF pipeline.
-- Typesetting and mid-end translation stages (`typesetting.py`, `il_translator.py`) updated to route Arabic output through the shaper before layout, and to handle RTL-specific line and paragraph direction.
-- Test coverage in `tests/test_arabic_typesetting.py` and `babeldoc/tools/test_arabic_reshaping.py`.
+Built on the **BabelDOC** intermediate-language framework, TransDOC introduces specialized algorithms for financial, economic, and government policy publications (such as Qatar Central Bank monetary bulletins and National Development Strategy reports).
 
-Everything else — layout analysis, PDF reconstruction, translation backends, glossary handling, offline asset packaging — is BabelDOC's existing pipeline; the reference documentation below is inherited from upstream and still describes this fork's CLI accurately.
+---
 
-This project is licensed under AGPL-3.0, the same as upstream — see [LICENSE](LICENSE). It's a derivative work of BabelDOC and inherits its copyleft terms; the license cannot be changed to something more permissive or non-commercial by a downstream fork.
+## 🌟 Key Capabilities & Features
 
-## Getting Started
+- **Advanced RTL Typesetting**:
+  - **Per-Line BiDi Algorithm**: Breaks text into lines before applying Unicode Bidirectional reordering, preventing line-wrap corruption.
+  - **Bullet Points & Inverted Hanging Indents**: First line flush with right margin; subsequent lines indented inward.
+  - **Running Header/Footer & Page Number Mirroring**: Automatically mirrors top/bottom margins across the vertical midline.
+  - **Chronological Axis Preservation**: Preserves LTR time-series axes (e.g. `Jan ... Dec`) to match visual chart data curves.
+  - **Punctuation BiDi Locking (RLM `\u200F`)**: Ensures trailing periods, colons, and question marks after numbers/acronyms remain on the left side of Arabic sentences.
 
-### Install from PyPI
+- **Typography & Font Weight Hierarchy**:
+  - **Font Weight Detection & Mapping**: Automatically detects bold English fonts (`Arial-BoldMT`, `Helvetica-Bold`) and maps them to `GoNotoKurrent-Bold.ttf`.
+  - **Optical Scale Compensation (`1.08x`)**: Enlarges Arabic glyphs to balance visual weight against Latin text.
+  - **Hierarchy Isolation**: Protects titles, headings, captions, and footnotes from being shrunk down by body text scaling.
+  - **Role-Based Scale Floors**: Strict minimum scaling thresholds (Titles `>= 0.88`, Captions `>= 0.82`, Body `>= 0.72`).
 
-We recommend using the Tool feature of [uv](https://github.com/astral-sh/uv) to install yadt.
+- **Financial & Technical Translation Integrity**:
+  - **Numeral & Formula Protection (`_protect_numerals`)**: Shields numbers, years, percentages, and equation labels `(2018=100)` with `{0}`, `{1}` placeholders to prevent Seq2Seq looping or hallucination.
+  - **Pure Passthrough Detection**: Completely bypasses translation for purely numerical table cells, years, and financial codes.
+  - **Automated Terminology Normalization**: Fixes currency mistranslations (`كرو` -> `ريال قطري`, `QR million`, `QR billion`), basis points (`bps` -> `نقطة أساس`), and petroleum terms (`غير الزيت` -> `غير النفط`).
 
-1. First, you need to refer to [uv installation](https://github.com/astral-sh/uv#installation) to install uv and set up the `PATH` environment variable as prompted.
+- **Multi-Engine Translation Support**:
+  - **Meta NLLB-200** (`facebook/nllb-200-distilled-600M` and `facebook/nllb-200-3.3B`): Offline translation with CPU/GPU execution, beam search, and repetition penalties.
+  - **MarianMT**: Lightweight offline local translation for CPU deployments.
+  - **OpenAI GPT-4o-mini / GPT-4o**: Cloud LLM translation with dynamic bilingual glossary extraction.
 
-2. Use the following command to install yadt:
+- **Dual & Monolingual PDF Outputs**:
+  - Export clean monolingual Arabic PDFs (`.mono.pdf`) or side-by-side bilingual reading PDFs (`.dual.pdf`).
 
-```bash
-# Basic installation
-uv tool install --python 3.12 BabelDOC
+- **Interactive Web Interface & FastAPI Server**:
+  - Modern web UI (`frontend/index.html`) with drag-and-drop file upload, model picker, layout mode selector, and dual/mono download buttons.
+  - Real-time Server-Sent Events (SSE) streaming progress across all 13 pipeline stages.
 
-# With HuggingFace support
-uv tool install --python 3.12 "BabelDOC[huggingface]"
+---
 
-babeldoc --help
+## 📚 Technical Documentation
+
+For in-depth explanations and specifications, see the detailed documentation:
+
+- [Project Guide](docs/PROJECT_GUIDE.md): beginner-friendly map of the application and PDF translation flow.
+- [Engineering Backlog](docs/ENGINEERING_BACKLOG.md): the current prioritized work list; dated reports below are historical.
+- [Testing & Operations](docs/TESTING_AND_OPERATIONS.md): current test inventory and commands (results are only current when recorded with a run).
+- [Security & Deployment](docs/SECURITY_AND_DEPLOYMENT.md): upload/session boundaries and deployment review points.
+- [Changelog](docs/CHANGELOG.md): completed changes by release; planned work stays in the backlog.
+
+- [System Architecture & 13-Stage Pipeline](docs/ARCHITECTURE.md): Data structures (`Box`, `PdfParagraph`, `TypesettingUnit`), intermediate representation, and stage breakdown.
+- [RTL Layout & Typesetting Deep-Dive](docs/RTL_AND_TYPESETTING.md): Per-line BiDi algorithm, hanging indents, page mirroring, timeline axes, and optical font scaling.
+- [Financial Translation Rules & Token Protection](docs/FINANCIAL_TRANSLATION_RULES.md): Numeral protection, curly bracket placeholders, regex patterns, acronym preservation, and RLM locking.
+- [Translation Engines, Server & Frontend](docs/ENGINES_AND_SERVER.md): NLLB-200, MarianMT, OpenAI, FastAPI REST/SSE endpoints, and Web UI architecture.
+
+---
+
+## 🚀 Quick Start
+
+### 1. Run Regression Tests
+Run the current test suite (the command is documented; no result is implied here):
+```powershell
+.venv\Scripts\python -m pytest -q
 ```
 
-Alternatively, you can use pip:
+### 2. Start the Web Server
+Launch the FastAPI application:
+```powershell
+.venv\Scripts\python -m uvicorn server:app --host 127.0.0.1 --port 7860
+```
+Open your browser at `http://localhost:7860/` to access the translation interface.
 
-```bash
-# Basic installation
-pip install BabelDOC
-
-# With HuggingFace support
-pip install "BabelDOC[huggingface]"
+### 3. Translate from Command Line
+```powershell
+.venv\Scripts\python -m babeldoc --files my_document.pdf --lang-in en --lang-out ar --openai
 ```
 
-3. Use the `babeldoc` command. For example:
+---
 
-```bash
-# Using HuggingFace MarianMT model (default, no additional flags needed)
-babeldoc --files example.pdf
+## Upstream Attribution & License
 
-# Using HuggingFace MarianMT model with explicit options
-babeldoc --huggingface --huggingface-model "marefa-nlp/marefa-mt-en-ar" --files example.pdf
+This project is an English-to-Arabic (RTL) adaptation of [BabelDOC](https://github.com/funstory-ai/BabelDOC) (created by `awwaawwa` / `funstory.ai`). The core PDF intermediate-language parser, layout analysis, asset packaging, and CLI infrastructure derive from upstream BabelDOC, extended here with Arabic glyph shaping, per-line RTL bidirectional typesetting, protected-content validation, table/footnote layout hardening, and a FastAPI web interface.
 
-# Using OpenAI
-babeldoc --openai --openai-model "gpt-4o-mini" --openai-base-url "https://api.openai.com/v1" --openai-api-key "your-api-key-here" --files example.pdf
-
-# Multiple files
-babeldoc --files example1.pdf --files example2.pdf
-```
-
-### Install from Source
-
-We still recommend using [uv](https://github.com/astral-sh/uv) to manage virtual environments.
-
-1. First, you need to refer to [uv installation](https://github.com/astral-sh/uv#installation) to install uv and set up the `PATH` environment variable as prompted.
-
-2. Use the following command to install yadt:
-
-```bash
-# clone this fork
-git clone https://github.com/muhammadaamirgulzar/Doc_Translator_MultiLingual
-
-# enter the project directory
-cd Doc_Translator_MultiLingual
-
-# install dependencies and run babeldoc
-uv run babeldoc --help
-```
-
-3. Use the `uv run babeldoc` command. For example:
-
-```bash
-# Using HuggingFace MarianMT model (default, no additional flags needed)
-uv run babeldoc --files example.pdf
-
-# Using HuggingFace MarianMT model with explicit options
-uv run babeldoc --huggingface --huggingface-model "marefa-nlp/marefa-mt-en-ar" --files example.pdf
-
-# Using OpenAI
-uv run babeldoc --files example.pdf --openai --openai-model "gpt-4o-mini" --openai-base-url "https://api.openai.com/v1" --openai-api-key "your-api-key-here"
-
-# Multiple files
-uv run babeldoc --files example.pdf --files example2.pdf
-```
-
-> [!TIP]
-> The absolute path is recommended.
-
-### Language Options
-
-- `--lang-in`, `-li`: Source language code (default: en)
-- `--lang-out`, `-lo`: Target language code (default: ar for Arabic)
-
-> [!TIP]
-> This project now defaults to English-to-Arabic translation using the MarianMT model. Other language pairs can be used by specifying the appropriate language codes and models.
-> 
-> (2025.3.1 update): Basic English target language support has been added, primarily to minimize line breaks within words([0-9A-Za-z]+).
-
-### PDF Processing Options
-
-- `--files`: One or more file paths to input PDF documents.
-- `--pages`, `-p`: Specify pages to translate (e.g., "1,2,1-,-3,3-5"). If not set, translate all pages
-- `--split-short-lines`: Force split short lines into different paragraphs (may cause poor typesetting & bugs)
-- `--short-line-split-factor`: Split threshold factor (default: 0.8). The actual threshold is the median length of all lines on the current page \* this factor
-- `--skip-clean`: Skip PDF cleaning step
-- `--dual-translate-first`: Put translated pages first in dual PDF mode (default: original pages first)
-- `--disable-rich-text-translate`: Disable rich text translation (may help improve compatibility with some PDFs)
-- `--enhance-compatibility`: Enable all compatibility enhancement options (equivalent to --skip-clean --dual-translate-first --disable-rich-text-translate)
-- `--use-alternating-pages-dual`: Use alternating pages mode for dual PDF. When enabled, original and translated pages are arranged in alternate order. When disabled (default), original and translated pages are shown side by side on the same page.
-- `--watermark-output-mode`: Control watermark output mode: 'watermarked' (default) adds watermark to translated PDF, 'no_watermark' doesn't add watermark, 'both' outputs both versions.
-- `--max-pages-per-part`: Maximum number of pages per part for split translation. If not set, no splitting will be performed.
-- `--no-watermark`: [DEPRECATED] Use --watermark-output-mode=no_watermark instead.
-- `--translate-table-text`: Translate table text (experimental, default: False)
-- `--formular-font-pattern`: Font pattern to identify formula text (default: None)
-- `--formular-char-pattern`: Character pattern to identify formula text (default: None)
-- `--show-char-box`: Show character bounding boxes (debug only, default: False)
-- `--skip-scanned-detection`: Skip scanned document detection (default: False). When using split translation, only the first part performs detection if not skipped.
-- `--ocr-workaround`: Use OCR workaround (default: False). Only suitable for documents with black text on white background. When enabled, white rectangular blocks will be added below the translation to cover the original text content, and all text will be forced to black color.
-- `--auto-enable-ocr-workaround`: Enable automatic OCR workaround (default: False). If a document is detected as heavily scanned, this will attempt to enable OCR processing and skip further scan detection. See "Important Interaction Note" below for crucial details on how this interacts with `--ocr-workaround` and `--skip-scanned-detection`.
-- `--primary-font-family`: Override primary font family for translated text. Choices: 'serif' for serif fonts, 'sans-serif' for sans-serif fonts, 'script' for script/italic fonts. If not specified, uses automatic font selection based on original text properties.
-- `--only-include-translated-page`: Only include translated pages in the output PDF. This option is only effective when `--pages` is used. (default: False)
-- `--merge-alternating-line-numbers`: Enable post-processing to merge alternating line-number layouts (keep the number paragraph as an independent paragraph b; merge adjacent text paragraphs a and c across it when `layout_id` and `xobj_id` match, digits are ASCII and spaces only). Default: off.
-- `--skip-form-render`: Skip form rendering (default: False). When enabled, PDF forms will not be rendered in the output.
-- `--skip-curve-render`: Skip curve rendering (default: False). When enabled, PDF curves will not be rendered in the output.
-- `--only-parse-generate-pdf`: Only parse PDF and generate output PDF without translation (default: False). This skips all translation-related processing including layout analysis, paragraph finding, style processing, and translation itself. Useful for testing PDF parsing and reconstruction functionality.
-- `--remove-non-formula-lines`: Remove non-formula lines from paragraph areas (default: False). This removes decorative lines that are not part of formulas, while protecting lines in figure/table areas. Useful for cleaning up documents with decorative elements that interfere with text flow.
-- `--non-formula-line-iou-threshold`: IoU threshold for detecting paragraph overlap when removing non-formula lines (default: 0.9). Higher values are more conservative and will remove fewer lines.
-- `--figure-table-protection-threshold`: IoU threshold for protecting lines in figure/table areas when removing non-formula lines (default: 0.9). Higher values provide more protection for structural elements in figures and tables.
-
-- `--rpc-doclayout`: RPC service host address for document layout analysis (default: None)
-- `--working-dir`: Working directory for translation. If not set, use temp directory.
-- `--no-auto-extract-glossary`: Disable automatic term extraction. If this flag is present, the step is skipped. Defaults to enabled.
-- `--save-auto-extracted-glossary`: Save automatically extracted glossary to the specified file. If not set, the glossary will not be saved.
-
-> [!TIP]
-> - Both `--skip-clean` and `--dual-translate-first` may help improve compatibility with some PDF readers
-> - `--disable-rich-text-translate` can also help with compatibility by simplifying translation input
-> - However, using `--skip-clean` will result in larger file sizes
-> - If you encounter any compatibility issues, try using `--enhance-compatibility` first
-> - Use `--max-pages-per-part` for large documents to split them into smaller parts for translation and automatically merge them back.
-> - Use `--skip-scanned-detection` to speed up processing when you know your document is not a scanned PDF.
-> - Use `--ocr-workaround` to fill background for scanned PDF. (Current assumption: background is pure white, text is pure black, this option will also auto enable `--skip-scanned-detection`)
-
-### Translation Service Options
-
-- `--qps`: QPS (Queries Per Second) limit for translation service (default: 4)
-- `--ignore-cache`: Ignore translation cache and force retranslation
-- `--no-dual`: Do not output bilingual PDF files
-- `--no-mono`: Do not output monolingual PDF files
-- `--min-text-length`: Minimum text length to translate (default: 5)
-- `--openai`: Use OpenAI for translation (requires API key)
-- `--huggingface`: Use HuggingFace for translation (default)
-- `--custom-system-prompt`: Custom system prompt for translation.
-- `--add-formula-placehold-hint`: Add formula placeholder hint for translation. (Currently not recommended, it may affect translation quality, default: False)
-- `--pool-max-workers`: Maximum number of worker threads for internal task processing pools. If not specified, defaults to QPS value. This parameter directly sets the worker count, replacing previous QPS-based dynamic calculations.
-- `--no-auto-extract-glossary`: Disable automatic term extraction. If this flag is present, the step is skipped. Defaults to enabled.
-
-> [!TIP]
->
-> 1. BabelDOC now uses HuggingFace's MarianMT model (marefa-nlp/marefa-mt-en-ar) for English to Arabic translation by default.
-> 2. BabelDOC also supports OpenAI-compatible LLMs by using the `--openai` flag with an API key.
-> 3. For OpenAI-compatible LLMs, it is recommended to use models with strong compatibility with OpenAI, such as: `glm-4-flash`, `deepseek-chat`, etc.
-> 4. For HuggingFace models, translation-specific models like MarianMT models (marefa-nlp/marefa-mt-en-ar) and Helsinki-NLP's Opus-MT series work best.
-> 5. Currently, it has not been optimized for traditional translation engines like Bing/Google, it is recommended to use LLMs.
-> 6. You can use [litellm](https://github.com/BerriAI/litellm) to access multiple models.
-> 7. `--custom-system-prompt`: It is mainly used to add the `/no_think` instruction of Qwen 3 in the prompt. For example: `--custom-system-prompt "/no_think You are a professional, authentic machine translation engine."`
-
-### OpenAI Specific Options
-
-- `--openai-model`: OpenAI model to use (default: gpt-4o-mini)
-- `--openai-base-url`: Base URL for OpenAI API
-- `--openai-api-key`: API key for OpenAI service
-- `--enable-json-mode-if-requested`: Enable JSON mode for OpenAI requests (default: False)
-
-> [!TIP]
->
-> 1. This tool supports any OpenAI-compatible API endpoints. Just set the correct base URL and API key. (e.g. `https://xxx.custom.xxx/v1`)
-> 2. For local models like Ollama, you can use any value as the API key (e.g. `--openai-api-key a`).
-
-### HuggingFace Specific Options
-
-- `--huggingface-model`: HuggingFace model to use for translation (default: marefa-nlp/marefa-mt-en-ar)
-- `--huggingface-device`: Device to run the model on (cpu, cuda, cuda:0, etc.) (default: cpu)
-- `--huggingface-max-length`: Maximum sequence length for the model (default: 512)
-
-> [!TIP]
->
-> 1. You need to install the transformers package to use HuggingFace models: `pip install transformers torch`
-> 2. BabelDOC uses MarianMT models by default, specifically `marefa-nlp/marefa-mt-en-ar` for English to Arabic translation
-> 3. For other language pairs, Helsinki-NLP's Opus-MT models work well (e.g., `Helsinki-NLP/opus-mt-en-zh` for English to Chinese)
-> 4. For better performance on GPU, set `--huggingface-device cuda` if you have CUDA available
-> 5. The first time you use a model, it will be downloaded automatically
-
-### Glossary Options
-
-- `--glossary-files`: Comma-separated paths to glossary CSV files.
-  - Each CSV file should have the columns: `source`, `target`, and an optional `tgt_lng`.
-  - The `source` column contains the term in the original language.
-  - The `target` column contains the term in the target language.
-  - The `tgt_lng` column (optional) specifies the target language for that specific entry (e.g., "zh-CN", "en-US").
-    - If `tgt_lng` is provided for an entry, that entry will only be loaded and used if its (normalized) `tgt_lng` matches the (normalized) overall target language specified by `--lang-out`. Normalization involves lowercasing and replacing hyphens (`-`) with underscores (`_`).
-    - If `tgt_lng` is omitted for an entry, that entry is considered applicable for any `--lang-out`.
-  - The name of each glossary (used in LLM prompts) is derived from its filename (without the .csv extension).
-  - During translation, the system will check the input text against the loaded glossaries. If terms from a glossary are found in the current text segment, that glossary (with the relevant terms) will be included in the prompt to the language model, along with an instruction to adhere to it.
-
-### Output Control
-
-- `--output`, `-o`: Output directory for translated files. If not set, use current working directory.
-- `--debug`: Enable debug logging level and export detailed intermediate results in `~/.cache/yadt/working`.
-- `--report-interval`: Progress report interval in seconds (default: 0.1).
-
-### General Options
-
-- `--warmup`: Only download and verify required assets then exit (default: False)
-
-### Offline Assets Management
-
-- `--generate-offline-assets`: Generate an offline assets package in the specified directory. This creates a zip file containing all required models and fonts.
-- `--restore-offline-assets`: Restore an offline assets package from the specified file. This extracts models and fonts from a previously generated package.
-
-> [!TIP]
-> 
-> 1. Offline assets packages are useful for environments without internet access or to speed up installation on multiple machines.
-> 2. Generate a package once with `babeldoc --generate-offline-assets /path/to/output/dir` and then distribute it.
-> 3. Restore the package on target machines with `babeldoc --restore-offline-assets /path/to/offline_assets_*.zip`.
-> 4. The offline assets package name cannot be modified because the file list hash is encoded in the name.
-> 5. If you provide a directory path to `--restore-offline-assets`, the tool will automatically look for the correct offline assets package file in that directory.
-> 6. The package contains all necessary fonts and models required for document processing, ensuring consistent results across different environments.
-> 7. The integrity of all assets is verified using SHA3-256 hashes during both packaging and restoration.
-> 8. If you're deploying in an air-gapped environment, make sure to generate the package on a machine with internet access first.
-
-### Configuration File
-
-- `--config`, `-c`: Configuration file path. Use the TOML format.
-
-Example Configuration:
-
-```toml
-[babeldoc]
-# Basic settings
-debug = true
-lang-in = "en-US"
-lang-out = "zh-CN"
-qps = 10
-output = "/path/to/output/dir"
-
-# PDF processing options
-split-short-lines = false
-short-line-split-factor = 0.8
-skip-clean = false
-dual-translate-first = false
-disable-rich-text-translate = false
-use-alternating-pages-dual = false
-watermark-output-mode = "watermarked"  # Choices: "watermarked", "no_watermark", "both"
-max-pages-per-part = 50  # Automatically split the document for translation and merge it back.
-only_include_translated_page = false # Only include translated pages in the output PDF. Effective only when `pages` is used.
-# no-watermark = false  # DEPRECATED: Use watermark-output-mode instead
-skip-scanned-detection = false  # Skip scanned document detection for faster processing
-auto_extract_glossary = true # Set to false to disable automatic term extraction
-formular_font_pattern = "" # Font pattern for formula text
-formular_char_pattern = "" # Character pattern for formula text
-show_char_box = false # Show character bounding boxes (debug)
-ocr_workaround = false # Use OCR workaround for scanned PDFs
-rpc_doclayout = "" # RPC service host for document layout analysis
-working_dir = "" # Working directory for translation
-auto_enable_ocr_workaround = false # Enable automatic OCR workaround for scanned PDFs. See docs for interaction with ocr_workaround and skip_scanned_detection.
-skip_form_render = false # Skip form rendering (default: False)
-skip_curve_render = false # Skip curve rendering (default: False)
-only_parse_generate_pdf = false # Only parse PDF and generate output PDF without translation (default: False)
-remove_non_formula_lines = false # Remove non-formula lines from paragraph areas (default: False)
-non_formula_line_iou_threshold = 0.2 # IoU threshold for paragraph overlap detection (default: 0.2)
-figure_table_protection_threshold = 0.3 # IoU threshold for figure/table protection (default: 0.3)
-
-# Translation service
-openai = true
-openai-model = "gpt-4o-mini"
-openai-base-url = "https://api.openai.com/v1"
-openai-api-key = "your-api-key-here"
-enable-json-mode-if-requested = false  # Enable JSON mode when requested (default: false)
-pool-max-workers = 8  # Maximum worker threads for task processing (defaults to QPS value if not set)
-
-# Glossary Options (Optional)
-# glossary-files = "/path/to/glossary1.csv,/path/to/glossary2.csv"
-
-# Output control
-no-dual = false
-no-mono = false
-min-text-length = 5
-report-interval = 0.5
-
-# Offline assets management
-# Uncomment one of these options as needed:
-# generate-offline-assets = "/path/to/output/dir"
-# restore-offline-assets = "/path/to/offline_assets_package.zip"
-```
-
-## Python API
-
-The current recommended way to call BabelDOC in Python is to call the `high_level.do_translate_async_stream` function of [pdf2zh next](https://github.com/PDFMathTranslate/PDFMathTranslate-next).
-
-> [!WARNING]
-> **All APIs of BabelDOC should be considered as internal APIs, and any direct use of BabelDOC is not supported.**
-
-## Example Commands
-
-### Using OpenAI API
-
-```bash
-babeldoc --files paper.pdf --openai --openai-api-key YOUR_API_KEY --lang-in en --lang-out zh-CN
-```
-
-### Using OpenAI-compatible API
-
-```bash
-babeldoc --files paper.pdf --openai --openai-api-key YOUR_API_KEY --openai-base-url https://api.example.com/v1 --lang-in en --lang-out zh-CN
-```
-
-### Using HuggingFace Translation Model
-
-```bash
-babeldoc --files paper.pdf --huggingface --huggingface-model Helsinki-NLP/opus-mt-en-zh --lang-in en --lang-out zh-CN
-```
-
-### Using MarianMT Model for English to Arabic Translation
-
-```bash
-babeldoc --files paper.pdf --huggingface --huggingface-model marefa-nlp/marefa-mt-en-ar --lang-in en --lang-out ar
-```
-
-### Using HuggingFace with GPU Acceleration
-
-```bash
-babeldoc --files paper.pdf --huggingface --huggingface-model Helsinki-NLP/opus-mt-en-zh --huggingface-device cuda --lang-in en --lang-out zh-CN
-```
-
-## Version Number Explanation
-
-This project uses a combination of [Semantic Versioning](https://semver.org/) and [Pride Versioning](https://pridever.org/). The version number format is: "0.MAJOR.MINOR".
-
-> [!NOTE]
->
-> The API compatibility here mainly refers to the compatibility with [pdf2zh_next](https://github.com/PDFMathTranslate/PDFMathTranslate-next).
-
-
-- MAJOR: Incremented by 1 when API incompatible changes are made or when proud improvements are implemented.
-
-- MINOR: Incremented by 1 when any API compatible changes are made.
-
-## Known Issues
-
-1. Parsing errors in the author and reference sections; they get merged into one paragraph after translation.
-2. Lines are not supported.
-3. Does not support drop caps.
-4. Large pages will be skipped.
-
-
-
-## Acknowledgements
-
-- [PDFMathTranslate](https://github.com/Byaidu/PDFMathTranslate)
-- [DocLayout-YOLO](https://github.com/opendatalab/DocLayout-YOLO)
-- [pdfminer](https://github.com/pdfminer/pdfminer.six)
-- [PyMuPDF](https://github.com/pymupdf/PyMuPDF)
-- [Asynchronize](https://github.com/multimeric/Asynchronize/tree/master?tab=readme-ov-file)
-- [PriorityThreadPoolExecutor](https://github.com/oleglpts/PriorityThreadPoolExecutor)
-
-> [!WARNING]
-> **Important Interaction Note for `--auto-enable-ocr-workaround`:**
->
-> When `--auto-enable-ocr-workaround` is set to `true` (either via command line or config file):
->
-> 1.  During the initial setup, the values for `ocr_workaround` and `skip_scanned_detection` will be forced to `false` by `TranslationConfig`, regardless of whether you also set `--ocr-workaround` or `--skip-scanned-detection` flags.
-> 2.  Then, during the scanned document detection phase (`DetectScannedFile` stage):
->     *   If the document is identified as heavily scanned (e.g., >80% scanned pages) AND `auto_enable_ocr_workaround` is `true` (i.e., `translation_config.auto_enable_ocr_workaround` is true), the system will then attempt to set both `ocr_workaround` to `true` and `skip_scanned_detection` to `true`.
->
-> This means that `--auto-enable-ocr-workaround` effectively gives the system control to enable OCR processing for scanned documents, potentially overriding manual settings for `--ocr-workaround` and `--skip_scanned_detection` based on its detection results. If the document is *not* detected as heavily scanned, then the initial `false` values for `ocr_workaround` and `skip_scanned_detection` (forced by `--auto-enable-ocr-workaround` at the `TranslationConfig` initialization stage) will remain in effect unless changed by other logic.
+This project is licensed under **AGPL-3.0**, the same license as upstream BabelDOC — see [LICENSE](LICENSE). As a derivative work of BabelDOC, it inherits AGPL-3.0 copyleft terms.

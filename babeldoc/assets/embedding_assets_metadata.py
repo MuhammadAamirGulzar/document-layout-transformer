@@ -619,28 +619,6 @@ JP_FONT_FAMILY = {
     "base": ["SourceHanSansCN-Regular.ttf"],
 }
 
-# Arabic font family: prefer Arabic-aware fonts with full shaping support
-AR_FONT_FAMILY = {
-    "script": [
-        # Keep script list minimal; primary Arabic faces are in normal/base
-        "NotoNaskhArabic-Regular.ttf",
-    ],
-    "normal": [
-        "NotoNaskhArabic-Regular.ttf",
-        "NotoNaskhArabic-Bold.ttf",
-        "NotoSansArabic-Regular.ttf",
-        "NotoSansArabic-Bold.ttf",
-    ],
-    "fallback": [
-        # Fallbacks can still include pan-Unicode fonts if embedded
-        "GoNotoKurrent-Regular.ttf",
-        "GoNotoKurrent-Bold.ttf",
-    ],
-    "base": [
-        "NotoNaskhArabic-Regular.ttf",
-    ],
-}
-
 EN_FONT_FAMILY = {
     "script": [
         "NotoSans-Italic.ttf",
@@ -660,6 +638,24 @@ EN_FONT_FAMILY = {
     ],
     "base": [
         "NotoSans-Regular.ttf",
+    ],
+}
+
+AR_FONT_FAMILY = {
+    "script": [
+        "GoNotoKurrent-Regular.ttf",
+        "GoNotoKurrent-Bold.ttf",
+    ],
+    "normal": [
+        "GoNotoKurrent-Regular.ttf",
+        "GoNotoKurrent-Bold.ttf",
+    ],
+    "fallback": [
+        "GoNotoKurrent-Regular.ttf",
+        "GoNotoKurrent-Bold.ttf",
+    ],
+    "base": [
+        "GoNotoKurrent-Regular.ttf",
     ],
 }
 
@@ -709,7 +705,9 @@ __cleanup_unused_font_metadata()
 
 def get_font_family(lang_code: str):
     lang_code = lang_code.upper()
-    if "KR" in lang_code:
+    if "AR" in lang_code:
+        font_family = AR_FONT_FAMILY
+    elif "KR" in lang_code:
         font_family = KR_FONT_FAMILY
     elif "JP" in lang_code or "JA" in lang_code:
         font_family = JP_FONT_FAMILY
@@ -717,8 +715,6 @@ def get_font_family(lang_code: str):
         font_family = HK_FONT_FAMILY
     elif "TW" in lang_code:
         font_family = TW_FONT_FAMILY
-    elif "AR" in lang_code:
-        font_family = AR_FONT_FAMILY
     elif "EN" in lang_code:
         font_family = EN_FONT_FAMILY
     elif "CN" in lang_code:

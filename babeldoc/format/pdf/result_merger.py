@@ -20,6 +20,8 @@ class ResultMerger:
         self, results: dict[int, TranslateResult | None]
     ) -> TranslateResult:
         """Merge multiple translation results into one"""
+        logger.debug(f"merge_results called with type: {type(results)}")
+        logger.debug(f"results content: {results}")
         if not results:
             raise ValueError("No results to merge")
 

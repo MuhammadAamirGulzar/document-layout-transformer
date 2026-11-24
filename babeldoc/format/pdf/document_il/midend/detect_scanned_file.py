@@ -9,6 +9,7 @@ from skimage.metrics import structural_similarity
 from babeldoc.babeldoc_exception.BabelDOCException import ScannedPDFError
 from babeldoc.format.pdf.document_il import il_version_1
 from babeldoc.format.pdf.document_il.backend.pdf_creater import PDFCreater
+from babeldoc.format.pdf.document_il.utils.style_helper import BLACK
 from babeldoc.format.pdf.document_il.utils.style_helper import GREEN
 from babeldoc.format.pdf.translation_config import TranslationConfig
 
@@ -20,6 +21,7 @@ class DetectScannedFile:
 
     def __init__(self, translation_config: TranslationConfig):
         self.translation_config = translation_config
+        self.detailed_logger = None
 
     def _save_debug_box_to_page(self, page: il_version_1.Page, similarity: float):
         """Save debug boxes and text labels to the PDF page."""
@@ -81,68 +83,90 @@ class DetectScannedFile:
         return False
 
     def process(
-        self, docs: il_version_1.Document, original_pdf_path, mediabox_data: dict
-    ):
-        """Generate layouts for all pages that need to be translated."""
-        # Get pages that need to be translated
+            self, docs: il_version_1.Document, original_pdf_path, mediabox_data: dict
+        ):
+            """Generate layouts for all pages that need to be translated."""
+            # Get pages that need to be translated
+            
+            if hasattr(self, 'detailed_logger') and self.detailed_logger:
+                self.detailed_logger.log_step("Scanned File Detection Started")
 
-        pdf_creater = PDFCreater(
-            original_pdf_path, docs, self.translation_config, mediabox_data
-        )
+            pdf_creater = PDFCreater(
+                original_pdf_path, docs, self.translation_config, mediabox_data
+            )
 
-        pages_to_translate = [
-            page
-            for page in docs.page
-            if self.translation_config.should_translate_page(page.page_number + 1)
-        ]
-        if not pages_to_translate:
-            return
-        mupdf = pymupdf.open(self.translation_config.get_working_file_path("input.pdf"))
-        total = len(pages_to_translate)
-        threshold = 0.8 * total
-        threshold = max(threshold, 1)
-        scanned = 0
-        non_scanned = 0
-        non_scanned_threshold = total - threshold
-        with self.translation_config.progress_monitor.stage_start(
-            self.stage_name,
-            total,
-        ) as progress:
-            for page in pages_to_translate:
-                if scanned < threshold and non_scanned < non_scanned_threshold:
-                    # Only continue detection if both counts are below thresholds
-                    is_scanned = self.detect_page_is_scanned(page, mupdf, pdf_creater)
-                    if is_scanned:
-                        scanned += 1
+            pages_to_translate = [
+                page
+                for page in docs.page
+                if self.translation_config.should_translate_page(page.page_number + 1)
+            ]
+            if not pages_to_translate:
+                return
+            mupdf = pymupdf.open(self.translation_config.get_working_file_path("input.pdf"))
+            total = len(pages_to_translate)
+            threshold = 0.8 * total
+            threshold = max(threshold, 1)
+            scanned = 0
+            non_scanned = 0
+            non_scanned_threshold = total - threshold
+            with self.translation_config.progress_monitor.stage_start(
+                self.stage_name,
+                total,
+            ) as progress:
+                for page in pages_to_translate:
+                    if scanned < threshold and non_scanned < non_scanned_threshold:
+                        # Only continue detection if both counts are below thresholds
+                        is_scanned = self.detect_page_is_scanned(page, mupdf, pdf_creater)
+                        if is_scanned:
+                            scanned += 1
+                        else:
+                            non_scanned += 1
                     else:
+                        # We have enough information to determine document type
                         non_scanned += 1
-                else:
-                    # We have enough information to determine document type
-                    non_scanned += 1
-                progress.advance(1)
+                    progress.advance(1)
 
-        if scanned >= threshold:
-            if self.translation_config.auto_enable_ocr_workaround:
-                logger.warning(
-                    f"Detected {scanned} scanned pages, which is more than 80% of the total pages. "
-                    "Turning on OCR workaround.",
+            # Determine if document is scanned
+            is_document_scanned = scanned >= threshold
+            
+            if hasattr(self, 'detailed_logger') and self.detailed_logger:
+                detection_result = {
+                    'is_scanned': is_document_scanned,
+                    'scanned_pages': scanned,
+                    'non_scanned_pages': non_scanned,
+                    'total_pages': total,
+                    'threshold': threshold
+                }
+                self.detailed_logger.log_step(
+                    "Scanned File Detection Complete",
+                    data=detection_result
                 )
-                self.translation_config.shared_context_cross_split_part.auto_enabled_ocr_workaround = True
-                self.translation_config.ocr_workaround = True
-                self.translation_config.skip_scanned_detection = True
-                self.clean_render_order_for_chars(docs)
-                self.translation_config.remove_non_formula_lines = False
-            else:
-                logger.warning(
-                    f"Detected {scanned} scanned pages, which is more than 80% of the total pages. "
-                    "Please check the input PDF file.",
-                )
-                raise ScannedPDFError("Scanned PDF detected.")
+
+            if is_document_scanned:
+                if self.translation_config.auto_enable_ocr_workaround:
+                    logger.warning(
+                        f"Detected {scanned} scanned pages, which is more than 80% of the total pages. "
+                        "Turning on OCR workaround.",
+                    )
+                    self.translation_config.shared_context_cross_split_part.auto_enabled_ocr_workaround = True
+                    self.translation_config.ocr_workaround = True
+                    self.translation_config.skip_scanned_detection = True
+                    self.translation_config.disable_rich_text_translate = True
+                    self.clean_render_order_for_chars(docs)
+                    self.translation_config.remove_non_formula_lines = False
+                else:
+                    logger.warning(
+                        f"Detected {scanned} scanned pages, which is more than 80% of the total pages. "
+                        "Please check the input PDF file.",
+                    )
+                    raise ScannedPDFError("Scanned PDF detected.")
 
     def clean_render_order_for_chars(self, docs: il_version_1.Document):
         for page in docs.page:
             for char in page.pdf_character:
                 char.render_order = None
+                if not char.debug_info:
+                    char.pdf_style.graphic_state = BLACK
 
     def detect_page_is_scanned(
         self, page: il_version_1.Page, pdf: pymupdf.Document, pdf_creater: PDFCreater

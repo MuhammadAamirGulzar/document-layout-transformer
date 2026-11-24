@@ -1176,6 +1176,28 @@ class PdfParagraph:
             "type": "Attribute",
         },
     )
+    
+    text_direction: str | None = field(
+        default=None,
+        metadata={
+            "name": "textDirection",
+            "type": "Attribute",
+        },
+    )
+    text_align: str | None = field(
+        default=None,
+        metadata={
+            "name": "textAlign",
+            "type": "Attribute",
+        },
+    )
+    pipeline_trace: dict | None = field(
+        default=None,
+        metadata={
+            "name": "pipelineTrace",
+            "type": "Attribute",
+        },
+    )
 
 
 @dataclass(slots=True)
@@ -1282,6 +1304,18 @@ class Page:
             "name": "Unit",
             "type": "Attribute",
             "required": True,
+        },
+    )
+    continuation_of_page: int | None = field(
+        default=None,
+        metadata={
+            "type": "Ignore",
+        },
+    )
+    source_page_number: int | None = field(
+        default=None,
+        metadata={
+            "type": "Ignore",
         },
     )
 

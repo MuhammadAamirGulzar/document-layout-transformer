@@ -12,6 +12,7 @@ import pymupdf
 
 import babeldoc.pdfminer.pdfinterp
 from babeldoc.format.pdf.babelpdf.base14 import get_base14_bbox
+from babeldoc.format.pdf.babelpdf.cidfont import get_cidfont_bbox
 from babeldoc.format.pdf.babelpdf.encoding import WinAnsiEncoding
 from babeldoc.format.pdf.babelpdf.encoding import get_type1_encoding
 from babeldoc.format.pdf.babelpdf.utils import guarded_bbox
@@ -332,6 +333,7 @@ class ILCreater:
     stage_name = "Parse PDF and Create Intermediate Representation"
 
     def __init__(self, translation_config: TranslationConfig):
+        self.detailed_logger = None  # Will be set from high_level.py
         self.progress = None
         self.current_page: il_version_1.Page = None
         self.mupdf: pymupdf.Document = None
@@ -762,6 +764,8 @@ class ILCreater:
             obj_type, obj_val = self.mupdf.xref_get_key(xobj_id, "BaseFont")
             if obj_type == "name":
                 bbox_list = get_base14_bbox(obj_val[1:])
+        if cid_bbox := get_cidfont_bbox(self.mupdf, xobj_id):
+            bbox_list = cid_bbox
         return bbox_list, cmap
 
     def create_graphic_state(
@@ -952,7 +956,24 @@ class ILCreater:
             )
             return
 
-        if char_bounding_box:
+        # ===== ADD YOUR LOGGING CODE HERE =====
+        if self.detailed_logger and hasattr(char, 'bbox'):
+            char_data = {
+                'unicode': char_unicode,  # Use char_unicode which is already extracted
+                'x': char.bbox[0],
+                'y': char.bbox[1],
+                'width': (char.bbox[2] - char.bbox[0]),
+                'height': (char.bbox[3] - char.bbox[1]),
+                'font_id': char.aw_font_id if hasattr(char, 'aw_font_id') else 'N/A',
+                'font_size': char.size if hasattr(char, 'size') else 0
+            }
+            self.detailed_logger.log_character_extraction(
+                self.current_page.page_number if self.current_page and hasattr(self.current_page, 'page_number') else 0,
+                char_data
+            )
+        # ===== END OF LOGGING CODE =====
+
+        if char_bounding_box and len(char_bounding_box) == 4:
             x_min, y_min, x_max, y_max = char_bounding_box
             factor = 1 / 1000 * pdf_style.font_size
             x_min = x_min * factor
@@ -1158,12 +1179,27 @@ class ILCreater:
             logger.warning("Error in on_pdf_clip_path: %s", e)
 
     def create_il(self):
+        if self.detailed_logger:
+            self.detailed_logger.log_step(
+                "Creating Intermediate Representation",
+                f"Total pages: {len(self.docs.page)}\n"
+                f"Total characters: {sum(len(p.pdf_character) for p in self.docs.page)}"
+            )
         pages = [
             page
             for page in self.docs.page
             if self.translation_config.should_translate_page(page.page_number + 1)
         ]
         self.docs.page = pages
+        if self.detailed_logger:
+            self.detailed_logger.log_step(
+                "IL Creation Complete",
+                data={
+                    'total_pages': len(self.docs.page),
+                    'total_chars': sum(len(p.pdf_character) for p in self.docs.page),
+                    'total_fonts': len(set(f.font_id for p in self.docs.page for f in p.pdf_font))
+                }
+            )
         return self.docs
 
     def on_total_pages(self, total_pages: int):

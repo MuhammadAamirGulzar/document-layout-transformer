@@ -1,0 +1,1618 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TransDOC - Intelligent PDF Translation</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+        }
+
+        .container {
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+            max-width: 650px;
+            width: 100%;
+            padding: 40px;
+        }
+
+        .header {
+            text-align: center;
+            margin-bottom: 30px;
+        }
+
+        .header h1 {
+            color: #333;
+            font-size: 2.5em;
+            margin-bottom: 10px;
+        }
+
+        .header p {
+            color: #666;
+            font-size: 1.1em;
+        }
+
+        .upload-area {
+            border: 3px dashed #667eea;
+            border-radius: 15px;
+            padding: 40px;
+            text-align: center;
+            transition: all 0.3s ease;
+            cursor: pointer;
+            margin-bottom: 20px;
+        }
+
+        .upload-area:hover {
+            border-color: #764ba2;
+            background: #f8f9ff;
+        }
+
+        .upload-area.dragover {
+            border-color: #764ba2;
+            background: #f0f0ff;
+        }
+
+        .upload-icon {
+            font-size: 3em;
+            color: #667eea;
+            margin-bottom: 10px;
+        }
+
+        .upload-text {
+            color: #333;
+            font-size: 1.2em;
+            margin-bottom: 5px;
+        }
+
+        .upload-subtext {
+            color: #999;
+            font-size: 0.9em;
+        }
+
+        input[type="file"] {
+            display: none;
+        }
+
+        .file-info {
+            background: #f8f9ff;
+            border-radius: 10px;
+            padding: 15px;
+            margin-bottom: 20px;
+            display: none;
+        }
+
+        .file-info.active {
+            display: block;
+        }
+
+        .file-name {
+            color: #333;
+            font-weight: 600;
+            margin-bottom: 5px;
+        }
+
+        .file-size {
+            color: #666;
+            font-size: 0.9em;
+        }
+
+        .language-selection {
+            margin-bottom: 20px;
+        }
+
+        .language-selection label {
+            display: block;
+            color: #333;
+            font-weight: 600;
+            margin-bottom: 10px;
+        }
+
+        .language-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 10px;
+        }
+
+        select {
+            width: 100%;
+            padding: 12px;
+            border: 2px solid #e0e0e0;
+            border-radius: 8px;
+            font-size: 1em;
+            color: #333;
+            background: white;
+            cursor: pointer;
+            transition: border-color 0.3s ease;
+        }
+
+        select:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+
+        /* Model Selection Styles */
+        .model-selection {
+            margin-bottom: 25px;
+        }
+
+        .model-selection > label {
+            display: block;
+            color: #333;
+            font-weight: 600;
+            margin-bottom: 12px;
+            font-size: 0.95em;
+        }
+
+        .model-toggle-group {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+
+        .model-card {
+            border: 2px solid #e2e8f0;
+            background: #ffffff;
+            border-radius: 12px;
+            padding: 12px 16px;
+            cursor: pointer;
+            transition: all 0.25s ease;
+            position: relative;
+            user-select: none;
+        }
+
+        .model-card:hover {
+            border-color: #818cf8;
+            background: #f8faff;
+            transform: translateY(-1px);
+        }
+
+        .model-card.active {
+            border-color: #6366f1;
+            background: #f5f7ff;
+            box-shadow: 0 4px 14px rgba(99, 102, 241, 0.15);
+        }
+
+        .model-card-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 5px;
+        }
+
+        .model-card-left {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .model-radio-custom {
+            width: 18px;
+            height: 18px;
+            border: 2px solid #cbd5e1;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.2s ease;
+        }
+
+        .model-card.active .model-radio-custom {
+            border-color: #6366f1;
+            background: #6366f1;
+        }
+
+        .model-radio-custom::after {
+            content: '';
+            width: 7px;
+            height: 7px;
+            background: white;
+            border-radius: 50%;
+            display: none;
+        }
+
+        .model-card.active .model-radio-custom::after {
+            display: block;
+        }
+
+        .model-title {
+            font-weight: 700;
+            color: #1e293b;
+            font-size: 0.95em;
+        }
+
+        .model-badge {
+            font-size: 0.72em;
+            font-weight: 700;
+            padding: 3px 9px;
+            border-radius: 20px;
+            letter-spacing: 0.3px;
+        }
+
+        .badge-recommended {
+            background: #dcfce7;
+            color: #15803d;
+            border: 1px solid #bbf7d0;
+        }
+
+        .badge-fast {
+            background: #fef3c7;
+            color: #b45309;
+            border: 1px solid #fde68a;
+        }
+
+        .badge-cloud {
+            background: #ede9fe;
+            color: #6d28d9;
+            border: 1px solid #ddd6fe;
+        }
+
+        .model-desc {
+            font-size: 0.82em;
+            color: #64748b;
+            margin-left: 28px;
+            line-height: 1.4;
+        }
+
+        /* Layout Selection Styles */
+        .layout-selection {
+            margin-bottom: 25px;
+        }
+
+        .layout-selection > label {
+            display: block;
+            color: #333;
+            font-weight: 600;
+            margin-bottom: 12px;
+            font-size: 0.95em;
+        }
+
+        .layout-toggle-group {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+
+        .layout-card {
+            border: 2px solid #e2e8f0;
+            background: #ffffff;
+            border-radius: 12px;
+            padding: 12px 16px;
+            cursor: pointer;
+            transition: all 0.25s ease;
+            position: relative;
+            user-select: none;
+        }
+
+        .layout-card:hover {
+            border-color: #38bdf8;
+            background: #f0f9ff;
+            transform: translateY(-1px);
+        }
+
+        .layout-card.active {
+            border-color: #0284c7;
+            background: #f0f9ff;
+            box-shadow: 0 4px 14px rgba(2, 132, 199, 0.15);
+        }
+
+        .layout-card-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 5px;
+        }
+
+        .layout-card-left {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .layout-radio-custom {
+            width: 18px;
+            height: 18px;
+            border: 2px solid #cbd5e1;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.2s ease;
+        }
+
+        .layout-card.active .layout-radio-custom {
+            border-color: #0284c7;
+            background: #0284c7;
+        }
+
+        .layout-radio-custom::after {
+            content: '';
+            width: 7px;
+            height: 7px;
+            background: white;
+            border-radius: 50%;
+            display: none;
+        }
+
+        .layout-card.active .layout-radio-custom::after {
+            display: block;
+        }
+
+        .layout-title {
+            font-weight: 700;
+            color: #1e293b;
+            font-size: 0.95em;
+        }
+
+        .layout-badge {
+            font-size: 0.72em;
+            font-weight: 700;
+            padding: 3px 9px;
+            border-radius: 20px;
+            letter-spacing: 0.3px;
+        }
+
+        .badge-all {
+            background: #e0e7ff;
+            color: #4338ca;
+            border: 1px solid #c7d2fe;
+        }
+
+        .badge-dual {
+            background: #e0f2fe;
+            color: #0369a1;
+            border: 1px solid #bae6fd;
+        }
+
+        .badge-mono {
+            background: #dcfce7;
+            color: #15803d;
+            border: 1px solid #bbf7d0;
+        }
+
+        .layout-desc {
+            font-size: 0.82em;
+            color: #64748b;
+            margin-left: 28px;
+            line-height: 1.4;
+        }
+
+        .translate-btn {
+            width: 100%;
+            padding: 15px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            border-radius: 10px;
+            font-size: 1.1em;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.2s ease, box-shadow 0.2s ease;
+        }
+
+        .translate-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 20px rgba(102, 126, 234, 0.4);
+        }
+
+        .translate-btn:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+            transform: none;
+            box-shadow: none;
+        }
+
+        /* Progress Container Styles */
+        .progress-container {
+            display: none;
+            margin-top: 25px;
+            padding: 25px;
+            background: linear-gradient(135deg, #f8f9ff 0%, #f0f4ff 100%);
+            border-radius: 15px;
+            border: 1px solid #e0e7ff;
+        }
+
+        .progress-container.active {
+            display: block;
+        }
+
+        .progress-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 15px;
+        }
+
+        .progress-title {
+            font-weight: 600;
+            color: #333;
+            font-size: 1.1em;
+        }
+
+        .progress-percentage {
+            font-weight: 700;
+            color: #667eea;
+            font-size: 1.3em;
+        }
+
+        /* Main Progress Bar */
+        .progress-bar-container {
+            margin-bottom: 20px;
+        }
+
+        .progress-bar {
+            width: 100%;
+            height: 12px;
+            background: #e0e7ff;
+            border-radius: 10px;
+            overflow: hidden;
+            position: relative;
+        }
+
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
+            width: 0%;
+            transition: width 0.3s ease;
+            border-radius: 10px;
+            position: relative;
+        }
+
+        .progress-fill::after {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: linear-gradient(
+                90deg,
+                rgba(255, 255, 255, 0) 0%,
+                rgba(255, 255, 255, 0.3) 50%,
+                rgba(255, 255, 255, 0) 100%
+            );
+            animation: shimmer 1.5s infinite;
+        }
+
+        @keyframes shimmer {
+            0% { transform: translateX(-100%); }
+            100% { transform: translateX(100%); }
+        }
+
+        /* Current Stage Display */
+        .current-stage {
+            background: white;
+            border-radius: 10px;
+            padding: 15px;
+            margin-bottom: 15px;
+            border: 1px solid #e0e7ff;
+        }
+
+        .current-stage-label {
+            font-size: 0.85em;
+            color: #666;
+            margin-bottom: 5px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .current-stage-name {
+            font-size: 1.15em;
+            font-weight: 600;
+            color: #333;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .stage-spinner {
+            width: 18px;
+            height: 18px;
+            border: 2px solid #e0e7ff;
+            border-top-color: #667eea;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        /* Stage Progress */
+        .stage-progress {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-top: 10px;
+        }
+
+        .stage-progress-bar {
+            flex: 1;
+            height: 6px;
+            background: #e0e7ff;
+            border-radius: 3px;
+            overflow: hidden;
+        }
+
+        .stage-progress-fill {
+            height: 100%;
+            background: #667eea;
+            width: 0%;
+            transition: width 0.2s ease;
+        }
+
+        .stage-progress-text {
+            font-size: 0.85em;
+            color: #666;
+            min-width: 80px;
+            text-align: right;
+        }
+
+        /* Stages List */
+        .stages-list {
+            margin-top: 15px;
+        }
+
+        .stages-list-title {
+            font-size: 0.85em;
+            color: #666;
+            margin-bottom: 10px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .stage-item {
+            display: flex;
+            align-items: center;
+            padding: 8px 12px;
+            background: white;
+            border-radius: 8px;
+            margin-bottom: 6px;
+            border: 1px solid #e0e7ff;
+            transition: all 0.3s ease;
+        }
+
+        .stage-item.completed {
+            background: #f0fdf4;
+            border-color: #86efac;
+        }
+
+        .stage-item.active {
+            background: #fef3c7;
+            border-color: #fcd34d;
+            box-shadow: 0 2px 8px rgba(252, 211, 77, 0.3);
+        }
+
+        .stage-item.pending {
+            opacity: 0.6;
+        }
+
+        .stage-icon {
+            width: 24px;
+            height: 24px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin-right: 10px;
+            font-size: 0.9em;
+        }
+
+        .stage-item.completed .stage-icon {
+            color: #10b981;
+        }
+
+        .stage-item.active .stage-icon {
+            color: #f59e0b;
+        }
+
+        .stage-item.pending .stage-icon {
+            color: #9ca3af;
+        }
+
+        .stage-name {
+            flex: 1;
+            font-size: 0.9em;
+            color: #333;
+        }
+
+        .stage-status {
+            font-size: 0.8em;
+            color: #666;
+        }
+
+        .stage-item.completed .stage-status {
+            color: #10b981;
+        }
+
+        .stage-item.active .stage-status {
+            color: #f59e0b;
+        }
+
+        /* Part Info */
+        .part-info {
+            text-align: center;
+            font-size: 0.85em;
+            color: #666;
+            margin-top: 10px;
+            padding-top: 10px;
+            border-top: 1px solid #e0e7ff;
+        }
+
+        /* Result Container */
+        .result-container {
+            display: none;
+            margin-top: 20px;
+            padding: 25px;
+            background: linear-gradient(135deg, #f0fdf4 0%, #dcfce7 100%);
+            border-radius: 15px;
+            border: 2px solid #86efac;
+            text-align: center;
+        }
+
+        .result-container.active {
+            display: block;
+        }
+
+        .result-icon {
+            font-size: 3em;
+            margin-bottom: 10px;
+        }
+
+        .result-text {
+            color: #166534;
+            font-weight: 600;
+            font-size: 1.2em;
+            margin-bottom: 5px;
+        }
+
+        .result-subtext {
+            font-size: 0.9em;
+            color: #15803d;
+            margin-bottom: 20px;
+        }
+
+        .download-action-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 15px;
+            margin-top: 15px;
+        }
+
+        @media (max-width: 600px) {
+            .download-action-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        .download-btn {
+            width: 100%;
+            padding: 14px 16px;
+            color: white;
+            border: none;
+            border-radius: 12px;
+            cursor: pointer;
+            transition: all 0.25s ease;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+        }
+
+        .download-btn:hover {
+            transform: translateY(-2px);
+        }
+
+        .download-btn-dual {
+            background: linear-gradient(135deg, #4f46e5 0%, #3730a3 100%);
+        }
+
+        .download-btn-dual:hover {
+            box-shadow: 0 6px 20px rgba(79, 70, 229, 0.4);
+        }
+
+        .download-btn-mono {
+            background: linear-gradient(135deg, #059669 0%, #047857 100%);
+        }
+
+        .download-btn-mono:hover {
+            box-shadow: 0 6px 20px rgba(5, 150, 105, 0.4);
+        }
+
+        .dl-btn-icon {
+            font-size: 1.4em;
+        }
+
+        .dl-btn-content {
+            display: flex;
+            flex-direction: column;
+            text-align: left;
+        }
+
+        .dl-btn-main {
+            font-size: 0.95em;
+            font-weight: 700;
+        }
+
+        .dl-btn-sub {
+            font-size: 0.75em;
+            font-weight: 400;
+            opacity: 0.88;
+        }
+
+        .download-both-link {
+            display: inline-block;
+            margin-top: 14px;
+            background: none;
+            border: none;
+            color: #4338ca;
+            text-decoration: underline;
+            cursor: pointer;
+            font-size: 0.88em;
+            font-weight: 600;
+            transition: color 0.2s;
+        }
+
+        .download-both-link:hover {
+            color: #312e81;
+        }
+
+        /* Error Container */
+        .error-container {
+            display: none;
+            margin-top: 20px;
+            padding: 20px;
+            background: linear-gradient(135deg, #fef2f2 0%, #fee2e2 100%);
+            border-radius: 15px;
+            border: 2px solid #fca5a5;
+        }
+
+        .error-container.active {
+            display: block;
+        }
+
+        .error-icon {
+            font-size: 2em;
+            text-align: center;
+            margin-bottom: 10px;
+        }
+
+        .error-text {
+            color: #dc2626;
+            text-align: center;
+            font-weight: 500;
+        }
+
+        /* Cancel Button */
+        .cancel-btn {
+            width: 100%;
+            margin-top: 15px;
+            padding: 12px;
+            background: #f3f4f6;
+            color: #6b7280;
+            border: 1px solid #d1d5db;
+            border-radius: 8px;
+            font-size: 0.95em;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+
+        .cancel-btn:hover {
+            background: #e5e7eb;
+            color: #374151;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>📄 TransDOC</h1>
+            <p>Intelligent PDF Translation with Layout Preservation</p>
+        </div>
+
+        <div class="upload-area" id="uploadArea">
+            <div class="upload-icon">📤</div>
+            <div class="upload-text">Drop your PDF here or click to browse</div>
+            <div class="upload-subtext">Supports PDF files up to 50MB</div>
+            <input type="file" id="fileInput" accept=".pdf">
+        </div>
+
+        <div class="file-info" id="fileInfo">
+            <div class="file-name" id="fileName"></div>
+            <div class="file-size" id="fileSize"></div>
+        </div>
+
+        <div class="language-selection">
+            <label>Translation Languages:</label>
+            <div class="language-grid">
+                <div>
+                    <label style="font-weight: normal; font-size: 0.9em; margin-bottom: 5px;">From:</label>
+                    <select id="sourceLang">
+                        <option value="en">English</option>
+                        <option value="ar">Arabic</option>
+                        <option value="es">Spanish</option>
+                        <option value="fr">French</option>
+                        <option value="de">German</option>
+                        <option value="zh">Chinese</option>
+                    </select>
+                </div>
+                <div>
+                    <label style="font-weight: normal; font-size: 0.9em; margin-bottom: 5px;">To:</label>
+                    <select id="targetLang">
+                        <option value="ar">Arabic</option>
+                        <option value="en">English</option>
+                        <option value="es">Spanish</option>
+                        <option value="fr">French</option>
+                        <option value="de">German</option>
+                        <option value="zh">Chinese</option>
+                    </select>
+                </div>
+            </div>
+        </div>
+
+        <div class="model-selection">
+            <label>Translation AI Engine:</label>
+            <div class="model-toggle-group">
+                <div class="model-card" data-model="nllb-3.3b" onclick="selectModel('nllb-3.3b')">
+                    <div class="model-card-header">
+                        <div class="model-card-left">
+                            <div class="model-radio-custom"></div>
+                            <span class="model-title">Meta NLLB-200 (3.3B Quantized 8-Bit)</span>
+                        </div>
+                        <span class="model-badge badge-recommended">👑 SOTA Quality</span>
+                    </div>
+                    <div class="model-desc">Meta's flagship 3.3B parameter model with 8-bit GPU acceleration. Highest accuracy Arabic translation (~3.5 GB VRAM).</div>
+                </div>
+
+                <div class="model-card active" data-model="nllb" onclick="selectModel('nllb')">
+                    <div class="model-card-header">
+                        <div class="model-card-left">
+                            <div class="model-radio-custom"></div>
+                            <span class="model-title">Meta NLLB-200 (600M Fast)</span>
+                        </div>
+                        <span class="model-badge badge-fast">⚡ Fast Offline</span>
+                    </div>
+                    <div class="model-desc">Lightweight 600M model for rapid drafting with minimal memory footprint (~1.4 GB VRAM).</div>
+                </div>
+
+                <div class="model-card" data-model="marianmt" onclick="selectModel('marianmt')">
+                    <div class="model-card-header">
+                        <div class="model-card-left">
+                            <div class="model-radio-custom"></div>
+                            <span class="model-title">MarianMT (Helsinki / Marefa)</span>
+                        </div>
+                        <span class="model-badge badge-fast">⚡ Fast Offline</span>
+                    </div>
+                    <div class="model-desc">Lightweight seq2seq neural model for fast translation with lower memory usage.</div>
+                </div>
+
+                <div class="model-card" data-model="gpt-4o-mini" onclick="selectModel('gpt-4o-mini')">
+                    <div class="model-card-header">
+                        <div class="model-card-left">
+                            <div class="model-radio-custom"></div>
+                            <span class="model-title">OpenAI GPT-4o-mini</span>
+                        </div>
+                        <span class="model-badge badge-cloud">☁️ Cloud LLM</span>
+                    </div>
+                    <div class="model-desc">Deep document context & formatting preservation (requires OPENAI_API_KEY).</div>
+                </div>
+            </div>
+            <input type="hidden" id="selectedModel" value="nllb">
+        </div>
+
+        <div class="layout-selection">
+            <label>Output Document Layout:</label>
+            <div class="layout-toggle-group">
+                <div class="layout-card active" data-layout="both" onclick="selectLayout('both')">
+                    <div class="layout-card-header">
+                        <div class="layout-card-left">
+                            <div class="layout-radio-custom"></div>
+                            <span class="layout-title">✨ Both (Dual Side-by-Side + Mono Arabic)</span>
+                        </div>
+                        <span class="layout-badge badge-all">Recommended</span>
+                    </div>
+                    <div class="layout-desc">Generates both bilingual side-by-side reading and pure Arabic document.</div>
+                </div>
+
+                <div class="layout-card" data-layout="dual" onclick="selectLayout('dual')">
+                    <div class="layout-card-header">
+                        <div class="layout-card-left">
+                            <div class="layout-radio-custom"></div>
+                            <span class="layout-title">📖 Dual Bilingual (Side-by-Side)</span>
+                        </div>
+                        <span class="layout-badge badge-dual">Dual</span>
+                    </div>
+                    <div class="layout-desc">English original on the left, Arabic translation on the right for parallel reading.</div>
+                </div>
+
+                <div class="layout-card" data-layout="mono" onclick="selectLayout('mono')">
+                    <div class="layout-card-header">
+                        <div class="layout-card-left">
+                            <div class="layout-radio-custom"></div>
+                            <span class="layout-title">📄 Monolingual (Arabic Only)</span>
+                        </div>
+                        <span class="layout-badge badge-mono">Mono</span>
+                    </div>
+                    <div class="layout-desc">Clean Arabic-only document with 1:1 original visual layout.</div>
+                </div>
+            </div>
+            <input type="hidden" id="selectedLayout" value="both">
+        </div>
+
+        <button class="translate-btn" id="translateBtn" disabled>
+            Translate Document
+        </button>
+
+        <div class="progress-container" id="progressContainer">
+            <div class="progress-header">
+                <span class="progress-title">Translation Progress</span>
+                <span class="progress-percentage" id="progressPercentage">0%</span>
+            </div>
+            
+            <div class="progress-bar-container">
+                <div class="progress-bar">
+                    <div class="progress-fill" id="progressFill"></div>
+                </div>
+            </div>
+
+            <div class="current-stage">
+                <div class="current-stage-label">Current Step</div>
+                <div class="current-stage-name">
+                    <div class="stage-spinner" id="stageSpinner"></div>
+                    <span id="currentStageName">Initializing...</span>
+                </div>
+                <div class="stage-progress">
+                    <div class="stage-progress-bar">
+                        <div class="stage-progress-fill" id="stageProgressFill"></div>
+                    </div>
+                    <span class="stage-progress-text" id="stageProgressText">0 / 0</span>
+                </div>
+            </div>
+
+            <div class="stages-list" id="stagesList">
+                <div class="stages-list-title">Processing Pipeline</div>
+                <div id="stagesContainer"></div>
+            </div>
+
+            <div class="part-info" id="partInfo" style="display: none;">
+                Processing part <span id="currentPart">1</span> of <span id="totalParts">1</span>
+            </div>
+
+            <button class="cancel-btn" id="cancelBtn">Cancel Translation</button>
+        </div>
+
+        <div class="result-container" id="resultContainer">
+            <div class="result-icon">🎉</div>
+            <div class="result-text">Translation Completed!</div>
+            <div class="result-subtext">Your document has been translated with preserved layout. Choose your preferred format to download:</div>
+            <div id="untranslatedNote" class="result-subtext" style="display:none; background:#fffbeb; border:1px solid #fcd34d; color:#92400e; border-radius:8px; padding:10px 12px;"></div>
+            
+            <div class="download-action-grid" id="downloadActionGrid">
+                <button class="download-btn download-btn-dual" id="downloadDualBtn">
+                    <span class="dl-btn-icon">📖</span>
+                    <div class="dl-btn-content">
+                        <span class="dl-btn-main">Download Dual (Side-by-Side)</span>
+                        <span class="dl-btn-sub">Bilingual English + Arabic</span>
+                    </div>
+                </button>
+                <button class="download-btn download-btn-mono" id="downloadMonoBtn">
+                    <span class="dl-btn-icon">📄</span>
+                    <div class="dl-btn-content">
+                        <span class="dl-btn-main">Download Arabic Only</span>
+                        <span class="dl-btn-sub">Monolingual Preserved Layout</span>
+                    </div>
+                </button>
+            </div>
+            <button class="download-both-link" id="downloadBothBtn">
+                ⬇️ Download Both Files (Opens 2 tabs)
+            </button>
+        </div>
+
+        <div class="error-container" id="errorContainer">
+            <div class="error-icon">❌</div>
+            <div class="error-text" id="errorText"></div>
+        </div>
+    </div>
+
+    <script>
+        // API Configuration
+        const API_BASE_URL = window.location.origin;
+
+        let selectedFile = null;
+        let currentSessionId = null;
+        let pollStopped = false;
+        let completedStages = new Set();
+        let allStages = [];
+
+        // DOM Elements
+        const uploadArea = document.getElementById('uploadArea');
+        const fileInput = document.getElementById('fileInput');
+        const fileInfo = document.getElementById('fileInfo');
+        const fileName = document.getElementById('fileName');
+        const fileSize = document.getElementById('fileSize');
+        const translateBtn = document.getElementById('translateBtn');
+        const progressContainer = document.getElementById('progressContainer');
+        const progressFill = document.getElementById('progressFill');
+        const progressPercentage = document.getElementById('progressPercentage');
+        const currentStageName = document.getElementById('currentStageName');
+        const stageProgressFill = document.getElementById('stageProgressFill');
+        const stageProgressText = document.getElementById('stageProgressText');
+        const stagesContainer = document.getElementById('stagesContainer');
+        const partInfo = document.getElementById('partInfo');
+        const currentPart = document.getElementById('currentPart');
+        const totalParts = document.getElementById('totalParts');
+        const resultContainer = document.getElementById('resultContainer');
+        const errorContainer = document.getElementById('errorContainer');
+        const errorText = document.getElementById('errorText');
+        const downloadDualBtn = document.getElementById('downloadDualBtn');
+        const downloadMonoBtn = document.getElementById('downloadMonoBtn');
+        const downloadBothBtn = document.getElementById('downloadBothBtn');
+        const cancelBtn = document.getElementById('cancelBtn');
+        const stageSpinner = document.getElementById('stageSpinner');
+
+        // Default stages (will be replaced by server data)
+        const defaultStages = [
+            { name: 'Create IL', display_name: '📄 Parsing PDF Structure' },
+            { name: 'Detect Scanned File', display_name: '🔍 Detecting Scanned Content' },
+            { name: 'Layout', display_name: '📐 Analyzing Page Layout' },
+            { name: 'Table', display_name: '📊 Processing Tables' },
+            { name: 'Paragraph', display_name: '📝 Finding Paragraphs' },
+            { name: 'Styles And Formulas', display_name: '🔢 Processing Formulas & Styles' },
+            { name: 'AutomaticTermExtractor', display_name: '📚 Extracting Terms' },
+            { name: 'Translate', display_name: '🌐 Translating Content' },
+            { name: 'Typesetting', display_name: '✍️ Typesetting Document' },
+            { name: 'Font Mapper', display_name: '🔤 Mapping Fonts' },
+            { name: 'PDF Creater', display_name: '📑 Generating PDF' },
+            { name: 'Subset Font', display_name: '⚙️ Subsetting Fonts' },
+            { name: 'Save PDF', display_name: '💾 Saving Document' },
+        ];
+
+        // Initialize stages
+        function initializeStages(stages = null) {
+            allStages = stages || defaultStages;
+            completedStages.clear();
+            stagesContainer.innerHTML = '';
+            
+            allStages.forEach(stage => {
+                const stageEl = document.createElement('div');
+                stageEl.className = 'stage-item pending';
+                stageEl.id = `stage-${stage.name.replace(/\s+/g, '-')}`;
+                stageEl.innerHTML = `
+                    <div class="stage-icon">⏳</div>
+                    <div class="stage-name">${stage.display_name}</div>
+                    <div class="stage-status">Pending</div>
+                `;
+                stagesContainer.appendChild(stageEl);
+            });
+        }
+
+        // Update stage status
+        function updateStageStatus(stageName, status, displayName) {
+            // Find stage element by partial match
+            const stageEl = Array.from(stagesContainer.children).find(el => {
+                const elName = el.querySelector('.stage-name').textContent;
+                return elName.includes(stageName) || 
+                       displayName && elName === displayName ||
+                       el.id.toLowerCase().includes(stageName.toLowerCase().replace(/\s+/g, '-'));
+            });
+            
+            if (!stageEl) return;
+
+            stageEl.className = `stage-item ${status}`;
+            const iconEl = stageEl.querySelector('.stage-icon');
+            const statusEl = stageEl.querySelector('.stage-status');
+
+            if (status === 'completed') {
+                iconEl.textContent = '✅';
+                statusEl.textContent = 'Complete';
+                completedStages.add(stageName);
+            } else if (status === 'active') {
+                iconEl.textContent = '⚡';
+                statusEl.textContent = 'Processing...';
+            } else {
+                iconEl.textContent = '⏳';
+                statusEl.textContent = 'Pending';
+            }
+        }
+
+        // Find and update stage by matching name
+        function findAndUpdateStage(stageName, displayName, status) {
+            const exactId = 'stage-' + String(stageName || '').replace(/\s+/g, '-');
+            const exactStageEl = Array.from(stagesContainer.children).find(el => el.id === exactId) || null;
+            const stageEls = exactStageEl ? [exactStageEl] : stagesContainer.children;
+            for (const stageEl of stageEls) {
+                const nameEl = stageEl.querySelector('.stage-name');
+                if (nameEl && (stageEl === exactStageEl ||
+                    nameEl.textContent === displayName ||
+                    nameEl.textContent.includes(stageName) ||
+                    stageName.toLowerCase().includes(nameEl.textContent.split(' ').pop()?.toLowerCase() || '')
+                )) {
+                    stageEl.className = `stage-item ${status}`;
+                    const iconEl = stageEl.querySelector('.stage-icon');
+                    const statusEl = stageEl.querySelector('.stage-status');
+
+                    if (status === 'completed') {
+                        iconEl.textContent = '✅';
+                        statusEl.textContent = 'Complete';
+                    } else if (status === 'active') {
+                        iconEl.textContent = '⚡';
+                        statusEl.textContent = 'Processing...';
+                    }
+                    break;
+                }
+            }
+        }
+
+        // Upload area event handlers
+        uploadArea.addEventListener('click', () => fileInput.click());
+        fileInput.addEventListener('change', handleFileSelect);
+
+        uploadArea.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            uploadArea.classList.add('dragover');
+        });
+
+        uploadArea.addEventListener('dragleave', () => {
+            uploadArea.classList.remove('dragover');
+        });
+
+        uploadArea.addEventListener('drop', (e) => {
+            e.preventDefault();
+            uploadArea.classList.remove('dragover');
+            const files = e.dataTransfer.files;
+            if (files.length > 0) {
+                handleFile(files[0]);
+            }
+        });
+
+        function handleFileSelect(e) {
+            const files = e.target.files;
+            if (files.length > 0) {
+                handleFile(files[0]);
+            }
+        }
+
+        function handleFile(file) {
+            if (file.type !== 'application/pdf') {
+                showError('Please select a PDF file');
+                return;
+            }
+
+            if (file.size > 50 * 1024 * 1024) {
+                showError('File size must be less than 50MB');
+                return;
+            }
+
+            selectedFile = file;
+            fileName.textContent = file.name;
+            fileSize.textContent = formatFileSize(file.size);
+            fileInfo.classList.add('active');
+            translateBtn.disabled = false;
+            hideError();
+            hideResult();
+        }
+
+        function formatFileSize(bytes) {
+            if (bytes === 0) return '0 Bytes';
+            const k = 1024;
+            const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return Math.round(bytes / Math.pow(k, i) * 100) / 100 + ' ' + sizes[i];
+        }
+
+        // Translate button click
+        translateBtn.addEventListener('click', async () => {
+            if (!selectedFile) return;
+
+            const sourceLang = document.getElementById('sourceLang').value;
+            const targetLang = document.getElementById('targetLang').value;
+
+            if (sourceLang === targetLang) {
+                showError('Source and target languages must be different');
+                return;
+            }
+
+            await startTranslation(selectedFile, sourceLang, targetLang);
+        });
+
+        // Request cancellation on the server; keep polling until the worker stops.
+        cancelBtn.disabled = true;
+        cancelBtn.addEventListener('click', async () => {
+            if (!currentSessionId) return;
+            cancelBtn.disabled = true;
+            try {
+                const reply = await fetch(`${API_BASE_URL}/translate/cancel/${currentSessionId}`, { method: 'POST' });
+                if (!reply.ok) throw new Error('Could not cancel this job');
+                currentStageName.textContent = 'Stopping after the current operation...';
+            } catch (error) {
+                showError(error.message);
+                cancelBtn.disabled = false;
+            }
+        });
+
+        // Model Selection
+        function selectModel(modelKey) {
+            document.querySelectorAll('.model-card').forEach(card => {
+                if (card.dataset.model === modelKey) {
+                    card.classList.add('active');
+                } else {
+                    card.classList.remove('active');
+                }
+            });
+            document.getElementById('selectedModel').value = modelKey;
+        }
+
+        // Layout Mode Selection
+        function selectLayout(layoutKey) {
+            document.querySelectorAll('.layout-card').forEach(card => {
+                if (card.dataset.layout === layoutKey) {
+                    card.classList.add('active');
+                } else {
+                    card.classList.remove('active');
+                }
+            });
+            document.getElementById('selectedLayout').value = layoutKey;
+        }
+
+        async function startTranslation(file, sourceLang, targetLang) {
+            hideError();
+            hideResult();
+            showProgress();
+            translateBtn.disabled = true;
+            initializeStages();
+
+            try {
+                const selectedModel = document.getElementById('selectedModel').value || 'nllb';
+                const selectedLayout = document.getElementById('selectedLayout').value || 'both';
+
+                // Step 1: Start translation and get session ID
+                const formData = new FormData();
+                formData.append('file', file);
+                formData.append('source_lang', sourceLang);
+                formData.append('target_lang', targetLang);
+                formData.append('model', selectedModel);
+                formData.append('layout', selectedLayout);
+
+                updateCurrentStage('📤 Uploading document...', 0, 0, 0);
+
+                const startResponse = await fetch(`${API_BASE_URL}/translate/start`, {
+                    method: 'POST',
+                    body: formData
+                });
+
+                if (!startResponse.ok) {
+                    const errorData = await startResponse.json();
+                    throw new Error(errorData.detail || 'Failed to start translation');
+                }
+
+                const { session_id } = await startResponse.json();
+                currentSessionId = session_id;
+
+                // Step 2: Connect to progress stream
+                await startJobAndPoll(session_id);
+
+            } catch (error) {
+                console.error('Translation error:', error);
+                showError(error.message || 'An error occurred during translation');
+                hideProgress();
+                translateBtn.disabled = false;
+            }
+        }
+
+        async function startJobAndPoll(sessionId) {
+            pollStopped = false;
+            const started = await fetch(`${API_BASE_URL}/translate/run/${sessionId}`, { method: 'POST' });
+            if (!started.ok && started.status !== 409) {
+                const body = await started.json();
+                throw new Error(body.detail || 'Could not run translation');
+            }
+            cancelBtn.disabled = false;
+            let cursor = 0;
+            let currentActiveStage = null;
+            function renderEvent(data) {
+                updateModelLoadingHint(data);
+                    switch (data.type) {
+                        case 'init':
+                            updateCurrentStage(data.message || 'Initializing translation...', 0, 0, 0);
+                            break;
+
+                        case 'stage_summary':
+                            // Reinitialize stages with server data
+                            if (data.stages && data.stages.length > 0) {
+                                initializeStages(data.stages);
+                            }
+                            break;
+
+                        case 'progress_start':
+                            // Mark previous stage as completed
+                            if (currentActiveStage && currentActiveStage !== data.stage) {
+                                findAndUpdateStage(currentActiveStage, '', 'completed');
+                            }
+                            currentActiveStage = data.stage;
+                            
+                            // Update current stage
+                            findAndUpdateStage(data.stage, data.display_name, 'active');
+                            updateCurrentStage(
+                                data.display_name,
+                                0,
+                                data.stage_current,
+                                data.stage_total
+                            );
+                            updateOverallProgress(data.overall_progress || 0);
+                            updatePartInfo(data.part_index, data.total_parts);
+                            break;
+
+                        case 'progress_update':
+                            currentActiveStage = data.stage;
+                            findAndUpdateStage(data.stage, data.display_name, 'active');
+                            updateCurrentStage(
+                                data.display_name,
+                                data.stage_progress,
+                                data.stage_current,
+                                data.stage_total
+                            );
+                            updateOverallProgress(data.overall_progress);
+                            updatePartInfo(data.part_index, data.total_parts);
+                            break;
+
+                        case 'progress_end':
+                            findAndUpdateStage(data.stage, data.display_name, 'completed');
+                            updateOverallProgress(data.overall_progress);
+                            break;
+
+                        case 'heartbeat':
+                            if (typeof data.model_loading === 'boolean') {
+                                updateModelLoadingHint(data);
+                            }
+                            break;
+
+                        case 'finish':
+                            cancelBtn.disabled = true;
+                            // Mark all stages as completed
+                            Array.from(stagesContainer.children).forEach(el => {
+                                el.className = 'stage-item completed';
+                                el.querySelector('.stage-icon').textContent = '✅';
+                                el.querySelector('.stage-status').textContent = 'Complete';
+                            });
+                            
+                            updateOverallProgress(100);
+                            stageSpinner.style.display = 'none';
+                            currentStageName.textContent = '✅ Translation Complete!';
+                            
+                            pollStopped = true;
+
+                            configureDownloadButtons(data);
+                            
+                            setTimeout(() => {
+                                hideProgress();
+                                showResult();
+                            }, 1000);
+                            break;
+
+                        case 'stopping':
+                            cancelBtn.disabled = true;
+                            currentStageName.textContent = data.message;
+                            break;
+
+                        case 'cancelled':
+                        case 'timed_out':
+                        case 'error':
+                            cancelBtn.disabled = true;
+                            pollStopped = true;
+                            hideProgress();
+                            showError(data.error || 'An error occurred during translation');
+                            translateBtn.disabled = false;
+                            break;
+                    }
+            }
+            async function poll() {
+                if (pollStopped) return;
+                try {
+                    const response = await fetch(`${API_BASE_URL}/translate/status/${sessionId}?after=${cursor}`);
+                    if (!response.ok) {
+                        if (response.status === 404) {
+                            pollStopped = true;
+                            hideProgress();
+                            showError('Job not found. The server may have restarted.');
+                            translateBtn.disabled = false;
+                            return;
+                        }
+                        throw new Error('Status temporarily unavailable');
+                    }
+                    const state = await response.json();
+                    for (const event of state.events) {
+                        renderEvent(event);
+                        cursor = Math.max(cursor, event.event_id || 0);
+                    }
+                    cursor = Math.max(cursor, state.next_event_id || 0);
+                    updateEtaDisplay(state.eta_seconds, state.model_loading);
+                    updateUntranslatedNote(state.untranslated_count || 0, state.incomplete_count || 0);
+                    if (['error', 'cancelled', 'timed_out'].includes(state.status) && !pollStopped) {
+                        pollStopped = true;
+                        hideProgress();
+                        showError(state.error || 'Translation failed');
+                        translateBtn.disabled = false;
+                    }
+                } catch (error) {
+                    console.warn('Retrying status request; job remains on the server.', error);
+                }
+                if (!pollStopped) setTimeout(poll, 1000);
+            }
+            await poll();
+        }
+
+        function updateCurrentStage(name, progress, current, total) {
+            currentStageName.textContent = name;
+            stageProgressFill.style.width = `${progress}%`;
+            
+            if (total > 0) {
+                stageProgressText.textContent = `${current} / ${total}`;
+            } else {
+                stageProgressText.textContent = progress > 0 ? `${Math.round(progress)}%` : 'Starting...';
+            }
+        }
+
+        // Hint for the wait before the first paragraph is done (model load or slow first paragraph).
+        function updateModelLoadingHint(data) {
+            let hint = document.getElementById('modelLoadingHint');
+            const stage = String((data && data.stage) || '');
+            const current = Number(data && data.stage_current) || 0;
+            const waiting = data && typeof data.model_loading === 'boolean'
+                ? data.model_loading
+                : (!!data
+                    && (data.type === 'progress_start' || data.type === 'progress_update')
+                    && stage.includes('Translate Paragraphs')
+                    && current === 0);
+            if (!hint) {
+                if (!waiting || !stageProgressText || !stageProgressText.parentElement) return;
+                hint = document.createElement('div');
+                hint.id = 'modelLoadingHint';
+                hint.className = 'result-subtext';
+                hint.style.cssText = 'background:#eff6ff; border:1px solid #93c5fd; color:#1e40af; border-radius:8px; padding:10px 12px; margin-top:10px;';
+                hint.textContent = 'Loading the translation model. First use can take several minutes. This is not stuck.';
+                stageProgressText.parentElement.insertAdjacentElement('afterend', hint);
+            }
+            hint.style.display = waiting ? 'block' : 'none';
+        }
+
+        function formatEtaSeconds(seconds) {
+            const total = Math.max(0, Math.round(seconds));
+            const mins = Math.floor(total / 60);
+            const secs = total % 60;
+            return mins > 0 ? `${mins}m ${secs}s remaining` : `${secs}s remaining`;
+        }
+
+        function updateEtaDisplay(etaSeconds, modelLoading) {
+            let etaEl = document.getElementById('etaEstimateText');
+            if (!etaEl && progressPercentage && progressPercentage.parentElement) {
+                etaEl = document.createElement('span');
+                etaEl.id = 'etaEstimateText';
+                etaEl.className = 'result-subtext';
+                etaEl.style.cssText = 'margin-left:10px; font-weight:500;';
+                progressPercentage.insertAdjacentElement('afterend', etaEl);
+            }
+            if (!etaEl) return;
+            if (modelLoading) {
+                etaEl.textContent = '• Loading model...';
+            } else if (typeof etaSeconds === 'number' && Number.isFinite(etaSeconds) && etaSeconds > 0) {
+                etaEl.textContent = `• ~${formatEtaSeconds(etaSeconds)}`;
+            } else {
+                etaEl.textContent = '';
+            }
+        }
+
+        function updateOverallProgress(progress) {
+            const roundedProgress = Math.round(progress);
+            progressFill.style.width = `${roundedProgress}%`;
+            progressPercentage.textContent = `${roundedProgress}%`;
+        }
+
+        function updatePartInfo(partIndex, totalPartsCount) {
+            if (totalPartsCount > 1) {
+                partInfo.style.display = 'block';
+                currentPart.textContent = partIndex;
+                totalParts.textContent = totalPartsCount;
+            } else {
+                partInfo.style.display = 'none';
+            }
+        }
+
+        function configureDownloadButtons(data) {
+            const hasDual = data ? (data.has_dual !== false) : true;
+            const hasMono = data ? (data.has_mono !== false) : true;
+
+            if (downloadDualBtn) downloadDualBtn.style.display = hasDual ? 'flex' : 'none';
+            if (downloadMonoBtn) downloadMonoBtn.style.display = hasMono ? 'flex' : 'none';
+            if (downloadBothBtn) downloadBothBtn.style.display = (hasDual && hasMono) ? 'inline-block' : 'none';
+        }
+
+        // Dual download button click
+        if (downloadDualBtn) {
+            downloadDualBtn.addEventListener('click', () => {
+                if (!currentSessionId) return;
+                window.open(`${API_BASE_URL}/translate/download/${currentSessionId}?type=dual`, '_blank');
+            });
+        }
+
+        // Mono download button click
+        if (downloadMonoBtn) {
+            downloadMonoBtn.addEventListener('click', () => {
+                if (!currentSessionId) return;
+                window.open(`${API_BASE_URL}/translate/download/${currentSessionId}?type=mono`, '_blank');
+            });
+        }
+
+        // Download both files click
+        if (downloadBothBtn) {
+            downloadBothBtn.addEventListener('click', () => {
+                if (!currentSessionId) return;
+                window.open(`${API_BASE_URL}/translate/download/${currentSessionId}?type=dual`, '_blank');
+                setTimeout(() => {
+                    window.open(`${API_BASE_URL}/translate/download/${currentSessionId}?type=mono`, '_blank');
+                }, 400);
+            });
+        }
+
+        function showProgress() {
+            progressContainer.classList.add('active');
+            progressFill.style.width = '0%';
+            progressPercentage.textContent = '0%';
+            stageProgressFill.style.width = '0%';
+            stageProgressText.textContent = 'Starting...';
+            stageSpinner.style.display = 'block';
+        }
+
+        function hideProgress() {
+            progressContainer.classList.remove('active');
+        }
+
+        function updateUntranslatedNote(count, incompleteCount) {
+            const note = document.getElementById('untranslatedNote');
+            if (!note) return;
+            const untranslated = Number(count) || 0;
+            const incomplete = Number(incompleteCount) || 0;
+            const messages = [];
+            if (untranslated > 0) {
+                messages.push(untranslated + (untranslated === 1 ? ' text block could not be translated and was left' : ' text blocks could not be translated and were left') + ' in the original language.');
+            }
+            if (incomplete > 0) {
+                messages.push(incomplete + (incomplete === 1 ? ' translated text block may be' : ' translated text blocks may be') + ' missing protected numbers or codes.');
+            }
+            note.textContent = messages.length ? messages.join(' ') + ' Please check the downloaded file.' : '';
+            note.style.display = messages.length ? 'block' : 'none';
+        }
+
+        function showResult() {
+            resultContainer.classList.add('active');
+            translateBtn.disabled = false;
+        }
+
+        function hideResult() {
+            resultContainer.classList.remove('active');
+        }
+
+        function showError(message) {
+            errorText.textContent = message;
+            errorContainer.classList.add('active');
+        }
+
+        function hideError() {
+            errorContainer.classList.remove('active');
+        }
+    </script>
+</body>
+</html>
